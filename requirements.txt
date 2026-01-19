@@ -1,0 +1,35 @@
+# >=python3.10
+
+# base deps
+protobuf<=4.25.4#,>=4.21.6
+
+# utils
+psutil>=5.9.0
+ruamel.yaml>=0.17.21
+scipy>=1.9.3
+tqdm>=4.64.1
+opencv-python
+fast-histogram>=0.11
+pyyaml
+easydict
+matplotlib
+yacs
+torchvision
+numpy<2.0
+
+onnx_graphsurgeon
+ai_edge_litert
+sng4onnx
+
+# AIs
+tensorflow==2.16.0rc0 #tensorflow==2.14.0
+tf-keras==2.16.0rc0
+onnxruntime==1.20
+onnx==1.17.0
+onnxslim
+tf2onnx
+torch==2.4.0
+ml_dtypes>=0.3.1
+
+
+
