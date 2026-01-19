@@ -7,6 +7,8 @@ __pycache__/*
 /datasets/original
 /datasets/WIDER_val_subset
 
+/DeepSORT
+
 
 /NanoTrackV3/models_convert/original/SiamTrackers
 

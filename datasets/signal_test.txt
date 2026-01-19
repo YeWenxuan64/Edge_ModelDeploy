@@ -1,0 +1,2 @@
+./face.jpg
+./bus.jpg
