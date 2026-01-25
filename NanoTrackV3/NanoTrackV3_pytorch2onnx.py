@@ -29,9 +29,9 @@ EXPORT_FROM_PYTORCH = ['models_convert/original/NanoTrackV3_backbone_X_255_from_
                        'models_convert/original/NanoTrackV3_head_from_pytorch.onnx']
 EXPORT_FROM_PYTORCH = [os.path.join(current_path, path) for path in EXPORT_FROM_PYTORCH]
 
-EXPORT_AS_ONNX = ['./models_convert/onnx/NanoTrackV3_backbone_X_255.onnx',
-                  './models_convert/onnx/NanoTrackV3_backbone_T_127.onnx',
-                  './models_convert/onnx/NanoTrackV3_head.onnx']
+EXPORT_AS_ONNX = ['models_convert/onnx/NanoTrackV3_backbone_X_255.onnx',
+                  'models_convert/onnx/NanoTrackV3_backbone_T_127.onnx',
+                  'models_convert/onnx/NanoTrackV3_head.onnx']
 EXPORT_AS_ONNX = [os.path.join(current_path, path) for path in EXPORT_AS_ONNX]
 
 yaml_config_path = os.path.join(current_path, 'models_convert/original/SiamTrackers/NanoTrack/models/config/configv3.yaml')
