@@ -1,18 +1,13 @@
 /.vscode
 __pycache__/*
 
-/datasets/COCO_subset
-/datasets/COCO2017_subset
-/datasets/ILSVRC2012_img_val_samples
+
 /datasets/original
-/datasets/WIDER_val_subset
+
 
 /DeepSORT
 
 
-/NanoTrackV3/models_convert/original/SiamTrackers
-
-/utilities/ultralytics_yolo11
 /utilities/qairt
 
 *.pyc
