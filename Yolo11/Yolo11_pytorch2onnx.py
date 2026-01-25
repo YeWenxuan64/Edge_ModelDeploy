@@ -12,7 +12,7 @@ import onnxslim
 current_path = os.path.dirname(os.path.abspath(__file__)) # 获取当前脚本所在目录的绝对路径
 sys.path.insert(0, os.path.dirname(current_path))
 
-project_root = os.path.join(os.path.dirname(current_path), 'utilities/ultralytics_yolo11')
+project_root = os.path.join(os.path.dirname(current_path), 'models_convert/original/ultralytics_yolo11')
 sys.path.insert(0, project_root)
 
 
@@ -120,10 +120,10 @@ model_quantities = ['s', 'm']
 yolo11_config_paths = [f'config/yolo11{size}_[320,640]_cfg.yaml' for size in model_quantities]
 yolo11_config_paths = [os.path.join(current_path, path) for path in yolo11_config_paths]
 
-model_paths = [f'./models_convert/original/yolo11{size}.onnx' for size in model_quantities]
+model_paths = [f'models_convert/original/yolo11{size}.onnx' for size in model_quantities]
 model_paths = [os.path.join(current_path, path) for path in model_paths]
 
-output_paths = [f'./models_convert/onnx/yolo11{size}_[1,3,320,640].onnx' for size in model_quantities]
+output_paths = [f'models_convert/onnx/yolo11{size}_[1,3,320,640].onnx' for size in model_quantities]
 output_paths = [os.path.join(current_path, path) for path in output_paths]
 
 
