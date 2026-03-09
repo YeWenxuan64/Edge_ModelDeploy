@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import onnx
+import onnxslim
 
 import tensorflow as tf
 from tf2onnx.tf_loader import from_saved_model
@@ -26,7 +27,7 @@ target_conv_list = [('PartitionedCall/model/layer_from_saved_model/PartitionedCa
                     ('PartitionedCall/model/layer_from_saved_model/PartitionedCall/aspp/conv1_3/BiasAdd', 40),
                     ('PartitionedCall/model/layer_from_saved_model/PartitionedCall/aspp/conv1_4/BiasAdd', 80),]
 
-
+target_reducemax_node_name = 'PartitionedCall/model/layer_from_saved_model/PartitionedCall/Max'
 
 
 def convert_common(frozen_graph, name="unknown", output_path=None, **kwargs) -> onnx.ModelProto:
@@ -44,6 +45,72 @@ def convert_common(frozen_graph, name="unknown", output_path=None, **kwargs) -> 
         model_proto = onnx_graph.make_model(name, external_tensor_storage=external_tensor_storage)
     
     return model_proto
+
+def modify_normalization(onnx_model:onnx.ModelProto):
+    graph = onnx_model.graph
+
+    # 修改输出归一化
+    target_reducemax_node = None
+    target_reducemax_output_shape = None
+    for i, node in enumerate(graph.node):
+        if node.name == target_reducemax_node_name:
+            target_reducemax_node = node
+            print('found target_reducemax_node: ', target_reducemax_node.name)
+
+            # 获取target_reducemax_node的输出形状
+            for output in graph.output:
+                if output.name == target_reducemax_node.output[0]:
+                    target_reducemax_output_shape = [d.dim_value for d in output.type.tensor_type.shape.dim]
+                    break
+            
+            # 如果在graph.output中找不到，尝试在value_info中查找
+            if target_reducemax_output_shape is None:
+                for value_info in graph.value_info:
+                    if value_info.name == target_reducemax_node.output[0]:
+                        target_reducemax_output_shape = [d.dim_value for d in value_info.type.tensor_type.shape.dim]
+                        break
+
+            if target_reducemax_output_shape is None:
+                target_reducemax_output_shape = [1, 1, 1, 1]  # 默认形状
+
+            break
+
+    if target_reducemax_node is not None:
+        # 创建常量节点255
+        const_node = onnx.helper.make_node(
+            'Constant',
+            inputs=[],
+            outputs=['255_const'],
+            value=onnx.helper.make_tensor(name='255_const_tensor', data_type=onnx.TensorProto.FLOAT, dims=target_reducemax_output_shape, vals=[255.0]),
+            name='255_const_node')
+
+        # 创建除法节点
+        div_node = onnx.helper.make_node(
+            'Div',
+            inputs=[target_reducemax_node.output[0], const_node.output[0]],
+            outputs=[target_reducemax_node.output[0] + '_div'],
+            name=target_reducemax_node.name + '_div')
+
+
+        for i, node in enumerate(graph.node):
+            if node.input:
+                break_out = False
+
+                for j, input_name in enumerate(node.input):
+                    if input_name == target_reducemax_node.output[0]:
+                        node.input[j] = div_node.output[0]
+                        break_out = True
+                        print('modified node: ', node.name)
+                        break
+
+                if break_out:
+                    break
+
+        # 将新节点插入到图中
+        graph.node.insert(i + 1, div_node)
+        graph.node.insert(i + 1, const_node)
+
+    return onnx_model
 
 def export():
     model_path = tensorflow_savemodel_path
@@ -92,12 +159,14 @@ def export():
             tensors_to_rename=tensors_to_rename,
             output_path=onnx_output_path)
 
+    onnx_model = modify_normalization(model_proto)
 
-    onnx_model = onnx.shape_inference.infer_shapes(model_proto)
+    onnx_model = onnxslim.slim(onnx_model)
+    onnx_model = onnx.shape_inference.infer_shapes(onnx_model)
     onnx.save(onnx_model, onnx_output_path)
 
 
-def modify():
+def modify_conv():
     model = onnx.load_model(intermediate_onnx_model_path)
 
     # 获取图
@@ -277,6 +346,7 @@ def modify():
 
 
 
+
     new_model = model
     new_model = onnx.helper.make_model(graph, producer_name=model.producer_name, opset_imports=[onnx.helper.make_opsetid("", 13)])
     
@@ -286,5 +356,5 @@ def modify():
 
 if __name__ == '__main__':
     export()
-    modify()
+    modify_conv()
 

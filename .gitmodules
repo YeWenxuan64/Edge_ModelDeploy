@@ -4,3 +4,6 @@
 [submodule "Yolo11/models_convert/original/ultralytics_yolo11"]
 	path = Yolo11/models_convert/original/ultralytics_yolo11
 	url = https://github.com/airockchip/ultralytics_yolo11.git
+[submodule "RetinaFace-mobile/models_convert/original/Pytorch_Retinaface"]
+	path = RetinaFace-mobile/models_convert/original/Pytorch_Retinaface
+	url = https://github.com/biubug6/Pytorch_Retinaface.git

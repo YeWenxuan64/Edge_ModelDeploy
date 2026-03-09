@@ -12,7 +12,7 @@ import onnxslim
 current_path = os.path.dirname(os.path.abspath(__file__)) # 获取当前脚本所在目录的绝对路径
 sys.path.insert(0, os.path.dirname(current_path))
 
-project_root = os.path.join(os.path.dirname(current_path), 'models_convert/original/ultralytics_yolo11')
+project_root = os.path.join(current_path, 'models_convert/original/ultralytics_yolo11')
 sys.path.insert(0, project_root)
 
 

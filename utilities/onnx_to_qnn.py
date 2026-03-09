@@ -1,5 +1,7 @@
 import os
 import json
+import locale
+import platform
 import subprocess
 import concurrent.futures
 import shutil
@@ -11,52 +13,12 @@ import cv2
 import onnx
 
 
-def q_mod(onnx_model_path:str):
-    model = onnx.load_model(onnx_model_path)
-    from aimet_onnx.batch_norm_fold import fold_all_batch_norms_to_weight
-
-    _ = fold_all_batch_norms_to_weight(model)
-
-    from aimet_common.defs import QuantScheme
-    import aimet_onnx
-    from aimet_onnx.quantsim import QuantizationSimModel
-
-    sim = QuantizationSimModel(model=model,
-                            quant_scheme=QuantScheme.min_max,
-                            param_type=aimet_onnx.int8,
-                            activation_type=aimet_onnx.int8,
-                            providers=['CPUExecutionProvider'])
-    
-
-    def pass_calibration_data(session):
-        data_loader = ImageNetDataPipeline.get_val_dataloader()
-        batch_size = data_loader.batch_size
-        input_name = sess.get_inputs()[0].name
-
-        batch_cntr = 0
-        for input_data, _ in data_loader:
-
-            inputs_batch = input_data.numpy()
-            session.run(None, {input_name : inputs_batch})
-
-            batch_cntr += 1
-            # Use 10000 samples for computing initial scale/offset
-            if (batch_cntr * batch_size) > 1000:
-                break
-
-
-    sim.compute_encodings(forward_pass_callback=pass_calibration_data)
-
-    os.makedirs("aimet_quant", exist_ok=True)
-    sim.export("aimet_quant", "resnet50")
-
-
-
-
 
 
 class OnnxToQNN:
     def __init__(self, model_path:str, qnn_model_path:str, dataset_path:str):
+        self.platform = platform.system() # 'Windows' or 'Linux'
+
         self.model_path = Path(model_path).resolve()
         self.qnn_model_path = Path(qnn_model_path).resolve()
         self.dataset_path = Path(dataset_path).resolve()
@@ -69,6 +31,15 @@ class OnnxToQNN:
 
         self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
         self.tmp_onnx_path = self.tmp_dir / self.model_path.name
+
+        if self.platform == 'Windows':
+            self.model_path = self.model_path.as_posix()
+            self.qnn_model_path = self.qnn_model_path.as_posix()
+            self.dataset_path = self.dataset_path.as_posix()
+            self.qnn_sdk_dir = self.qnn_sdk_dir.as_posix()
+            self.tmp_dir = self.tmp_dir.as_posix()
+            self.tmp_onnx_path = self.tmp_onnx_path.as_posix()
+
 
         self.set_debug_mode()
         self.set_quantization_method()
@@ -155,6 +126,11 @@ class OnnxToQNN:
 
     @staticmethod
     def run_subprocess(command:str) -> int:
+        if platform.system() == 'Windows':
+            executable = None
+        else:
+            executable = '/bin/bash'
+
         print(f"Running command: {command}")
 
         # 使用实时输出的方式执行命令
@@ -163,7 +139,7 @@ class OnnxToQNN:
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT,  # 将stderr重定向到stdout
                                 universal_newlines=True,
-                                executable='/bin/bash')
+                                executable=executable, env=os.environ)
         
         # 实时打印输出
         while True:
@@ -179,33 +155,43 @@ class OnnxToQNN:
         return return_code
 
     def run_env_script(self):
-        envsetup_sh_path = os.path.join(self.qnn_sdk_dir, 'bin/envsetup.sh')
+        # 判断操作系统类型
+        if platform.system() == 'Windows':
+            # Windows系统使用PowerShell脚本
+            envsetup_script = os.path.join(self.qnn_sdk_dir, 'bin/envsetup.ps1')
+            command = f"powershell -ExecutionPolicy Bypass -Command \"& '{envsetup_script}'; Get-ChildItem Env: | ForEach-Object {{ $_.Name + '=' + $_.Value }}\""
+            executable = None
+            print(command)
+            encoding = locale.getpreferredencoding()
+            print("Setting up Windows environment...")
+            
+        else:
+            # Linux/Unix系统使用bash脚本
+            envsetup_script = os.path.join(self.qnn_sdk_dir, 'bin/envsetup.sh')
+            command = f"source '{envsetup_script}' && env"
+            executable = '/bin/bash'
+            encoding = 'utf-8'
+            print("Setting up Linux environment...")
+            
 
-        # 创建一个子shell来执行脚本并获取环境变量
-        command = f"source '{envsetup_sh_path}' && env"
-        print("Setting up environment...")
-
-        # 使用shell=True执行命令
-        proc = subprocess.Popen(command, 
-                            shell=True,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            executable='/bin/bash')
+        # 执行脚本
+        proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, executable=executable)
         
         # 获取输出
         stdout, stderr = proc.communicate()
         
         if proc.returncode != 0:
-            print(f"Error executing script: {stderr.decode()}")
+            print(f"Error executing script: {stderr.decode(encoding)}")
             return False
         
         # 解析环境变量
         for line in stdout.decode().split('\n'):
             if '=' in line:
                 key, value = line.split('=', 1)
+                print(f"Setting environment variable: {key}={value}")
                 os.environ[key] = value
         
-    def get_onnx_model_info(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[0, 0, 0]]) -> dict|None:
+    def get_onnx_model_info(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]) -> dict|None:
         """
         获取ONNX模型的输入输出信息
         
@@ -242,7 +228,7 @@ class OnnxToQNN:
         # 复制ONNX文件到tmp目录
         if not self.model_path.exists():
             print(f"Error: ONNX file not found at {self.model_path}")
-            return False
+            return None
         
         model = onnx.load_model(str(self.model_path))
 
@@ -359,7 +345,7 @@ class OnnxToQNN:
             
         except Exception as e:
             print(f"Error reading ONNX model: {str(e)}")
-            return None, None
+            return None
 
     def convert_onnx_model(self, onnx_model_info:dict, set_input_order:str) -> str|None:
         """
@@ -628,17 +614,34 @@ class OnnxToQNN:
 
 
 if __name__ == "__main__":
-    exit()
-    onnx_path = './yolo11s_[1,3,320,640].onnx'
-    qnn_model_path = './yolo11s_[1,3,320,640].bin'
+    onnx_path = './yolo11s.onnx'
+    qnn_model_path = './yolo11s.bin'
     dataset_path = './datasets/datasets_face.txt'
     
     mean_rgb = [[0, 0, 0]]
     std_rgb = [[255, 255, 255]]
 
     onnx_to_qnn = OnnxToQNN(onnx_path, qnn_model_path, dataset_path)
+    # onnx_to_qnn.convert(mean_rgb, std_rgb)
 
-    onnx_to_qnn.convert(mean_rgb, std_rgb)
+    onnx_to_qnn.run_env_script()
+  
+
+    command = 'qairt-converter --input_network d:/Projects/IT/330Project/convert_models/yolo11s.onnx'
+    command = ['python', 'D:/Projects/IT/330Project/convert_models/utilities/qairt/2.38.0.250901/bin/x86_64-windows-msvc/qairt-converter', '--input_network', 'd:/Projects/IT/330Project/convert_models/yolo11s.onnx']
+
+    print(f"Running command: {command}")
+
+    # 使用实时输出的方式执行命令
+    process = subprocess.Popen(command, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, env=os.environ)
+    
+    # 实时打印输出
+    while True:
+        output = process.stdout.readline()
+        if output == '' and process.poll() is not None:
+            break
+        if output:
+            print(output.strip())
 
 
 

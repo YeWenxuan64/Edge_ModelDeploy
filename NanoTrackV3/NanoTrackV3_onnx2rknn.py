@@ -16,8 +16,8 @@ MODEL_PATHS = ['models_convert/onnx/NanoTrackV3_backbone_X_255.onnx',
 MODEL_PATHS = [os.path.join(current_path, path) for path in MODEL_PATHS]
 
 # 导出路径
-RKNN_MODELS = ['models_convert/rknn/NanoTrackV3_backbone_X_i8[1,3,255,255].rknn', 
-              'models_convert/rknn/NanoTrackV3_backbone_T_i8[1,3,127,127].rknn', 
+RKNN_MODELS = ['models_convert/rknn/NanoTrackV3_backbone_X_i8[1,255,255,3].rknn', 
+              'models_convert/rknn/NanoTrackV3_backbone_T_i8[1,127,127,3].rknn', 
               'models_convert/rknn/NanoTrackV3_head_i8[[1,96,8,8][1,96,16,16]].rknn']
 RKNN_MODELS = [os.path.join(current_path, path) for path in RKNN_MODELS]
 

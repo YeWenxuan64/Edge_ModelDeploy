@@ -11,7 +11,7 @@ from utilities.onnx_to_rknn import OnnxToRKNN
 
 MODEL_PATH = os.path.join(current_path, 'models_convert/onnx/MSI-net_[1,3,160,320].onnx')
 
-RKNN_MODEL = os.path.join(current_path, 'models_convert/rknn/MSI-net_i8[1,3,160,320].rknn')
+RKNN_MODEL = os.path.join(current_path, 'models_convert/rknn/MSI-net_i8[1,160,320,3].rknn')
 
 DATASET_PATH = os.path.join(os.path.dirname(current_path), 'datasets/datasets_full.txt')
 

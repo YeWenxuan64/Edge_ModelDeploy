@@ -13,7 +13,7 @@ from utilities.onnx_to_rknn import OnnxToRKNN
 
 MODEL_PATH = os.path.join(current_path, 'models_convert/onnx/RetinaFace_mobile_[1,3,320,320].onnx')
 
-RKNN_MODEL = os.path.join(current_path, 'models_convert/rknn/RetinaFace_mobile_i8[1,3,320,320].rknn')
+RKNN_MODEL = os.path.join(current_path, 'models_convert/rknn/RetinaFace_mobile_i8[1,320,320,3].rknn')
 
 DATASET_PATH = os.path.join(os.path.dirname(current_path), 'datasets/datasets_face.txt')
 

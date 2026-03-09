@@ -16,7 +16,7 @@ MODEL_PATHS = [f'models_convert/onnx/yolo11{size}-pose_[1,3,320,640].onnx' for s
 MODEL_PATHS = [os.path.join(current_path, path) for path in MODEL_PATHS]
 
 # 导出路径
-RKNN_MODELS = [f'models_convert/rknn/yolo11{size}-pose_i8[1,3,320,640].rknn' for size in model_quantities]
+RKNN_MODELS = [f'models_convert/rknn/yolo11{size}-pose_i8[1,320,640,3].rknn' for size in model_quantities]
 RKNN_MODELS = [os.path.join(current_path, path) for path in RKNN_MODELS]
 
 DATASET_PATH = os.path.join(os.path.dirname(current_path), 'datasets/datasets.txt')
