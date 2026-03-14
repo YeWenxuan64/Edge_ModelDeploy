@@ -26,17 +26,14 @@ class temporary_chdir:
         os.chdir(self.saved_path)     # 无论代码块是否报错，都恢复原来的目录
 
 
-def export(use_original_project:bool=True):
+def export():
     import torch
     torch.set_grad_enabled(False)
     device = torch.device("cpu")
 
-    if use_original_project:
-        project_root = os.path.join(current_path, 'models_convert/original/Pytorch_Retinaface')
-        weight_path = os.path.join(project_root, 'weights/mobilenet0.25_Final.pth')
-    else:
-        project_root = os.path.join(current_path, 'models_convert/original/Face-Detector-1MB-with-landmark')
-        weight_path = os.path.join(project_root, 'weights/RBF_Final.pth')
+
+    project_root = os.path.join(current_path, 'models_convert/original/Pytorch_Retinaface')
+    weight_path = os.path.join(project_root, 'weights/mobilenet0.25_Final.pth')
 
 
     sys.path.insert(0, project_root)
@@ -95,7 +92,10 @@ def simplify():
     onnx.checker.check_model(model, full_check=True)
 
     print('start simplify')
-    onnxslim.slim(model, output_path)
+    # onnxslim.slim(model, output_path)
+    model = onnxslim.slim(model)
+    new_model = onnx.helper.make_model(model.graph, producer_name=model.producer_name, opset_imports=[onnx.helper.make_opsetid("", 15)])
+    onnx.save_model(new_model, output_path)
 
     print('Simplified')
     print(f"==> Exporting model to ONNX format at '{output_path}'")

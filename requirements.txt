@@ -1,7 +1,8 @@
 # >=python3.10
+#--index-url https://download.pytorch.org/whl/cpu
 
 # base deps
-protobuf<=4.25.4#,>=4.21.6
+protobuf<=4.25.4 #,>=4.21.6
 
 # utils
 psutil>=5.9.0
@@ -11,25 +12,26 @@ tqdm>=4.64.1
 opencv-python
 fast-histogram>=0.11
 pyyaml
-easydict
+#easydict
 matplotlib
 yacs
-torchvision
+
 numpy<2.0
 
-onnx_graphsurgeon
-ai_edge_litert
-sng4onnx
+#onnx_graphsurgeon
+#ai_edge_litert
+#sng4onnx
 
 # AIs
-tensorflow==2.16.0rc0 #tensorflow==2.14.0
+tensorflow-cpu==2.16.0rc0 #tensorflow==2.14.0
 tf-keras==2.16.0rc0
 onnxruntime==1.20
 onnx==1.17.0
 onnxslim
 tf2onnx
 torch==2.4.0
-ml_dtypes>=0.3.1
+torchvision
+ml_dtypes>0.3.1
 
 
 

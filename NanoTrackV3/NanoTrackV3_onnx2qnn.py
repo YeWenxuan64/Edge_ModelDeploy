@@ -37,7 +37,7 @@ for i, (model_path, qnn_model) in enumerate(zip(MODEL_PATHS, QNN_MODELS)):
 
     if i != last_index:
         onnx_to_qnn = OnnxToQNN(model_path, qnn_model, DATASET_PATH)
-        onnx_to_qnn.set_quantization_method(param_quantization_method='entropy', act_quantization_method='entropy')
+        onnx_to_qnn.set_quantization_method(param_quant_method='entropy', act_quant_method='entropy')
 
     else:
         # 创建对象并生成数据集

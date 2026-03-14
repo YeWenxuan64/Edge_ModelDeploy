@@ -8,16 +8,13 @@ sys.path.insert(0, os.path.dirname(current_path))
 
 from utilities.onnx_to_rknn import OnnxToRKNN
 
-model_quantities = ['s', 'm']
+
 
 # 模型文件路径
-MODEL_PATHS = [f'models_convert/onnx/yolo11{size}_[1,3,320,640].onnx' for size in model_quantities]
-MODEL_PATHS = [os.path.join(current_path, path) for path in MODEL_PATHS]
+MODEL_PATH = os.path.join(current_path, 'models_convert/onnx/yolo11s_[1,3,320,640].onnx')
 
 # 导出路径
-RKNN_MODELS = [f'models_convert/rknn/yolo11{size}_i8[1,320,640,3].rknn' for size in model_quantities]
-RKNN_MODELS = [os.path.join(current_path, path) for path in RKNN_MODELS]
-
+RKNN_MODEL = os.path.join(current_path, 'models_convert/rknn/yolo11s_i8[1,320,640,3].rknn')
 
 DATASET_PATH = os.path.join(os.path.dirname(current_path), 'datasets/datasets.txt')
 
@@ -25,12 +22,10 @@ TARGET_PLATFORM = 'rk3588'
 
 
 
-for i, (model_path, rknn_model) in enumerate(zip(MODEL_PATHS, RKNN_MODELS)):
-    print("turns:", i + 1)
+if __name__ == '__main__':
+    onnx_to_rknn = OnnxToRKNN(MODEL_PATH, RKNN_MODEL, DATASET_PATH, TARGET_PLATFORM)
+    # onnx_to_rknn.set_do_accuracy_analysis('/home/yewenxuan/convert_models/convert_models/datasets/bus.jpg')
 
-    onnx_to_rknn = OnnxToRKNN(model_path, rknn_model, DATASET_PATH, TARGET_PLATFORM)
-    onnx_to_rknn.set_do_accuracy_analysis('/home/yewenxuan/convert_models/convert_models/datasets/bus.jpg')
-    # onnx_to_rknn.extra_optimize(quantized_algorithm='normal')
     onnx_to_rknn.extra_optimize(flash_attantion=True)
     # onnx_to_rknn.do_hybrid_quantization(
     #     custom_hybrid=[['/model.23/cv3.2/cv3.2.0/cv3.2.0.0/act/Mul_output_0', '/model.23/Clip_2_output_0'],

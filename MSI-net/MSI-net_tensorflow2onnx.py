@@ -347,8 +347,7 @@ def modify_conv():
 
 
 
-    new_model = model
-    new_model = onnx.helper.make_model(graph, producer_name=model.producer_name, opset_imports=[onnx.helper.make_opsetid("", 13)])
+    new_model = onnx.helper.make_model(model.graph, producer_name=model.producer_name, opset_imports=[onnx.helper.make_opsetid("", 15)])
     
     new_model = onnx.shape_inference.infer_shapes(new_model, check_type=True, strict_mode=True)
     onnx.save_model(new_model, final_onnx_model_path)

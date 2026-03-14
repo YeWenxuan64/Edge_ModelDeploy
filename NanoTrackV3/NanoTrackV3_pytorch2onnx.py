@@ -1,6 +1,7 @@
 import os
 import sys
 import torch
+import onnx
 import onnxslim
 
 current_path = os.path.dirname(os.path.abspath(__file__))
@@ -71,7 +72,11 @@ def export():
 def simplify():
     print('start simplify')
     for import_model, export_model in zip(EXPORT_FROM_PYTORCH, EXPORT_AS_ONNX):
-        onnxslim.slim(import_model, export_model)
+        #onnxslim.slim(import_model, export_model)
+        model = onnxslim.slim(import_model)
+        new_model = onnx.helper.make_model(model.graph, producer_name=model.producer_name, opset_imports=[onnx.helper.make_opsetid("", 15)])
+        onnx.save_model(new_model, export_model)
+        print(f'simplify {import_model} to {export_model}')
 
 
 if __name__ == '__main__':

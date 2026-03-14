@@ -4,6 +4,14 @@ from rknn.api import RKNN
 
 class OnnxToRKNN:
     def __init__(self, model_path:str, rknn_model_path:str, dataset_path:str|None=None, target_platform:str='rk3588'):
+        """
+        Args:
+            model_path (str): onnx model to convert
+            rknn_model_path (str): output rknn model path
+            dataset_path (str): a dataset paths text file for accuracy analysis
+            target_platform (str): target platform, only 'rk3588' and 'rk3576' are supported
+        """
+
         self.model_path = os.path.abspath(model_path)
         self.rknn_model_path = os.path.abspath(rknn_model_path)
 		

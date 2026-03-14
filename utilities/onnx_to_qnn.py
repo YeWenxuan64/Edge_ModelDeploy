@@ -32,14 +32,6 @@ class OnnxToQNN:
         self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
         self.tmp_onnx_path = self.tmp_dir / self.model_path.name
 
-        if self.platform == 'Windows':
-            self.model_path = self.model_path.as_posix()
-            self.qnn_model_path = self.qnn_model_path.as_posix()
-            self.dataset_path = self.dataset_path.as_posix()
-            self.qnn_sdk_dir = self.qnn_sdk_dir.as_posix()
-            self.tmp_dir = self.tmp_dir.as_posix()
-            self.tmp_onnx_path = self.tmp_onnx_path.as_posix()
-
 
         self.set_debug_mode()
         self.set_quantization_method()
@@ -126,11 +118,8 @@ class OnnxToQNN:
 
     @staticmethod
     def run_subprocess(command:str) -> int:
-        if platform.system() == 'Windows':
-            executable = None
-        else:
-            executable = '/bin/bash'
 
+        executable = '/bin/bash'
         print(f"Running command: {command}")
 
         # 使用实时输出的方式执行命令
@@ -155,23 +144,13 @@ class OnnxToQNN:
         return return_code
 
     def run_env_script(self):
-        # 判断操作系统类型
-        if platform.system() == 'Windows':
-            # Windows系统使用PowerShell脚本
-            envsetup_script = os.path.join(self.qnn_sdk_dir, 'bin/envsetup.ps1')
-            command = f"powershell -ExecutionPolicy Bypass -Command \"& '{envsetup_script}'; Get-ChildItem Env: | ForEach-Object {{ $_.Name + '=' + $_.Value }}\""
-            executable = None
-            print(command)
-            encoding = locale.getpreferredencoding()
-            print("Setting up Windows environment...")
-            
-        else:
-            # Linux/Unix系统使用bash脚本
-            envsetup_script = os.path.join(self.qnn_sdk_dir, 'bin/envsetup.sh')
-            command = f"source '{envsetup_script}' && env"
-            executable = '/bin/bash'
-            encoding = 'utf-8'
-            print("Setting up Linux environment...")
+
+        # Linux/Unix系统使用bash脚本
+        envsetup_script = os.path.join(self.qnn_sdk_dir, 'bin/envsetup.sh')
+        command = f"source '{envsetup_script}' && env"
+        executable = '/bin/bash'
+        encoding = 'utf-8'
+        print("Setting up Linux environment...")
             
 
         # 执行脚本
@@ -188,7 +167,7 @@ class OnnxToQNN:
         for line in stdout.decode().split('\n'):
             if '=' in line:
                 key, value = line.split('=', 1)
-                print(f"Setting environment variable: {key}={value}")
+                #print(f"Setting environment variable: {key}={value}")
                 os.environ[key] = value
         
     def get_onnx_model_info(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]) -> dict|None:

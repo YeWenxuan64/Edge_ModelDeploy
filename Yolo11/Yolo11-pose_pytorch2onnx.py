@@ -15,21 +15,24 @@ sys.path.insert(0, os.path.dirname(current_path))
 project_root = os.path.join(current_path, 'models_convert/original/ultralytics_yolo11')
 sys.path.insert(0, project_root)
 
+try:
+    from models_convert.original.ultralytics_yolo11.ultralytics import YOLO
+except Exception as e:
+    from ultralytics import YOLO
 
-from ultralytics.engine import exporter
 
-
-model_quantities = ['s', 'm']
-
-yolo11_pose_config_paths = [f'config/yolo11{size}-pose_[320,640]_cfg.yaml' for size in model_quantities]
-yolo11_pose_config_paths = [os.path.join(current_path, path) for path in yolo11_pose_config_paths]
-
-model_paths = [f'models_convert/original/yolo11{size}-pose.onnx' for size in model_quantities]
-model_paths = [os.path.join(current_path, path) for path in model_paths]
-
-output_paths = [f'models_convert/onnx/yolo11{size}-pose_[1,3,320,640].onnx' for size in model_quantities]
-output_paths = [os.path.join(current_path, path) for path in output_paths]
-
+# 定义一个上下文管理器以安全地更改目录
+class temporary_chdir:
+    def __init__(self, new_path):
+        self.new_path = new_path
+        self.saved_path = None
+        
+    def __enter__(self):
+        self.saved_path = os.getcwd() # 保存进入前的当前目录
+        os.chdir(self.new_path)       # 切换到新目录
+        
+    def __exit__(self, etype, value, traceback):
+        os.chdir(self.saved_path)     # 无论代码块是否报错，都恢复原来的目录
 
 def load_config(config_path):
 
@@ -141,10 +144,20 @@ def change_node_output(model:onnx.ModelProto, original_output_name, new_output_n
                 node.output[0] = new_output_name
 
 
-for yolo11_pose_config_path, model_path, output_path in zip(yolo11_pose_config_paths, model_paths, output_paths):
 
+
+yolo11_pose_config_path = os.path.join(current_path, 'config/yolo11s-pose_[320,640]_cfg.yaml')
+model_path = os.path.join(current_path, 'models_convert/original/yolo11s-pose.onnx')
+output_path = os.path.join(current_path, 'models_convert/onnx/yolo11s-pose_[1,3,320,640].onnx')
+
+
+
+if __name__ == '__main__':
     config = load_config(yolo11_pose_config_path)
-    exporter.export(config)
+
+    with temporary_chdir(current_path):
+        yolo_model = YOLO(config.model)
+        yolo_model.export(**vars(config))
 
     # 加载ONNX模型
     model:onnx.ModelProto = onnx.load_model(model_path)
@@ -172,7 +185,6 @@ for yolo11_pose_config_path, model_path, output_path in zip(yolo11_pose_config_p
         for i, (original_output_name, w) in enumerate(target_output_list):
             
             if output.name == original_output_name:
-                
                 new_output_name = new_output_name_list[i]
 
                 change_node_output(model, original_output_name, new_output_name)
@@ -184,5 +196,4 @@ for yolo11_pose_config_path, model_path, output_path in zip(yolo11_pose_config_p
 
     print('start simplify')
     onnxslim.slim(model, output_path)
-
 
