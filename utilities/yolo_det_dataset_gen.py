@@ -1,4 +1,5 @@
 import os
+import time
 import cv2
 import numpy as np
 import onnx
@@ -40,71 +41,66 @@ def preprocess_image(image:np.ndarray, input_size:tuple[int, int], mean_rgb:list
     return normalized, r, left, top
 
 def process_predictions(output: np.ndarray) -> list[list[int, int, int, int, int, float]]:
-    """处理模型输出，返回置信度最高的5个检测结果"""
+    """处理模型输出，返回置信度最高的3个检测结果"""
 
     conf_threshold:float=0.25
-    nms_threshold:float=0.45
 
-    # 输出形状为 (1, 84, 8400)
-    output = output.squeeze()  # 移除批次维度
-    output = output.transpose(1, 0)  # 转置为 (8400, 84)
-    
-    # 分离边界框坐标和类别分数
-    boxes = output[:, :4]  # (8400, 4)
-    class_scores = output[:, 4:]  # (8400, 80)
-    
-    # 获取最大置信度和对应的类别ID
-    max_scores = np.max(class_scores, axis=1)
-    class_ids = np.argmax(class_scores, axis=1)
+    # 输出形状为 (1, 300, 6)
+    output = output.squeeze()  # 移除批次维度，形状变为 (300, 6)
 
+    # 分离边界框坐标、类别ID和分数
+    boxes = output[:, :4]  # (300, 4)
+    scores = output[:, 4]  # (300,)
+    class_ids = output[:, 5]  # (300,)
+    
     # 应用置信度阈值过滤
-    mask = max_scores > conf_threshold
+    mask = scores > conf_threshold
     filtered_boxes = boxes[mask]
-    filtered_scores = max_scores[mask]
+    filtered_scores = scores[mask]
     filtered_class_ids = class_ids[mask]
     
     if len(filtered_boxes) == 0:
         return []
 
-    # 应用NMS
-    indices = cv2.dnn.NMSBoxes(filtered_boxes.tolist(), filtered_scores.tolist(), conf_threshold, nms_threshold)
+    idxs = np.argsort(filtered_scores, axis=0)[::-1]  # 按置信度降序排序
+    filtered_boxes = filtered_boxes[idxs]
+    filtered_scores = filtered_scores[idxs]
+    filtered_class_ids = filtered_class_ids[idxs]
 
     results = []
     final_scores = []
-    if len(indices) > 0:
-        indices = indices.flatten()
-    
-        for i in indices:
-            box = filtered_boxes[i]
-            score = filtered_scores[i]
-            class_id = filtered_class_ids[i]
 
-            cx, cy, w, h = box
-            x1 = int(cx - w / 2)
-            y1 = int(cy - h / 2)
-            x2 = int(cx + w / 2)
-            y2 = int(cy + h / 2)
+    for box, score, class_id in zip(filtered_boxes, filtered_scores, filtered_class_ids):
+        x1, y1, x2, y2 = box
+        
+        w = x2 - x1
+        h = y2 - y1
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
 
-            # 计算综合评分
-            # 1. 中心距离得分（距离中心越近得分越高）
-            center_distance = np.sqrt((cx - 320)**2 + (cy - 320)**2)
-            max_distance = np.sqrt(320**2 + 320**2)
-            center_score = 1 - (center_distance / max_distance)
-            
-            # 2. 面积得分（面积越大得分越高）
-            area = w * h
-            max_area = 640 * 640  # 假设最大可能面积
-            area_score = area / max_area
-            
-            # 3. 综合得分（加权平均）
-            final_score = 0.4 * score + 0.3 * center_score + 0.3 * area_score
-            if area > 128*128:
-                results.append([x1, y1, x2, y2, int(class_id), float(score)])
-                final_scores.append(final_score)
+        # 计算综合评分
+        # 1. 中心距离得分（距离中心越近得分越高）
+        center_distance = np.sqrt((cx - 320)**2 + (cy - 320)**2)
+        max_distance = np.sqrt(320**2 + 320**2)
+        center_score = 1 - (center_distance / max_distance)
+        
+        # 2. 面积得分（面积越大得分越高）
+        area = w * h
+        max_area = 640 * 640  # 假设最大可能面积
+        area_score = area / max_area
+        
+        # 3. 综合得分（加权平均）
+        final_score = 0.4 * score + 0.3 * center_score + 0.3 * area_score
+        
+        if area > 128*128:
+            results.append([int(x1), int(y1), int(x2), int(y2), int(class_id), float(score)])
+            final_scores.append(final_score)
 
-    # 根据综合得分排序
-    sorted_indices = np.argsort(final_scores)[::-1][:3]
-    results = [results[i] for i in sorted_indices]
+
+    # 根据综合得分排序，取前3个
+    if len(results) > 0:
+        sorted_indices = np.argsort(final_scores)[::-1][:3]
+        results = [results[i] for i in sorted_indices]
 
     return results
 
@@ -116,11 +112,9 @@ class GenYoloDetedDataset:
         current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
         self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
 
-        self.yolo11_model_path = Path(os.path.join(current_dir, 'yolo11s.onnx')).resolve()
+        self.yolo11_model_path = Path(os.path.join(current_dir, 'yolo26s_f32([[640,640]],[[1,300,6]]).onnx')).resolve()
         self.dataset_path = Path(dataset_path).resolve()
         self.output_dir_name = output_dir_name
-
-
 
         self.another_ai_onnx = None
 
@@ -200,11 +194,12 @@ class GenYoloDetedDataset:
             
             # 处理预测结果
             results = process_predictions(output)
-            
-            # 裁剪并保存
-            image_name = Path(image_path).stem
 
-            cropped_paths = self.crop_and_save(image, results, scale, x_offset, y_offset, output_dir, image_name)
+            if results:
+                # 裁剪并保存
+                image_name = Path(image_path).stem
+
+                cropped_paths = self.crop_and_save(image, results, scale, x_offset, y_offset, output_dir, image_name)
             all_cropped_paths.extend(cropped_paths)
         
         # 保存裁剪图片的路径列表
@@ -280,7 +275,7 @@ def main():
 
     # 创建对象并生成数据集
     dataset_generator = GenYoloDetedDataset(dataset_path, 'cropped_images2')
-    dataset_generator.set_postprocess_by_another_ai('./NanoTrackV3/models_convert/onnx/NanoTrackV3_backbone_X_255.onnx', "nchw", '.npy')
+    #dataset_generator.set_postprocess_by_another_ai('./NanoTrackV3/models_convert/onnx/NanoTrackV3_backbone_X_255.onnx', "nchw", '.npy')
 
     cropped_list_path = dataset_generator.gerenate()
 

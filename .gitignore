@@ -3,10 +3,10 @@ __pycache__/*
 
 
 /datasets/original/
-
-
 /legacy/*
 
+/*/models_convert/*/*.onnx
+/MSI-net/models_convert/original/save_model/*
 
 /utilities/qairt
 /utilities/tmp
@@ -15,6 +15,6 @@ __pycache__/*
 *.zip
 *.bin
 *.rknn
-*.onnx
+# *.onnx
 *.pt
 *.mp4
