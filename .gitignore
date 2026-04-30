@@ -2,13 +2,14 @@
 __pycache__/*
 
 
-/datasets/original/*
+/datasets/original/
 
 
-/DeepSORT
+/legacy/*
 
 
 /utilities/qairt
+/utilities/tmp
 
 *.pyc
 *.zip
