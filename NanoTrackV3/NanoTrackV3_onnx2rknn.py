@@ -24,6 +24,7 @@ RKNN_MODELS = [os.path.join(current_path, path) for path in RKNN_MODELS]
 DATASET_PATH = os.path.join(os.path.dirname(current_path), 'datasets/datasets.txt')
 DATASET_2 = os.path.join(os.path.dirname(current_path), 'datasets/datasets_face.txt')
 DATASET_2_PATH = []
+DATASET_PATH = None
 
 TARGET_PLATFORM = 'rk3588'
 
@@ -38,31 +39,34 @@ for i, (model_path, rknn_model) in enumerate(zip(MODEL_PATHS, RKNN_MODELS)):
         onnx_to_rknn = OnnxToRKNN(model_path, rknn_model, DATASET_PATH, TARGET_PLATFORM)
 
     else:
-        # 创建对象并生成数据集
-        for j in range(2):
-            dataset_generator = GenYoloDetedDataset(DATASET_2, f'cropped_images_{j}')
-            dataset_generator.set_postprocess_by_another_ai(MODEL_PATHS[j], "nchw", '.npy')
-            cropped_list_path = dataset_generator.gerenate()
-            DATASET_2_PATH.append(cropped_list_path)
-
-        # 读取两个文件的内容
-        with open(DATASET_2_PATH[1], 'r', encoding='utf-8') as f1:
-            lines1 = f1.readlines()
+        tmp_dataset_path = None
         
-        with open(DATASET_2_PATH[0], 'r', encoding='utf-8') as f2:
-            lines2 = f2.readlines()
+        if DATASET_PATH is not None:
+            # 创建对象并生成数据集
+            for j in range(2):
+                dataset_generator = GenYoloDetedDataset(DATASET_2, f'cropped_images_{j}')
+                dataset_generator.set_postprocess_by_another_ai(MODEL_PATHS[j], "nchw", '.npy')
+                cropped_list_path = dataset_generator.gerenate()
+                DATASET_2_PATH.append(cropped_list_path)
 
-        tmp_dataset_path = os.path.join(os.path.dirname(DATASET_2_PATH[0]), 'cropped_images.txt')
+            # 读取两个文件的内容
+            with open(DATASET_2_PATH[1], 'r', encoding='utf-8') as f1:
+                lines1 = f1.readlines()
+            
+            with open(DATASET_2_PATH[0], 'r', encoding='utf-8') as f2:
+                lines2 = f2.readlines()
 
-        # 合并内容并写入新文件
-        with open(tmp_dataset_path, 'w', encoding='utf-8') as out_file:
-            for k in range(min(len(lines1), len(lines2))):
-                line1 = lines1[k]
-                line2 = lines2[k]
+            tmp_dataset_path = os.path.join(os.path.dirname(DATASET_2_PATH[0]), 'cropped_images.txt')
 
-                # 去除每行末尾的换行符，添加空格，然后合并
-                merged_line = line1.rstrip() + ' ' + line2.rstrip() + '\n'
-                out_file.write(merged_line)
+            # 合并内容并写入新文件
+            with open(tmp_dataset_path, 'w', encoding='utf-8') as out_file:
+                for k in range(min(len(lines1), len(lines2))):
+                    line1 = lines1[k]
+                    line2 = lines2[k]
+
+                    # 去除每行末尾的换行符，添加空格，然后合并
+                    merged_line = line1.rstrip() + ' ' + line2.rstrip() + '\n'
+                    out_file.write(merged_line)
 
 
         onnx_to_rknn = OnnxToRKNN(model_path, rknn_model, tmp_dataset_path, TARGET_PLATFORM)
