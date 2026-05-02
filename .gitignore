@@ -17,4 +17,5 @@ __pycache__/*
 *.rknn
 # *.onnx
 *.pt
+*.ts
 *.mp4

@@ -112,11 +112,15 @@ class GenYoloDetedDataset:
         current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
         self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
 
-        self.yolo11_model_path = Path(os.path.join(current_dir, 'yolo26s_f32([[640,640]],[[1,300,6]]).onnx')).resolve()
+        self.yolo_model_path = Path(os.path.join(current_dir, 'yolo26s_f32([[640,640]],[[1,300,6]]).onnx')).resolve()
         self.dataset_path = Path(dataset_path).resolve()
         self.output_dir_name = output_dir_name
 
         self.another_ai_onnx = None
+
+        self.human_list = [0]
+        self.animal_list = [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 77]
+        self.vehicle_list = [2, 3, 4, 5, 6, 7, 8, 30, 31, 33, 36, 37]
 
     def set_postprocess_by_another_ai(self, another_ai_onnx_path:str, output_shape:str='chw',outpur_format:str='.npy'):
         another_ai_onnx_path = Path(another_ai_onnx_path).resolve()
@@ -167,16 +171,20 @@ class GenYoloDetedDataset:
         os.makedirs(output_dir, exist_ok=True)
 
         # 初始化ONNX运行时
-        session = ort.InferenceSession(self.yolo11_model_path)
+        session = ort.InferenceSession(self.yolo_model_path)
         input_name = session.get_inputs()[0].name
 
         # 读取图片路径列表
+        image_path_set = set()
         with open(self.dataset_path, 'r', encoding='utf-8') as f:
-            image_path_list = [line.strip() for line in f if line.strip()]
+            for line in f:
+                line_s = line.strip()
+                if line_s:
+                    image_path_set.add(str(Path(line_s)))
 
         # 构建完整图片路径
         dataset_dir = str(self.dataset_path.parent)
-        full_img_path_list = [os.path.join(dataset_dir, img_path) for img_path in image_path_list]
+        full_img_path_list = [os.path.join(dataset_dir, img_path) for img_path in image_path_set]
 
         all_cropped_paths = []
         for image_path in full_img_path_list:
@@ -236,11 +244,21 @@ class GenYoloDetedDataset:
             x2 = max(0, min(x2, image.shape[1]))
             y2 = max(0, min(y2, image.shape[0]))
             
+            id = int(class_id)
+
+            if id in self.human_list:
+                color = (255, 0, 0)
+            elif id == 1 or id in self.animal_list:
+                color = (0, 255, 0)
+            elif id == 2 or id in self.vehicle_list:
+                color = (0, 0, 255)
+            else:
+                color = (255, 255, 255)
+
             # 在显示图像上绘制边界框
-            cv2.rectangle(display_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.rectangle(display_image, (x1, y1), (x2, y2), color, 2)
             # 在边界框上方显示置信度
-            cv2.putText(display_image, f'{conf:.2f}', (x1, y1-10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(display_image, f'{conf:.2f}', (x1, y1+20), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
             
             # 裁剪并保存
             cropped = image[y1:y2, x1:x2]
