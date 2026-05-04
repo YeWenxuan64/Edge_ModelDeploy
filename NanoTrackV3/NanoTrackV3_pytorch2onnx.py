@@ -3,6 +3,7 @@ import sys
 import torch
 import onnx
 import onnxslim
+from onnxslim.utils import summarize_model, print_model_info_as_table
 
 current_path = os.path.dirname(os.path.abspath(__file__))
 current_path = os.path.abspath(current_path)
@@ -19,7 +20,10 @@ sys.path.insert(0, project_root)
 
 
 from models_convert.original.SiamTrackers.NanoTrack.nanotrack.core.config import cfg
-from nanotrack.core.config import cfg
+try:
+    from nanotrack.core.config import cfg
+except Exception as e:
+    print(e)
 
 from models_convert.original.SiamTrackers.NanoTrack.nanotrack.utils.model_load import load_pretrain
 from models_convert.original.SiamTrackers.NanoTrack.nanotrack.models.model_builder import ModelBuilder
@@ -50,33 +54,39 @@ def export():
     
     # backbone 图像特征提取模型
     print('convert backbone_X model to onnx')
-    backbone_x = torch.randn([1, 3, 255, 255], device='cpu')
-    torch.onnx.export(backbone_net, backbone_x, EXPORT_FROM_PYTORCH[0], 
-                      input_names=['input'], output_names=['output'], verbose=True, opset_version=11, do_constant_folding=True)
+    backbone_x_input = torch.randn([1, 3, 255, 255], device='cpu')
+    torch.onnx.export(backbone_net, backbone_x_input, EXPORT_FROM_PYTORCH[0], 
+                      input_names=['input'], output_names=['output'], opset_version=13, do_constant_folding=True)
 
 
     # backbone 模板特征提取模型
     print('convert backbone_T model to onnx')
-    backbone_T = torch.randn([1, 3, 127, 127], device='cpu')
-    torch.onnx.export(backbone_net, backbone_T, EXPORT_FROM_PYTORCH[1], 
-                      input_names=['input'], output_names=['output'], verbose=True, opset_version=11, do_constant_folding=True)
+    backbone_t_input = torch.randn([1, 3, 127, 127], device='cpu')
+    torch.onnx.export(backbone_net, backbone_t_input, EXPORT_FROM_PYTORCH[1], 
+                      input_names=['input'], output_names=['output'], opset_version=13, do_constant_folding=True)
 
 
     # head 模型
     print('convert head model to onnx')
-    head_zf, head_xf = torch.randn([1, 96, 8, 8], device='cpu'), torch.randn([1, 96, 16, 16], device='cpu')
-    torch.onnx.export(head_net,(head_zf,head_xf), EXPORT_FROM_PYTORCH[2], 
-                      input_names=['input1','input2'], output_names=['output1','output2'],verbose=True, opset_version=11, do_constant_folding=True)
+    head_zf_input, head_xf_input = torch.randn([1, 96, 8, 8], device='cpu'), torch.randn([1, 96, 16, 16], device='cpu')
+    torch.onnx.export(head_net, (head_zf_input, head_xf_input), EXPORT_FROM_PYTORCH[2], 
+                      input_names=['input_z','input_x'], output_names=['output_cls','output_reg'], opset_version=13, do_constant_folding=True)
 
 
 def simplify():
     print('start simplify')
     for import_model, export_model in zip(EXPORT_FROM_PYTORCH, EXPORT_AS_ONNX):
-        #onnxslim.slim(import_model, export_model)
-        model = onnxslim.slim(import_model)
+        model = onnx.load_model(import_model)
+        original_info = summarize_model(model, os.path.basename(import_model))
+
+        model = onnxslim.slim(model)
+
         new_model = onnx.helper.make_model(model.graph, producer_name=model.producer_name, opset_imports=[onnx.helper.make_opsetid("", 15)])
         onnx.save_model(new_model, export_model)
+
+        slimmed_info = summarize_model(new_model, os.path.basename(export_model))
         print(f'simplify {import_model} to {export_model}')
+        print_model_info_as_table([original_info, slimmed_info])
 
 
 if __name__ == '__main__':

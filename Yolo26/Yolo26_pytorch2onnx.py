@@ -141,13 +141,13 @@ yoloe_config_path = os.path.join(current_path, 'config/yoloe26s_[320,640]_cfg.ya
 
 
 yolo_onnx_path = os.path.join(current_path, 'models_convert/original/yolo26s.onnx')
-yolo_onnx_output_path = os.path.join(current_path, 'models_convert/onnx/yolo26s.onnx')
+yolo_onnx_output_path = os.path.join(current_path, 'models_convert/onnx/yolo26s_[1,3,320,640].onnx')
 
 yolo_pose_onnx_path = os.path.join(current_path, 'models_convert/original/yolo26s-pose.onnx')
-yolo_pose_onnx_output_path = os.path.join(current_path, 'models_convert/onnx/yolo26s-pose.onnx')
+yolo_pose_onnx_output_path = os.path.join(current_path, 'models_convert/onnx/yolo26s-pose_[1,3,320,640].onnx')
 
 yoloe_onnx_path = os.path.join(current_path, 'models_convert/original/yoloe-26s-seg.onnx')
-yoloe_onnx_output_path = os.path.join(current_path, 'models_convert/onnx/yoloe26s.onnx')
+yoloe_onnx_output_path = os.path.join(current_path, 'models_convert/onnx/yoloe26s_[1,3,320,640].onnx')
 
 
 def export(yolo_type:str="yolo"):
@@ -327,7 +327,7 @@ def modify(yolo_type:str="yolo"):
 
 
 yolo_type = "yolo"
-yolo_type = "yolo-pose"
+# yolo_type = "yolo-pose"
 
 export(yolo_type)
 modify(yolo_type)
