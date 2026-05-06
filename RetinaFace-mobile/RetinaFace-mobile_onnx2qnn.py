@@ -19,5 +19,6 @@ DATASET_PATH = os.path.join(os.path.dirname(current_path), 'datasets/datasets_fa
 
 onnx_to_qnn = OnnxToQNN(MODEL_PATH, QNN_MODEL, DATASET_PATH)
 onnx_to_qnn.set_quantization_method(param_quant_method='entropy', act_quant_method='entropy')
-# onnx_to_qnn.set_debug_mode(True)
+
 onnx_to_qnn.convert(mean_rgb=[[0, 0, 0]], std_rgb=[[1, 1, 1]])
+onnx_to_qnn.clean()

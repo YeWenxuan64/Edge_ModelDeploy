@@ -29,4 +29,4 @@ if __name__ == '__main__':
     onnx_to_rknn.extra_optimize(flash_attantion=True)
 
     onnx_to_rknn.convert(mean_rgb=[[0, 0, 0]], std_rgb=[[255, 255, 255]])
-
+    onnx_to_rknn.clean()

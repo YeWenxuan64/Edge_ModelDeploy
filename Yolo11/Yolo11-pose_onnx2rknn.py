@@ -31,6 +31,6 @@ if __name__ == '__main__':
                                                       ['/model.23/cv4.2/cv4.2.0/act/Mul_output_0', '/model.22/Concat_6_output_0']])
     
     onnx_to_rknn.convert(mean_rgb=[[0, 0, 0]], std_rgb=[[255, 255, 255]])
-
+    onnx_to_rknn.clean()
 
 

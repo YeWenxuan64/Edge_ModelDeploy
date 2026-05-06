@@ -26,6 +26,7 @@ DATASET_PATH = os.path.join(os.path.dirname(current_path), 'datasets/datasets.tx
 
 
 last_index = len(MODEL_PATHS) - 1
+dataset_generator = None
 dataset_model_list_for_head = []
 
 
@@ -65,3 +66,7 @@ for i, (model_path, qnn_model) in enumerate(zip(MODEL_PATHS, QNN_MODELS)):
     else:
         onnx_to_qnn.convert(mean_rgb=[[0]*96,[0]*96], std_rgb=[[1]*96,[1]*96])
 
+    onnx_to_qnn.clean()
+
+    if dataset_generator:
+        dataset_generator.clean()

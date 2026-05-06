@@ -20,3 +20,4 @@ TARGET_PLATFORM = 'rk3588'
 
 onnx_to_rknn = OnnxToRKNN(MODEL_PATH, RKNN_MODEL, DATASET_PATH, TARGET_PLATFORM)
 onnx_to_rknn.convert(mean_rgb=[[0, 0, 0]], std_rgb=[[1, 1, 1]])
+onnx_to_rknn.clean()

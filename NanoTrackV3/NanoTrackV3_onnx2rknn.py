@@ -28,6 +28,7 @@ TARGET_PLATFORM = 'rk3588'
 
 
 last_index = len(MODEL_PATHS) - 1
+dataset_generator = None
 dataset_model_list_for_head = []
 
 # 循环处理每个模型
@@ -65,4 +66,6 @@ for i, (model_path, rknn_model) in enumerate(zip(MODEL_PATHS, RKNN_MODELS)):
         onnx_to_rknn.convert(mean_rgb=[[0]*96,[0]*96], std_rgb=[[1]*96,[1]*96])
 
     onnx_to_rknn.clean()
-
+    
+    if dataset_generator:
+        dataset_generator.clear()

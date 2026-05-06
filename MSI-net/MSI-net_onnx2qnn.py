@@ -19,3 +19,4 @@ DATASET_PATH = os.path.join(os.path.dirname(current_path), 'datasets/datasets_fu
 onnx_to_qnn = OnnxToQNN(MODEL_PATH, QNN_MODEL, DATASET_PATH)
 
 onnx_to_qnn.convert(mean_rgb=[[0, 0, 0]], std_rgb=[[1, 1, 1]])
+onnx_to_qnn.clean()

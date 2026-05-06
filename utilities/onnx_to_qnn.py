@@ -13,6 +13,18 @@ import cv2
 import onnx
 
 
+# 定义一个上下文管理器以安全地更改目录
+class temporary_chdir:
+    def __init__(self, new_path):
+        self.new_path = new_path
+        self.saved_path = None
+        
+    def __enter__(self):
+        self.saved_path = os.getcwd() # 保存进入前的当前目录
+        os.chdir(self.new_path)       # 切换到新目录
+        
+    def __exit__(self, etype, value, traceback):
+        os.chdir(self.saved_path)     # 无论代码块是否报错，都恢复原来的目录
 
 
 class OnnxToQNN:
@@ -32,14 +44,11 @@ class OnnxToQNN:
         self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
         self.tmp_onnx_path = self.tmp_dir / self.model_path.name
 
+        self.file_or_dir_to_clean = []
 
-        self.set_debug_mode()
         self.set_quantization_method()
         self.custom_alibration_data_path:str|None = None
         self.accuracy_analysis_picture_path:str|None = None
-
-    def set_debug_mode(self, debug_mode:bool=False,):
-        self.debug_mode = debug_mode
 
     def set_quantization_method(self, param_quant_method:str='percentile', act_quant_method:str='entropy', bitwidth:str='w8a8', use_8bit_bias:bool=False):
         """
@@ -98,7 +107,7 @@ class OnnxToQNN:
             calibration_data_index_path = self.custom_alibration_data_path
         if calibration_data_index_path is None:
             exit(1)
-
+        
         quantized_dlc_model_path = self.quantize_model(dlc_model_path, calibration_data_index_path)
         if quantized_dlc_model_path is None:
             exit(1)
@@ -107,14 +116,36 @@ class OnnxToQNN:
 
         self.generate_context_binary_model(quantized_dlc_model_path, config_path)
 
-        if self.debug_mode is False:
-            if self.tmp_dir.exists():
-                if Path('output').exists():
-                    shutil.rmtree('output')
-                    
-                shutil.rmtree(self.tmp_dir)
-                print(f"Temporary directory {self.tmp_dir} has been removed.")
+    def clean(self):
+        # if self.tmp_dir.exists():
+        #     if Path('output').exists():
+        #         shutil.rmtree('output')
+                
+        #     shutil.rmtree(self.tmp_dir)
+        #     print(f"Temporary directory {self.tmp_dir} has been removed.")
 
+        file_count = 0
+        dir_count = 0
+
+        for file_or_dir in self.file_or_dir_to_clean:
+            try:
+                if os.path.isfile(file_or_dir):
+                    os.remove(file_or_dir)
+                    file_count += 1
+
+                elif os.path.isdir(file_or_dir):
+                    # 统计目录中的文件数量
+                    for root, dirs, files in os.walk(file_or_dir):
+                        file_count += len(files)
+                        dir_count += len(dirs)
+                    
+                    shutil.rmtree(file_or_dir) # 删除目录
+                    dir_count += 1  # 加上被删除的目录本身
+
+            except Exception as e:
+                print(f"failed to delete {file_or_dir} due to {e}")
+
+        print(f"cleaned {file_count} files and {dir_count} dirs")
 
     @staticmethod
     def run_subprocess(command:str) -> int:
@@ -123,12 +154,10 @@ class OnnxToQNN:
         print(f"Running command: {command}")
 
         # 使用实时输出的方式执行命令
-        process = subprocess.Popen(command,
-                                shell=True,
+        process = subprocess.Popen(command, shell=True,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT,  # 将stderr重定向到stdout
-                                universal_newlines=True,
-                                executable=executable, env=os.environ)
+                                universal_newlines=True, executable=executable, env=os.environ)
         
         # 实时打印输出
         while True:
@@ -204,7 +233,7 @@ class OnnxToQNN:
         #     elif item.is_dir():
         #         shutil.rmtree(item)
 
-        # 复制ONNX文件到tmp目录
+        
         if not self.model_path.exists():
             print(f"Error: ONNX file not found at {self.model_path}")
             return None
@@ -294,13 +323,16 @@ class OnnxToQNN:
 
             onnx.checker.check_model(model, full_check=True)
             model = onnx.shape_inference.infer_shapes(model, check_type=True, strict_mode=True)
+
+        # 复制ONNX文件到tmp目录
         onnx.save_model(model, str(self.tmp_onnx_path))
+        self.file_or_dir_to_clean.append(self.tmp_onnx_path)
         print(f"Copied ONNX file to {self.tmp_onnx_path}")
 
 
         try:
             # 加载ONNX模型
-            model = onnx.load(str(self.tmp_onnx_path))
+            model = onnx.load_model(str(self.tmp_onnx_path))
             
             # 获取输入信息
             inputs = []
@@ -357,6 +389,7 @@ class OnnxToQNN:
             print("Conversion successful!")
 
             dlc_path = self.tmp_onnx_path.with_suffix('.dlc')
+            self.file_or_dir_to_clean.append(dlc_path)
             return dlc_path
         
         else:
@@ -387,6 +420,7 @@ class OnnxToQNN:
                 # 创建输出目录
                 output_dir = self.tmp_dir / f"calibration_data_for_input{idx + 1}"
                 output_dir.mkdir(parents=True, exist_ok=True)
+                self.file_or_dir_to_clean.append(output_dir)
 
                 # 获取当前输入的尺寸
                 input_shape = input_info["shape"]
@@ -488,6 +522,11 @@ class OnnxToQNN:
                 print(f'{calibration_data_index} created listing {len(calibration_files)} columns.')
 
             print("Calibration data generation completed successfully!")
+
+            self.file_or_dir_to_clean.append(calibration_data_index)
+            for file_list in calibration_files:
+                self.file_or_dir_to_clean.extend(file_list)
+
             return calibration_data_index
 
         except Exception as e:
@@ -522,9 +561,13 @@ class OnnxToQNN:
         
         command = f"qairt-quantizer --input_dlc {dlc_model_path} --input_list {input_list_str} --output_dlc {quantized_dlc_model_path} {extra_args}"
 
-        return_code = self.run_subprocess(command)
+        with temporary_chdir(self.tmp_dir):
+            return_code = self.run_subprocess(command)
+
+        self.file_or_dir_to_clean.append(os.path.join(str(self.tmp_dir), 'output'))
 
         if return_code == 0:
+            self.file_or_dir_to_clean.append(quantized_dlc_model_path)
             print("Model quantization completed successfully!")
             return quantized_dlc_model_path
         else:
@@ -569,6 +612,9 @@ class OnnxToQNN:
         config_file_path = dlc_model_file.parent / "config_file.json"
         with open(str(config_file_path), 'w') as f:
             json.dump(config_file, f, indent=4)
+
+        self.file_or_dir_to_clean.append(str(config_backend_path))
+        self.file_or_dir_to_clean.append(str(config_file_path))
         
         print(f"Config file created at: {config_backend_path}")
         return config_file_path
@@ -581,6 +627,7 @@ class OnnxToQNN:
             --binary_file {self.qnn_model_path.stem} \
             --config_file {config_path}"
         #  --profiling_level detailed
+
         return_code = self.run_subprocess(command)
 
         if return_code == 0:

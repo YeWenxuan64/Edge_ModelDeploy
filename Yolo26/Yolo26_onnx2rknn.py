@@ -31,4 +31,4 @@ if __name__ == '__main__':
     #     custom_hybrid=[['/model.23/Concat_3_output_0-rs', 'output0']])
 
     onnx_to_rknn.convert(mean_rgb=[[0, 0, 0]], std_rgb=[[255, 255, 255]])
-
+    onnx_to_rknn.clean()

@@ -39,7 +39,7 @@ if __name__ == '__main__':
     
 
     onnx_to_rknn.convert(mean_rgb=[[0, 0, 0]], std_rgb=[[255, 255, 255]])
-    # break
+    onnx_to_rknn.clean()
 
 
 
