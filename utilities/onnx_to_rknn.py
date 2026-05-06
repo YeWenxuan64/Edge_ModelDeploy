@@ -2,6 +2,20 @@ import os
 from rknn.api import RKNN
 
 
+# 定义一个上下文管理器以安全地更改目录
+class temporary_chdir:
+    def __init__(self, new_path):
+        self.new_path = new_path
+        self.saved_path = None
+        
+    def __enter__(self):
+        self.saved_path = os.getcwd() # 保存进入前的当前目录
+        os.chdir(self.new_path)       # 切换到新目录
+        
+    def __exit__(self, etype, value, traceback):
+        os.chdir(self.saved_path)     # 无论代码块是否报错，都恢复原来的目录
+
+
 class OnnxToRKNN:
     def __init__(self, model_path:str, rknn_model_path:str, dataset_path:str|None=None, target_platform:str='rk3588'):
         """
@@ -14,6 +28,9 @@ class OnnxToRKNN:
 
         self.model_path = os.path.abspath(model_path)
         self.rknn_model_path = os.path.abspath(rknn_model_path)
+
+        current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
+        self.tmp_dir = os.path.join(current_dir, 'tmp') # 构建tmp目录的绝对路径
 		
         if dataset_path is not None:
             self.dataset_path = os.path.abspath(dataset_path)
@@ -21,15 +38,11 @@ class OnnxToRKNN:
             self.dataset_path = None
         self.target_platform = target_platform
 
-        self.set_debug_mode()
         self.extra_optimize()
         self.custom_hybrid = None
-        self.accuracy_analysis_picture_path:str|None = None
+        self.accuracy_analysis_picture_list:list[str]|None = None
 
         self.temp_files_list = ["check0_base_optimize.onnx", "check1_fold_constant.onnx", "check2_correct_ops.onnx", "check3_fuse_ops.onnx"]
-
-    def set_debug_mode(self, debug_mode:bool=False,):
-        self.debug_mode = debug_mode
 
     def extra_optimize(self, quantized_algorithm:str='kl_divergence', compress_weight:bool=False, model_pruning:bool=False, flash_attantion:bool=False):
         """
@@ -45,10 +58,15 @@ class OnnxToRKNN:
     def do_hybrid_quantization(self, custom_hybrid:list[list[str]]):
         self.custom_hybrid = custom_hybrid
 
-    def set_do_accuracy_analysis(self, accuracy_analysis_picture_path:str):
-        self.accuracy_analysis_picture_path = os.path.abspath(accuracy_analysis_picture_path)
+    def set_do_accuracy_analysis(self, accuracy_analysis_picture_list:list[str]):
+        self.accuracy_analysis_picture_list = [os.path.abspath(path) for path in accuracy_analysis_picture_list]
 		
+
     def convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
+        with temporary_chdir(self.tmp_dir):
+            self.self_convert(mean_rgb, std_rgb)
+
+    def self_convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
         rknn = RKNN(verbose=True)
 
         # Pre-process config
@@ -70,7 +88,7 @@ class OnnxToRKNN:
             if self.custom_hybrid is None:
                 ret = rknn.build(do_quantization=True, dataset=self.dataset_path)
             else:
-                model_name=os.path.basename(self.model_path).replace('.onnx','')
+                model_name = os.path.basename(self.model_path).replace('.onnx','')
                 model_input = model_name + ".model" # 表示第一步生成的模型文件
                 data_input = model_name + ".data" # 表示第一步生成的配置文件
                 model_quantization_cfg = model_name + ".quantization.cfg" # 表示第一步生成的量化配置文件
@@ -88,24 +106,28 @@ class OnnxToRKNN:
 
         # Export rknn model
         print('--> Export rknn model')
+        
+        os.makedirs(os.path.dirname(self.rknn_model_path), exist_ok=True)
+        
         ret = rknn.export_rknn(self.rknn_model_path)
         if ret != 0:
             print('Export rknn model failed!')
             exit(ret)
         print('done')
 
-        if self.accuracy_analysis_picture_path is not None:
-            rknn.accuracy_analysis(inputs=[self.accuracy_analysis_picture_path])
-
-        if self.debug_mode is False:
-            for file_name in self.temp_files_list:
-                file_path = os.path.join(os.getcwd(), file_name)
-                try:
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                        print(f"已删除临时文件: {file_path}")
-                except Exception as e:
-                    print(f"删除文件 {file_path} 失败: {str(e)}")
+        if self.accuracy_analysis_picture_list is not None:
+            print(f'accuracy_analysis_picture_list: {self.accuracy_analysis_picture_list}')
+            rknn.accuracy_analysis(inputs=self.accuracy_analysis_picture_list)
 
         # Release
         rknn.release()
+
+    def clean(self):
+        for file_name in self.temp_files_list:
+            file_path = os.path.join(self.tmp_dir, file_name)
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    print(f"deleted tmp file {file_path}")
+            except Exception as e:
+                print(f"failed to delete {file_path}: {str(e)}")

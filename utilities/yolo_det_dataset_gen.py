@@ -1,8 +1,8 @@
 import os
 import time
+import shutil
 import cv2
 import numpy as np
-import onnx
 import onnxruntime as ort
 from pathlib import Path
 
@@ -108,71 +108,93 @@ def process_predictions(output: np.ndarray) -> list[list[int, int, int, int, int
 
 
 class GenYoloDetedDataset:
-    def __init__(self, dataset_path:str, output_dir_name:str='cropped_images'):
+    def __init__(self, dataset_path:str, output_dir_name:str='cropped_images', ):
         current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
         self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
 
         self.yolo_model_path = Path(os.path.join(current_dir, 'yolo26s_f32([[640,640]],[[1,300,6]]).onnx')).resolve()
         self.dataset_path = Path(dataset_path).resolve()
         self.output_dir_name = output_dir_name
+        self.file_or_dir_to_clean = []
 
-        self.another_ai_onnx = None
+        self.another_ai_path_list:list[tuple[str, str]]|None = None
 
         self.human_list = [0]
         self.animal_list = [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 77]
         self.vehicle_list = [2, 3, 4, 5, 6, 7, 8, 30, 31, 33, 36, 37]
 
-    def set_postprocess_by_another_ai(self, another_ai_onnx_path:str, output_shape:str='chw',outpur_format:str='.npy'):
-        another_ai_onnx_path = Path(another_ai_onnx_path).resolve()
-        
+    def set_postprocess_by_another_ai(self, another_ai_path_and_target_list:list[tuple[str, str]], output_shape:str='chw',outpur_format:str='.npy'):
+        """
+        Args:
+            another_ai_path_and_target_list (list[tuple[str, str]]): [(another_ai_path, process_target), ...]
+                - process_target (str): 'output' or 'input'
+            output_shape (str): 'chw' or 'hwc' or 'nchw' or 'nhwc'
+            outpur_format (str): '.npy' or '.raw'
+        """
         if output_shape not in ['chw', 'hwc', 'nchw', 'nhwc']:
             raise ValueError("output_shape must be 'chw' or 'hwc' or 'nchw' or 'nhwc'")
 
         if outpur_format not in ['.npy', '.raw']:
             raise ValueError("outpur_format must be '.npy' or '.raw'")
         
-        model = onnx.load(another_ai_onnx_path)
-        self.another_ai_input_shape = [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim]
-        del model
 
+        new_another_ai_path_list = []
+        for another_ai_path, process_target in another_ai_path_and_target_list:
+            if process_target not in ['output', 'input']:
+                raise ValueError("process_target must be 'output' or 'input'")
+
+            new_anothor_ai_path = Path(another_ai_path).resolve()
+            new_another_ai_path_list.append((new_anothor_ai_path, process_target))
+        
+        self.another_ai_path_list = new_another_ai_path_list
+        
         self.output_shape = output_shape
         self.output_format = outpur_format
 
-        self.another_ai_onnx = ort.InferenceSession(another_ai_onnx_path)
-        self.anorher_ai_input_name = self.another_ai_onnx.get_inputs()[0].name
 
+    def postprocess_by_another_ai(self, another_ai_path:str, image_path_list:list[str]) -> list[str]:
+        another_ai_ort = ort.InferenceSession(another_ai_path)
+        input_details = another_ai_ort.get_inputs()[0]
 
-    def postprocess_by_another_ai(self, image:np.ndarray) -> np.ndarray:
-        input_h, input_w = self.another_ai_input_shape[2], self.another_ai_input_shape[3]
-        input_tensor, scale, x_offset, y_offset = preprocess_image(image, (input_w, input_h), std_rgb=[1, 1, 1])
+        another_ai_input_shape:list[int] = input_details.shape
+        input_h, input_w = another_ai_input_shape[2], another_ai_input_shape[3]
+        anorher_ai_input_name:str = input_details.name
 
-        input_name = self.anorher_ai_input_name
-        outputs = self.another_ai_onnx.run(None, {input_name: input_tensor})
+        output_path_list = []
+        for image_path in image_path_list:
+            image = cv2.imread(image_path)
+            input_tensor, scale, x_offset, y_offset = preprocess_image(image, (input_w, input_h), std_rgb=[1, 1, 1])
 
-        output:np.ndarray = outputs[0] # nchw
+            outputs = another_ai_ort.run(None, {anorher_ai_input_name: input_tensor})
+            output:np.ndarray = outputs[0] # nchw
 
-        if self.output_shape == 'chw':
-            output = output.squeeze()
-        elif self.output_shape == 'hwc':
-            output = output.squeeze().transpose(1, 2, 0)
-        elif self.output_shape == 'nchw':
-            pass
-        elif self.output_shape == 'nhwc':
-            output = output.transpose(0, 2, 3, 1)
+            if self.output_shape == 'chw':
+                output = output.squeeze()
+            elif self.output_shape == 'hwc':
+                output = output.squeeze().transpose(1, 2, 0)
+            elif self.output_shape == 'nchw':
+                pass
+            elif self.output_shape == 'nhwc':
+                output = output.transpose(0, 2, 3, 1)
 
-        return output
+            output_path = str(Path(image_path).with_suffix(self.output_format))
 
-        
-    def gerenate(self) -> Path|str:
+            if self.output_format == '.npy':
+                np.save(output_path, output)
+
+            elif self.output_format == '.raw':
+                output.tofile(output_path)
+
+            output_path_list.append(output_path)
+
+        return output_path_list
+
+    def prepare_work_dir(self) -> tuple[list[str], str]:
         self.tmp_dir.mkdir(parents=True, exist_ok=True) # 创建tmp目录
         # 创建输出目录
 
-        output_dir = self.tmp_dir / self.output_dir_name
+        output_dir = os.path.join(self.tmp_dir, self.output_dir_name)
         os.makedirs(output_dir, exist_ok=True)
-
-        # 初始化ONNX运行时
-        session = ort.InferenceSession(self.yolo_model_path)
-        input_name = session.get_inputs()[0].name
 
         # 读取图片路径列表
         image_path_set = set()
@@ -186,47 +208,37 @@ class GenYoloDetedDataset:
         dataset_dir = str(self.dataset_path.parent)
         full_img_path_list = [os.path.join(dataset_dir, img_path) for img_path in image_path_set]
 
-        all_cropped_paths = []
-        for image_path in full_img_path_list:
-            # 读取图片
-            image = cv2.imread(image_path)
-            if image is None:
-                print(f"无法读取图片: {image_path}")
-                continue
+        input_images_dir = os.path.join(self.tmp_dir, 'input_images')
+        os.makedirs(input_images_dir, exist_ok=True)
+
+        # 遍历图片输入列表并复制文件
+        count_copied_files: dict[str, int] = {}
+
+        for i, src_path in enumerate(full_img_path_list):
+            parent_dir = os.path.dirname(src_path)
+            file_name = os.path.basename(src_path) # 获取文件名（例如 'img1.jpg'）
+
+            dst_path = os.path.join(input_images_dir, file_name) # 拼接目标路径
+            full_img_path_list[i] = dst_path
             
-            # 预处理
-            input_tensor, scale, x_offset, y_offset = preprocess_image(image, input_size=(640, 640), std_rgb=[255, 255, 255])
-            
-            # 推理
-            output = session.run(None, {input_name: input_tensor})[0]
-            
-            # 处理预测结果
-            results = process_predictions(output)
+            try:
+                shutil.copy2(src_path, dst_path) # 执行复制操作
+                count_copied_files[parent_dir] = count_copied_files.get(parent_dir, 0) + 1
 
-            if results:
-                # 裁剪并保存
-                image_name = Path(image_path).stem
+            except Exception as e:
+                print(f"failed to copy {src_path}: {e}")
 
-                cropped_paths = self.crop_and_save(image, results, scale, x_offset, y_offset, output_dir, image_name)
-            all_cropped_paths.extend(cropped_paths)
-        
-        # 保存裁剪图片的路径列表
-        output_txt = self.tmp_dir / str(self.output_dir_name + '_list.txt')
-        with open(output_txt, 'w', encoding='utf-8') as f:
-            for path in all_cropped_paths:
-                f.write(path + '\n')
+        # 按源目录打印汇总信息
+        for srcdir, n in count_copied_files.items():
+            plural = "s" if n > 1 else ""
+            print(f"copied {n} file{plural} from {srcdir} to {input_images_dir}")
 
-        cv2.destroyAllWindows()
-        del session
-
-        return output_txt
+        self.file_or_dir_to_clean.extend([input_images_dir, output_dir])
+        return full_img_path_list, output_dir
 
     def crop_and_save(self, image: np.ndarray, boxes: list[list[int, int, int, int, int, float]],
-                    scale: float,
-                    x_offset: int,
-                    y_offset: int,
-                    output_dir: str,
-                    image_name: str) -> list[str]:
+                        scale: float, x_offset: int, y_offset: int, output_dir: str, image_name: str) -> list[str]:
+        
         """裁剪并保存检测结果"""
         saved_paths = []
         display_image = image.copy()  # 创建显示用的图像副本
@@ -266,18 +278,8 @@ class GenYoloDetedDataset:
             cv2.imshow("Cropped Image", cropped)
             cv2.waitKey(1)
 
-            if self.another_ai_onnx is None:
-                output_path = os.path.join(output_dir, f"{image_name}_crop_{i}.jpg")
-                cv2.imwrite(output_path, cropped)
-                
-            else:
-                output_path = os.path.join(output_dir, f"{image_name}_crop_{i}{self.output_format}")
-                cropped = self.postprocess_by_another_ai(cropped)
-                if self.output_format == '.npy':
-                    np.save(output_path, cropped)
-
-                elif self.output_format == '.raw':
-                    cropped.tofile(output_path)
+            output_path = os.path.join(output_dir, f"{image_name}_crop_{i}.jpg")
+            cv2.imwrite(output_path, cropped)
                 
             saved_paths.append(os.path.abspath(output_path))
         
@@ -287,19 +289,123 @@ class GenYoloDetedDataset:
         
         return saved_paths
 
+    def gerenate(self, swap_image_pair:bool=False) -> Path|str:
+        """
+        Args:
+            swap_image_pair (bool, optional): 是否交换得到的输入和输出图片对. Defaults to False.
+        """
+
+        full_img_path_list, output_dir = self.prepare_work_dir()
+
+        # 初始化ONNX运行时
+        session = ort.InferenceSession(self.yolo_model_path)
+        input_name = session.get_inputs()[0].name
+
+        all_cropped_paths = []
+        for image_path in full_img_path_list:
+            # 读取图片
+            image = cv2.imread(image_path)
+            if image is None:
+                print(f"无法读取图片: {image_path}")
+                continue
+            
+            # 预处理
+            input_tensor, scale, x_offset, y_offset = preprocess_image(image, input_size=(640, 640), std_rgb=[255, 255, 255])
+            
+            # 推理
+            output = session.run(None, {input_name: input_tensor})[0]
+            
+            # 处理预测结果
+            results = process_predictions(output)
+
+            if results:
+                # 裁剪并保存
+                image_name = Path(image_path).stem
+
+                cropped_paths = self.crop_and_save(image, results, scale, x_offset, y_offset, output_dir, image_name)
+
+                if cropped_paths:
+                    for cropped_path in cropped_paths:
+                        all_cropped_paths.append([image_path, cropped_path])
+
+        if self.another_ai_path_list:
+            for another_ai_path, process_target in self.another_ai_path_list:
+
+                process_path_list:list[str] = []
+                if process_target == 'input':
+                    index = 0
+                elif process_target == 'output':
+                    index = 1
+
+                for pair_path in all_cropped_paths:
+                    process_path_list.append(pair_path[index])
+
+
+                output_path_list = self.postprocess_by_another_ai(another_ai_path, process_path_list)
+
+
+                for i, pair_path in enumerate(all_cropped_paths):
+                    pair_path[index] = output_path_list[i]
+
+
+        # 保存裁剪图片的路径列表
+        output_txt = self.tmp_dir / str(self.output_dir_name + '_list.txt')
+        self.file_or_dir_to_clean.append(output_txt)
+
+        with open(output_txt, 'w', encoding='utf-8') as f:
+            for pair_path in all_cropped_paths:
+                if swap_image_pair:
+                    pair_path = pair_path[::-1]
+
+                pair_path_full = f"{pair_path[0]} {pair_path[1]}\n"
+                f.write(pair_path_full)
+
+        cv2.destroyAllWindows()
+        del session
+
+        return output_txt
+
+    def clean(self):
+        file_count = 0
+        dir_count = 0
+
+        for file_or_dir in self.file_or_dir_to_clean:
+            try:
+                if os.path.isfile(file_or_dir):
+                    os.remove(file_or_dir)
+                    file_count += 1
+
+                elif os.path.isdir(file_or_dir):
+                    # 统计目录中的文件数量
+                    for root, dirs, files in os.walk(file_or_dir):
+                        file_count += len(files)
+                        dir_count += len(dirs)
+                    
+                    shutil.rmtree(file_or_dir) # 删除目录
+                    dir_count += 1  # 加上被删除的目录本身
+
+            except Exception as e:
+                print(f"failed to delete {file_or_dir} due to {e}")
+
+        print(f"cleaned {file_count} files and {dir_count} dirs")
+
 def main():
     # 配置参数
     dataset_path = './datasets/datasets_face.txt'  # 输入图片索引文本
 
+    # 另一个AI模型路径
+    another_ai_path_and_target = [('./NanoTrackV3/models_convert/onnx/NanoTrackV3_backbone_X_255.onnx', 'input'),
+                                  ('./NanoTrackV3/models_convert/onnx/NanoTrackV3_backbone_T_127.onnx', 'output')]  
+
     # 创建对象并生成数据集
     dataset_generator = GenYoloDetedDataset(dataset_path, 'cropped_images2')
-    #dataset_generator.set_postprocess_by_another_ai('./NanoTrackV3/models_convert/onnx/NanoTrackV3_backbone_X_255.onnx', "nchw", '.npy')
+    dataset_generator.set_postprocess_by_another_ai(another_ai_path_and_target, output_shape="nchw", outpur_format='.npy')
 
     cropped_list_path = dataset_generator.gerenate()
 
     print(f"裁剪后的图片路径列表已保存到: {cropped_list_path}")
 
-
+    #dataset_generator.clean()
 
 if __name__ == "__main__":
     main()
