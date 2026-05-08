@@ -1,16 +1,19 @@
 import os
 import json
-import locale
+import shutil
 import platform
 import subprocess
-import concurrent.futures
-import shutil
+import heapq
 from pathlib import Path
 from itertools import zip_longest
+from collections import defaultdict, deque
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, Future
 
 import numpy as np
 import cv2
 import onnx
+
 
 
 # 定义一个上下文管理器以安全地更改目录
@@ -26,6 +29,237 @@ class temporary_chdir:
     def __exit__(self, etype, value, traceback):
         os.chdir(self.saved_path)     # 无论代码块是否报错，都恢复原来的目录
 
+def reorder_onnx_nodes_by_input(model:onnx.ModelProto, max_depth:int=10) -> onnx.ModelProto:
+    """
+    按输入分支顺序重排 ONNX 节点，同时保证严格拓扑序
+    核心策略: BFS分配优先级 + Kahn算法拓扑排序 + 最小堆调度
+    """
+    graph = model.graph
+
+    # 1. 获取真实输入（排除 initializer 常量）
+    init_names = {init.name for init in graph.initializer}
+
+    # 兼容 sparse_initializer (部分量化模型会使用)
+    if hasattr(graph, 'sparse_initializer'):
+        init_names.update({init.values.name for init in graph.sparse_initializer if init.values.name})
+        
+    input_names = [inp.name for inp in graph.input if inp.name not in init_names]
+
+    if len(input_names) < 2:
+        print("less than 2 inputs, skip reorder")
+        return model
+    
+    # for node in graph.node[:10]:
+    #     print(node.name)
+
+    nodes_list = list(graph.node) # 物化 graph.node，解决 Protobuf 迭代导致 id() 不稳定的问题
+    max_depth = min(max_depth, len(nodes_list))
+
+    # 2. 构建图依赖映射
+    tensor_to_producer = {}          # tensor_name -> 生产它的 node
+    tensor_to_consumers = defaultdict(list) # tensor_name -> [消费它的 node, ...]
+    for node in nodes_list:
+        for out in node.output:
+            tensor_to_producer[out] = node
+        for inp in node.input:
+            tensor_to_consumers[inp].append(node)
+
+    # 3. 多源 BFS 分配优先级 (depth, input_index)
+    # 优先级规则：深度越小越靠前；同深度时，input_index 越小越靠前
+    node_priority = {}
+    bfs_queue = deque()
+    visited_tensors = set(input_names) | init_names
+
+    for idx, inp_name in enumerate(input_names):
+        bfs_queue.append((inp_name, 0, idx))  # (tensor_name, current_depth, origin_input_idx)
+
+    while bfs_queue:
+        tensor, depth, inp_idx = bfs_queue.popleft()
+        if depth >= max_depth:
+            continue
+
+        for node in tensor_to_consumers.get(tensor, []):
+            nid = id(node)
+            node_depth = depth + 1
+            new_prio = (node_depth, inp_idx)
+            
+            # 记录最优优先级（更浅深度 或 更靠前的输入分支）
+            if nid not in node_priority or new_prio < node_priority[nid]:
+                node_priority[nid] = new_prio
+                for out in node.output:
+                    if out not in visited_tensors:
+                        visited_tensors.add(out)
+                        bfs_queue.append((out, node_depth, inp_idx))
+
+    # 未访问到的节点（超过深度或独立分支）赋予最低优先级
+    default_prio = (max_depth + 1, len(input_names))
+    for node in nodes_list:
+        if id(node) not in node_priority:
+            node_priority[id(node)] = default_prio
+
+    # 4. 基于优先级的拓扑排序 (Kahn算法 + 最小堆)
+    in_degree = {id(n): 0 for n in nodes_list}
+    node_to_consumers = defaultdict(list)
+
+    for node in nodes_list:
+        for inp in node.input:
+            producer = tensor_to_producer.get(inp)
+            # 仅统计由图中其他节点产生的输入（自动忽略 initializers 和 graph.input）
+            if producer is not None:
+                in_degree[id(node)] += 1
+                node_to_consumers[id(producer)].append(id(node))
+
+    # 初始化最小堆: (depth, input_idx, stable_counter, node_id)
+    heap = []
+    counter = 0
+    for nid, deg in in_degree.items():
+        if deg == 0:
+            d, idx = node_priority[nid]
+            heapq.heappush(heap, (d, idx, counter, nid))
+            counter += 1
+
+    sorted_nodes = []
+    id_to_node = {id(n): n for n in nodes_list}
+
+    while heap:
+        _, _, _, curr_id = heapq.heappop(heap)
+        sorted_nodes.append(id_to_node[curr_id])
+
+        for cons_id in node_to_consumers[curr_id]:
+            in_degree[cons_id] -= 1
+            if in_degree[cons_id] == 0:
+                d, idx = node_priority[cons_id]
+                heapq.heappush(heap, (d, idx, counter, cons_id))
+                counter += 1
+
+    if len(sorted_nodes) != len(graph.node):
+        raise RuntimeError("Topological sort failed: graph contains cycles or missing dependencies.")
+
+    # 5. 替换 protobuf repeated field
+    del graph.node[:]
+    graph.node.extend(sorted_nodes)
+
+    print("reorder nodes by input successfully")
+    # for node in graph.node[:10]:
+    #     print(node.name)
+
+    return model
+
+def reorder_onnx_nodes_by_output(model:onnx.ModelProto, max_depth:int=10) -> onnx.ModelProto:
+    """
+    按输出分支顺序重排 ONNX 节点 (output1优先 -> output2 -> ...)
+    规则: output1 的祖先节点在前, output2 的在后，依此类推
+    仅改变 model.graph.node 列表顺序，严格保证拓扑序以通过 full_check=True
+    """
+
+    graph = model.graph
+    output_names = [out.name for out in graph.output]
+    if len(output_names) < 2:
+        print("output node less than 2, skip reorder")
+        return model
+
+    # for node in graph.node[-25:]:
+    #     print(node.name)
+
+    
+    nodes_list = list(graph.node) # 一次性物化 graph.node，解决 Protobuf 迭代导致 id() 不稳定的问题
+    max_depth = min(max_depth, len(nodes_list))
+    original_indices = {id(n): i for i, n in enumerate(nodes_list)}
+
+    # 构建 tensor -> producer 映射
+    tensor_to_producer = {}
+    for node in nodes_list:
+        for out in node.output:
+            tensor_to_producer[out] = node
+
+    # 1. 反向 BFS 分配优先级
+    # output1 -> prio 0, output2 -> prio 1, ... 值越小越先出堆，越排在列表前面
+    node_priority = {}
+    bfs_queue = deque()
+    visited_tensors = set(output_names)
+
+    for idx, out_name in enumerate(output_names):
+        bfs_queue.append((out_name, 0, idx))  # (tensor, depth, priority)
+
+    while bfs_queue:
+        tensor, depth, prio = bfs_queue.popleft()
+        if depth >= max_depth:
+            continue
+
+        producer = tensor_to_producer.get(tensor)
+        if producer is None:
+            continue  # 追溯到 graph.input 或 initializer，自动停止
+
+        nid = id(producer)
+        # 共享节点归属优先级更高（值更小，即更靠近 output1）的分支
+        if nid not in node_priority or prio < node_priority[nid]:
+            node_priority[nid] = prio
+            for inp in producer.input:
+                if inp not in visited_tensors:
+                    visited_tensors.add(inp)
+                    bfs_queue.append((inp, depth + 1, prio))
+
+    # 未访问到的节点（超过深度或早期公共层）赋予最高优先级(-1)
+    # 确保它们被调度到列表最前面，保持原图自然流向，输出分支节点集中在列表末尾
+    default_prio = -1
+    for node in nodes_list:
+        if id(node) not in node_priority:
+            node_priority[id(node)] = default_prio
+
+    # 2. 基于优先级的拓扑排序 (Kahn算法 + 最小堆)
+    in_degree = {id(n): 0 for n in nodes_list}
+    node_to_consumers = defaultdict(list)
+
+    for node in nodes_list:
+        for inp in node.input:
+            producer = tensor_to_producer.get(inp)
+            # 仅统计由图中其他节点产生的输入（自动忽略 initializers 和 graph.input）
+            if producer is not None:
+                pid = id(producer)
+                if pid in in_degree:  # 防御性检查
+                    in_degree[id(node)] += 1
+                    node_to_consumers[pid].append(id(node))
+
+    # 初始化最小堆: (branch_priority, original_index, stable_counter, node_id)
+    heap = []
+    counter = 0
+    for nid, deg in in_degree.items():
+        if deg == 0:
+            prio = node_priority[nid]
+            orig_idx = original_indices[nid]
+            heapq.heappush(heap, (prio, orig_idx, counter, nid))
+            counter += 1
+
+    sorted_nodes = []
+    id_to_node = {id(n): n for n in nodes_list}
+
+    while heap:
+        _, _, _, curr_id = heapq.heappop(heap)
+        sorted_nodes.append(id_to_node[curr_id])
+
+        for cons_id in node_to_consumers[curr_id]:
+            in_degree[cons_id] -= 1
+            if in_degree[cons_id] == 0:
+                prio = node_priority[cons_id]
+                orig_idx = original_indices[cons_id]
+                heapq.heappush(heap, (prio, orig_idx, counter, cons_id))
+                counter += 1
+
+    if len(sorted_nodes) != len(nodes_list):
+        raise RuntimeError("Topological sort failed: graph contains cycles or missing dependencies.")
+
+    # 3. 替换 protobuf repeated field
+    del graph.node[:]
+    graph.node.extend(sorted_nodes)
+
+    print("reorder nodes by output successfully")
+    # for node in graph.node[-25:]:
+    #     print(node.name)
+
+    return model
+
+
+
 
 class OnnxToQNN:
     def __init__(self, model_path:str, qnn_model_path:str, dataset_path:str):
@@ -33,7 +267,10 @@ class OnnxToQNN:
 
         self.model_path = Path(model_path).resolve()
         self.qnn_model_path = Path(qnn_model_path).resolve()
-        self.dataset_path = Path(dataset_path).resolve()
+
+        self.dataset_path = dataset_path
+        if dataset_path:
+            self.dataset_path = Path(dataset_path).resolve()
 
         current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
 
@@ -77,11 +314,8 @@ class OnnxToQNN:
         self.use_8bit_bias = use_8bit_bias
         print(f"Quantization method has been set to param_quant_method={self.param_quant_method}, act_quant_method={self.act_quant_method}, bitwidth={self.weights_bitwidth}w{self.act_bitwidth}a")
 
-    def use_custom_alibration_data(self, custom_alibration_data_path:list[str]):
+    def use_custom_alibration_data(self, custom_alibration_data_path:str):
         self.custom_alibration_data_path = Path(custom_alibration_data_path).resolve()
-
-    def set_do_accuracy_analysis(self, accuracy_analysis_picture_path:str):
-        self.accuracy_analysis_picture_path = os.path.abspath(accuracy_analysis_picture_path)
 
     def convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]], set_input_order:str='nhwc'):
         """
@@ -101,16 +335,21 @@ class OnnxToQNN:
         if dlc_model_path is None:
             exit(1)
 
+        calibration_data_index_path = None
         if self.custom_alibration_data_path is None:
-            calibration_data_index_path = self.generate_calibration_data(onnx_model_info, set_input_order)
+            if self.dataset_path:
+                calibration_data_index_path = self.generate_calibration_data(onnx_model_info, set_input_order)
         else:
             calibration_data_index_path = self.custom_alibration_data_path
-        if calibration_data_index_path is None:
-            exit(1)
-        
-        quantized_dlc_model_path = self.quantize_model(dlc_model_path, calibration_data_index_path)
+
+        if calibration_data_index_path is not None:
+            quantized_dlc_model_path = self.quantize_model(dlc_model_path, calibration_data_index_path)
+        else:
+            quantized_dlc_model_path = dlc_model_path
+
         if quantized_dlc_model_path is None:
             exit(1)
+
 
         config_path = self.write_config_file(dlc_model_path)
 
@@ -146,6 +385,7 @@ class OnnxToQNN:
                 print(f"failed to delete {file_or_dir} due to {e}")
 
         print(f"cleaned {file_count} files and {dir_count} dirs")
+
 
     @staticmethod
     def run_subprocess(command:str) -> int:
@@ -226,20 +466,11 @@ class OnnxToQNN:
         # 确保tmp目录存在
         self.tmp_dir.mkdir(exist_ok=True)
 
-        # 清空tmp目录内容
-        # for item in self.tmp_dir.iterdir():
-        #     if item.is_file():
-        #         item.unlink()
-        #     elif item.is_dir():
-        #         shutil.rmtree(item)
-
-        
         if not self.model_path.exists():
             print(f"Error: ONNX file not found at {self.model_path}")
             return None
         
         model = onnx.load_model(str(self.model_path))
-
 
         # 检查是否需要归一化
         need_mean_normalization = False
@@ -255,85 +486,94 @@ class OnnxToQNN:
         
 
         if need_mean_normalization or need_std_normalization:
-            mean_sub_node_name = "Normalization_Sub"
-            std_div_node_name = "Normalization_Div"
+            nodes_to_add = []
+            initializers_to_add = []
 
             # 获取原始输入信息
             for index, input_node in enumerate(model.graph.input):
                 input_name = input_node.name
+
+                mean_sub_node_name = f"{input_name}_Normalization_Sub"
+                std_div_node_name = f"{input_name}_Normalization_Div"
 
                 input_mean = mean_rgb[index]
                 input_std = std_rgb[index]
                 mean = np.array(input_mean, np.float32).reshape(1, len(input_mean), 1, 1)
                 std = np.array(input_std, np.float32).reshape(1, len(input_std), 1, 1)
 
-
+                current_input = input_name
                 # 添加减法节点
                 if need_mean_normalization:
                     # 将mean转换为ONNX张量
-                    mean_tensor = onnx.numpy_helper.from_array(mean, name="mean_tensor")
+                    mean_tensor = onnx.numpy_helper.from_array(mean, name=f"{input_name}_mean_tensor")
                     
                     # 创建减法节点：(input - mean)
                     sub_output = input_name + "_sub"
                     sub_node = onnx.helper.make_node(
                         'Sub',
-                        inputs=[input_name, "mean_tensor"],
+                        inputs=[input_name, mean_tensor.name],
                         outputs=[sub_output],
                         name=mean_sub_node_name
                     )
-                    model.graph.node.insert(0, sub_node)
-                    model.graph.initializer.insert(0, mean_tensor)
-                    current_input = sub_output
-                else:
-                    current_input = input_name
 
+                    nodes_to_add.append(sub_node)
+                    initializers_to_add.append(mean_tensor)
+
+                    current_input = sub_output
 
                 # 添加除法节点
                 if need_std_normalization:
-                    div_output = input_name + "_normalized"
-
                     # 将std转换为ONNX张量
-                    std_tensor = onnx.numpy_helper.from_array(std, name="std_tensor")
+                    std_tensor = onnx.numpy_helper.from_array(std, name=f"{input_name}_std_tensor")
                     
-
                     # 创建除法节点：input / std
+                    div_output = f"{input_name}_normalized"
                     div_node = onnx.helper.make_node(
                         'Div',
-                        inputs=[current_input, "std_tensor"],
+                        inputs=[current_input, std_tensor.name],
                         outputs=[div_output],
                         name=std_div_node_name
                     )
-                    insert_index = 0
-                    if need_mean_normalization:
-                        insert_index = 1
-                    model.graph.node.insert(insert_index, div_node)
-                    model.graph.initializer.insert(insert_index, std_tensor)
+
+                    nodes_to_add.append(div_node)
+                    initializers_to_add.append(std_tensor)
 
                     current_input = div_output
 
 
                 # 更新所有使用原始输入的节点
                 for node in model.graph.node:
-                    # print(node.name)
                     if node.name != mean_sub_node_name and node.name != std_div_node_name:
                         for i, node_input in enumerate(node.input):
                             if node_input == input_name:
                                 node.input[i] = current_input
 
 
-            onnx.checker.check_model(model, full_check=True)
-            model = onnx.shape_inference.infer_shapes(model, check_type=True, strict_mode=True)
+            nodes_to_add.reverse()
+            initializers_to_add.reverse()
+
+            for node in nodes_to_add:
+                model.graph.node.insert(0, node)
+            for initializer in initializers_to_add:
+                model.graph.initializer.insert(0, initializer)
+
+
+        model = reorder_onnx_nodes_by_input(model, 5)
+        model = reorder_onnx_nodes_by_output(model, 10)
+
+        onnx.checker.check_model(model, full_check=True)
+        model = onnx.shape_inference.infer_shapes(model, check_type=True, strict_mode=True)
+
 
         # 复制ONNX文件到tmp目录
         onnx.save_model(model, str(self.tmp_onnx_path))
         self.file_or_dir_to_clean.append(self.tmp_onnx_path)
         print(f"Copied ONNX file to {self.tmp_onnx_path}")
 
-
         try:
             # 加载ONNX模型
             model = onnx.load_model(str(self.tmp_onnx_path))
-            
+
             # 获取输入信息
             inputs = []
             for input in model.graph.input:
@@ -352,7 +592,10 @@ class OnnxToQNN:
                 }
                 outputs.append(output_info)
 
-            return {"inputs": inputs, "outputs": outputs}
+            model_info = {"inputs": inputs, "outputs": outputs}
+            print(f"Model info: {model_info}")
+
+            return model_info
             
         except Exception as e:
             print(f"Error reading ONNX model: {str(e)}")
@@ -378,7 +621,10 @@ class OnnxToQNN:
         
         layout_args = " ".join(layout_params) # 将布局参数拼接成字符串
         
-        extra_args = '--target_backend HTP --onnx_skip_simplification --onnx_summary'
+        extra_args = '--target_backend HTP --onnx_summary' # --preserve_onnx_output_order
+
+        if not self.dataset_path and not self.custom_alibration_data_path:
+            extra_args += " --float_bitwidth 16"
 
         # 运行qairt-converter命令
         command = f"qairt-converter --input_network {str(self.tmp_onnx_path)} {layout_args} {extra_args}"
@@ -407,12 +653,19 @@ class OnnxToQNN:
         """
         try:
             # 读取数据集文件
-            with open(str(self.dataset_path), 'r') as f:
-                image_path_list = [line.strip() for line in f if line.strip()]
-
-            # 构建完整图片路径
             dataset_dir = str(self.dataset_path.parent)
-            full_img_path_list = [os.path.join(dataset_dir, img_path) for img_path in image_path_list]
+            dataset_path_list = []
+            with open(str(self.dataset_path), 'r') as f:
+                # 逐行读取文件
+                lines = f.readlines()
+
+                for line in lines: # 如果行不为空，则分割路径
+                    line = line.strip() # 去除首尾空白字符
+                    if line:
+                        one_line_paths_list = [path for path in line.split(' ') if path] # 按空格分割路径，并过滤掉空字符串
+                        full_path_list = [os.path.join(dataset_dir, img_path) for img_path in one_line_paths_list] # 构建完整图片路径
+                        dataset_path_list.append(full_path_list)
+
 
             # 为每个输入创建目录和文件列表
             calibration_files = []
@@ -434,14 +687,16 @@ class OnnxToQNN:
                     img.tofile(output_path)
                     #print(f"Processed: {output_path}")
 
-                max_workers = min(16, len(full_img_path_list))
-                Threadpool_to_file = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-                futures: list[concurrent.futures.Future] = []
+                max_workers = min(16, len(dataset_path_list))
+                Threadpool_to_file = ThreadPoolExecutor(max_workers=max_workers)
+                futures: list[Future] = []
 
                 calibration_data_list = []
 
                 # 处理每张图片
-                for full_img_path in full_img_path_list:
+                for j, one_line_paths_list in enumerate(dataset_path_list):
+                    full_img_path = one_line_paths_list[idx]
+
                     # 使用OpenCV读取图片
                     img = cv2.imread(full_img_path)
                     if img is None:
@@ -482,10 +737,10 @@ class OnnxToQNN:
                     # 转换为float32
                     img_float = padded_image.astype(np.float32)
 
-
                     # 生成输出文件名
                     base_name = os.path.splitext(os.path.basename(full_img_path))[0]
                     output_path = os.path.join(output_dir, f"{base_name}.raw")
+
                     calibration_data_list.append(output_path)
 
                     # 提交文件保存任务到线程池
@@ -540,7 +795,7 @@ class OnnxToQNN:
             print(f"Error: DLC model not found at {dlc_model_file}")
             return False
         
-        quantized_dlc_model_path = dlc_model_file.parent / "quantized_model.dlc"
+        quantized_dlc_model_path = dlc_model_file.parent / f"{dlc_model_file.stem}_quantized.dlc"
         input_list_str = calibration_data_index_path
 
         if self.use_8bit_bias is True:
@@ -555,7 +810,6 @@ class OnnxToQNN:
         quantize_args += f'--use_per_channel_quantization '
         quantize_args += f'--param_quantizer_calibration {self.param_quant_method} '
         quantize_args += f'--act_quantizer_calibration {self.act_quant_method} '
-
 
         extra_args = f'{quantize_args} --target_backend HTP'
         
@@ -622,8 +876,7 @@ class OnnxToQNN:
     def generate_context_binary_model(self, quantized_dlc_model_path:str, config_path:str):
 
         command = f"qnn-context-binary-generator --model libQnnModelDlc.so --backend libQnnHtp.so \
-            --dlc_path {quantized_dlc_model_path} \
-            --output_dir {self.qnn_model_path.parent} \
+            --dlc_path {quantized_dlc_model_path} --output_dir {self.qnn_model_path.parent} \
             --binary_file {self.qnn_model_path.stem} \
             --config_file {config_path}"
         #  --profiling_level detailed

@@ -34,6 +34,7 @@ dataset_model_list_for_head = []
 for i, (model_path, qnn_model) in enumerate(zip(MODEL_PATHS, QNN_MODELS)):
     print("turns:", i + 1)
 
+
     if i != last_index:
         onnx_to_qnn = OnnxToQNN(model_path, qnn_model, DATASET_PATH)
         onnx_to_qnn.set_quantization_method(param_quant_method='entropy', act_quant_method='entropy')
@@ -52,12 +53,12 @@ for i, (model_path, qnn_model) in enumerate(zip(MODEL_PATHS, QNN_MODELS)):
         if dataset_model_list_for_head:
             # 创建对象并生成数据集
             dataset_generator = GenYoloDetedDataset(DATASET_PATH, f'cropped_images_0')
-            dataset_generator.set_postprocess_by_another_ai(dataset_model_list_for_head, output_shape="nchw", outpur_format='.npy')
+            dataset_generator.set_postprocess_by_another_ai(dataset_model_list_for_head, output_shape="nhwc", outpur_format='.raw')
 
-            tmp_dataset_path = dataset_generator.gerenate()
+            tmp_dataset_path = dataset_generator.gerenate(swap_image_pair=True)
 
         onnx_to_qnn = OnnxToQNN(model_path, qnn_model, tmp_dataset_path)
-        onnx_to_qnn.set_quantization_method(param_quantization_method='entropy', act_quantization_method='entropy')
+        onnx_to_qnn.set_quantization_method(param_quant_method='entropy', act_quant_method='entropy')
         onnx_to_qnn.use_custom_alibration_data(tmp_dataset_path)
 
 
@@ -66,7 +67,8 @@ for i, (model_path, qnn_model) in enumerate(zip(MODEL_PATHS, QNN_MODELS)):
     else:
         onnx_to_qnn.convert(mean_rgb=[[0]*96,[0]*96], std_rgb=[[1]*96,[1]*96])
 
-    onnx_to_qnn.clean()
+    if i != last_index:
+        onnx_to_qnn.clean()
 
     if dataset_generator:
         dataset_generator.clean()
