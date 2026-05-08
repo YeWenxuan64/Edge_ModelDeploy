@@ -129,15 +129,12 @@ def load_config(config_path):
 
 try:
     from models_convert.original.ultralytics.ultralytics import YOLO
-    from models_convert.original.ultralytics.ultralytics import YOLOE
 
 except Exception as e:
     from ultralytics import YOLO
-    from ultralytics import YOLOE
 
 yolo_config_path = os.path.join(current_path, 'config/yolo26s_[320,640]_cfg.yaml')
 yolo_pose_config_path = os.path.join(current_path, 'config/yolo26s-pose_[320,640]_cfg.yaml')
-yoloe_config_path = os.path.join(current_path, 'config/yoloe26s_[320,640]_cfg.yaml')
 
 
 yolo_onnx_path = os.path.join(current_path, 'models_convert/original/yolo26s.onnx')
@@ -145,9 +142,6 @@ yolo_onnx_output_path = os.path.join(current_path, 'models_convert/onnx/yolo26s_
 
 yolo_pose_onnx_path = os.path.join(current_path, 'models_convert/original/yolo26s-pose.onnx')
 yolo_pose_onnx_output_path = os.path.join(current_path, 'models_convert/onnx/yolo26s-pose_[1,3,320,640].onnx')
-
-yoloe_onnx_path = os.path.join(current_path, 'models_convert/original/yoloe-26s-seg.onnx')
-yoloe_onnx_output_path = os.path.join(current_path, 'models_convert/onnx/yoloe26s_[1,3,320,640].onnx')
 
 
 def export(yolo_type:str="yolo"):
@@ -159,23 +153,14 @@ def export(yolo_type:str="yolo"):
         config_path = yolo_pose_config_path
         YOLO_module = YOLO
 
-    elif yolo_type == "yoloe":
-        config_path = yoloe_config_path
-        YOLO_module = YOLOE
-
     else:
-        raise ValueError("yolo_type must be 'yolo', 'yolo-pose' or 'yoloe'")
+        raise ValueError("yolo_type must be 'yolo', 'yolo-pose'")
 
 
     config = load_config(config_path)
 
     with temporary_chdir(current_path):
         model = YOLO_module(config.model)
-
-        if yolo_type == "yoloe":
-            with temporary_chdir(os.path.join(current_path, 'models_convert/original')):
-                model.set_classes(["person", "animal", "vehicle, bicycle, car, motorcycle, bus, train, truck, airplane, boat"])
-
         model.export(**vars(config))
 
 
@@ -300,22 +285,12 @@ def modify(yolo_type:str="yolo"):
     elif yolo_type == "yolo-pose":
         onnx_model_path = yolo_pose_onnx_path
         onnx_model_output_path = yolo_pose_onnx_output_path
-    elif yolo_type == "yoloe":
-        onnx_model_path = yoloe_onnx_path
-        onnx_model_output_path = yoloe_onnx_output_path
     else:
-        raise ValueError("yolo_type must be 'yolo' or 'yolo-pose' or 'yoloe'")
+        raise ValueError("yolo_type must be 'yolo' or 'yolo-pose'")
 
     onnx_model = onnx.load_model(onnx_model_path)
-    graph = onnx_model.graph
 
     original_info = summarize_model(onnx_model, os.path.basename(onnx_model_path))
-
-    if yolo_type == "yoloe":
-        prune_exclusive_branch(graph, graph.output[1].name)
-        prune_exclusive_branch(graph, "/model.23/Concat_2")
-        prune_exclusive_branch(graph, "/model.23/GatherElements_2")
-
     
     onnx_model = onnxslim.slim(onnx_model)
     onnx_model = onnx.shape_inference.infer_shapes(onnx_model, check_type=True, strict_mode=True)

@@ -112,7 +112,7 @@ class GenYoloDetedDataset:
         current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
         self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
 
-        self.yolo_model_path = Path(os.path.join(current_dir, 'yolo26s_f32([[640,640]],[[1,300,6]]).onnx')).resolve()
+        self.yolo_model_path = os.path.join(current_dir, 'yolo26s_f16([[640,640]],[[1,300,6]]).onnx')
         self.dataset_path = Path(dataset_path).resolve()
         self.output_dir_name = output_dir_name
         self.file_or_dir_to_clean = []
@@ -390,8 +390,11 @@ class GenYoloDetedDataset:
         print(f"cleaned {file_count} files and {dir_count} dirs")
 
 def main():
+    current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
+    parent_dir = os.path.dirname(current_dir)
+
     # 配置参数
-    dataset_path = './datasets/datasets_face.txt'  # 输入图片索引文本
+    dataset_path = os.path.join(parent_dir, 'datasets/datasets_face.txt')  # 输入图片索引文本
 
     # 另一个AI模型路径
     another_ai_path_and_target = [('./NanoTrackV3/models_convert/onnx/NanoTrackV3_backbone_X_255.onnx', 'input'),
@@ -399,7 +402,7 @@ def main():
 
     # 创建对象并生成数据集
     dataset_generator = GenYoloDetedDataset(dataset_path, 'cropped_images2')
-    dataset_generator.set_postprocess_by_another_ai(another_ai_path_and_target, output_shape="nchw", outpur_format='.npy')
+    #dataset_generator.set_postprocess_by_another_ai(another_ai_path_and_target, output_shape="nchw", outpur_format='.npy')
 
     cropped_list_path = dataset_generator.gerenate()
 

@@ -12,7 +12,7 @@ tqdm>=4.64.1
 opencv-python
 fast-histogram>=0.11
 pyyaml
-#easydict
+easydict
 matplotlib
 yacs
 

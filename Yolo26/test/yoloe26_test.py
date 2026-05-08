@@ -80,8 +80,6 @@ def process_predictions(output: np.ndarray) -> list[list[int, int, int, int, int
     return results
 
 
-
-
 class GenYoloDetedDataset:
     def __init__(self, dataset_path:str, model_path:str):
         self.dataset_path = Path(dataset_path).resolve()
@@ -126,7 +124,7 @@ class GenYoloDetedDataset:
             results = process_predictions(output)
 
             self.display(image, results, scale, x_offset, y_offset)
-            time.sleep(0.5)
+            #time.sleep(0.5)
 
 
         cv2.destroyAllWindows()
