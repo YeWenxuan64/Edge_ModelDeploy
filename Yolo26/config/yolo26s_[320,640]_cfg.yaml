@@ -4,7 +4,7 @@
 # For documentation see https://docs.ultralytics.com/usage/cfg/
 
 task: detect # (str) YOLO task, i.e. detect, segment, classify, pose, obb
-mode: train # (str) YOLO mode, i.e. train, val, predict, export, track, benchmark
+mode: export # (str) YOLO mode, i.e. train, val, predict, export, track, benchmark
 
 # Train settings -------------------------------------------------------------------------------------------------------
 model: ./models_convert/original/yolo26s.pt # (str, optional) path to model file, i.e. yolov8n.pt or yolov8n.yaml
