@@ -10,3 +10,6 @@
 [submodule "MSI-Net_ModelDeploy"]
 	path = MSI-Net_ModelDeploy
 	url = https://github.com/YeWenxuan64/MSI-Net_ModelDeploy.git
+[submodule "Yolo11_ModelDeploy"]
+	path = Yolo11_ModelDeploy
+	url = https://github.com/YeWenxuan64/Yolo11_ModelDeploy.git
