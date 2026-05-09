@@ -15,19 +15,8 @@ import cv2
 import onnx
 
 
+from utils import temporary_chdir
 
-# 定义一个上下文管理器以安全地更改目录
-class temporary_chdir:
-    def __init__(self, new_path):
-        self.new_path = new_path
-        self.saved_path = None
-        
-    def __enter__(self):
-        self.saved_path = os.getcwd() # 保存进入前的当前目录
-        os.chdir(self.new_path)       # 切换到新目录
-        
-    def __exit__(self, etype, value, traceback):
-        os.chdir(self.saved_path)     # 无论代码块是否报错，都恢复原来的目录
 
 def reorder_onnx_nodes_by_input(model:onnx.ModelProto, max_depth:int=10) -> onnx.ModelProto:
     """
@@ -356,13 +345,6 @@ class OnnxToQNN:
         self.generate_context_binary_model(quantized_dlc_model_path, config_path)
 
     def clean(self):
-        # if self.tmp_dir.exists():
-        #     if Path('output').exists():
-        #         shutil.rmtree('output')
-                
-        #     shutil.rmtree(self.tmp_dir)
-        #     print(f"Temporary directory {self.tmp_dir} has been removed.")
-
         file_count = 0
         dir_count = 0
 
