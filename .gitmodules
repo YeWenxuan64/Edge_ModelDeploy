@@ -7,3 +7,6 @@
 [submodule "RetinaFace-mobile_ModelDeploy"]
 	path = RetinaFace-mobile_ModelDeploy
 	url = https://github.com/YeWenxuan64/RetinaFace-mobile_ModelDeploy
+[submodule "NanoTrackV3_ModelDeploy"]
+	path = NanoTrackV3_ModelDeploy
+	url = https://github.com/YeWenxuan64/NanoTrackV3_ModelDeploy.git
