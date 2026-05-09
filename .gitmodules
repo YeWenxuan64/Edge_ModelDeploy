@@ -7,3 +7,6 @@
 [submodule "RetinaFace-mobile/models_convert/original/Pytorch_Retinaface"]
 	path = RetinaFace-mobile/models_convert/original/Pytorch_Retinaface
 	url = https://github.com/biubug6/Pytorch_Retinaface.git
+[submodule "Yolo26/models_convert/original/ultralytics"]
+	path = Yolo26/models_convert/original/ultralytics
+	url = https://github.com/ultralytics/ultralytics.git

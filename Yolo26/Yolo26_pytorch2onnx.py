@@ -1,7 +1,6 @@
 import os
 import sys
 import re
-from collections import defaultdict, deque
 import yaml
 import pathlib
 from types import SimpleNamespace
@@ -147,11 +146,9 @@ yolo_pose_onnx_output_path = os.path.join(current_path, 'models_convert/onnx/yol
 def export(yolo_type:str="yolo"):
     if yolo_type == "yolo":
         config_path = yolo_config_path
-        YOLO_module = YOLO
 
     elif yolo_type == "yolo-pose":
         config_path = yolo_pose_config_path
-        YOLO_module = YOLO
 
     else:
         raise ValueError("yolo_type must be 'yolo', 'yolo-pose'")
@@ -160,123 +157,9 @@ def export(yolo_type:str="yolo"):
     config = load_config(config_path)
 
     with temporary_chdir(current_path):
-        model = YOLO_module(config.model)
+        model = YOLO(config.model)
         model.export(**vars(config))
 
-
-def prune_exclusive_branch(graph:onnx.GraphProto, target_name: str):
-    """
-    精准删除目标节点及其独占上游父节点，并安全处理下游汇合点（如 G->D）。
-    
-    :param graph: onnx.GraphProto 对象
-    :param target_name: 目标节点名 或 输出Tensor名
-
-    :return: 被删除的节点名集合
-    """
-
-    # 1. 确保节点有唯一名称
-    for i, node in enumerate(graph.node):
-        if not node.name:
-            node.name = f"auto_node_{i}"
-
-    # 2. 构建映射表
-    tensor_to_producer = {}
-    tensor_to_consumers = defaultdict(list)
-    for node in graph.node:
-        for out in node.output:
-            tensor_to_producer[out] = node
-        for inp in node.input:
-            tensor_to_consumers[inp].append(node)
-
-    # 定位目标节点（支持传节点名或Tensor名）
-    target_node = next((n for n in graph.node if n.name == target_name), None)
-    if not target_node and target_name in tensor_to_producer:
-        target_node = tensor_to_producer[target_name]
-        print(f"从目标点'{target_name}'开始")
-
-    if not target_node:
-        raise ValueError(f"未找到目标节点或Tensor: '{target_name}'")
-
-    # 3. 向上BFS：精准收集“独占上游”节点
-    nodes_to_delete = set()
-    queue = deque([target_node])
-    
-    while queue:
-        node = queue.popleft()
-        nodes_to_delete.add(node.name)
-
-        for inp in node.input:
-            if inp not in tensor_to_producer:
-                continue  # 遇到 graph.input 或 initializer 停止
-            
-            parent = tensor_to_producer[inp]
-            if parent.name in nodes_to_delete:
-                continue
-
-            # 核心判断：父节点是否被其他非删除分支共享？
-            is_shared = False
-            for out_t in parent.output:
-                for consumer in tensor_to_consumers.get(out_t, []):
-                    if consumer.name != node.name and consumer.name not in nodes_to_delete:
-                        is_shared = True
-                        break
-                if is_shared:
-                    break
-            
-            if not is_shared:
-                queue.append(parent)
-
-    nodes_to_delete.add(target_name)
-    print(f"准备删除独占节点: {nodes_to_delete}")
-
-    # 4. 处理下游汇合边
-    deleted_tensors = set()
-    for node in graph.node:
-        if node.name in nodes_to_delete:
-            deleted_tensors.update(node.output)
-
-    for t_name in deleted_tensors:
-        for consumer in tensor_to_consumers.get(t_name, []):
-            if consumer.name not in nodes_to_delete:
-                # 直接移除该输入边
-                new_inputs = [i for i in consumer.input if i != t_name]
-                del consumer.input[:]
-                consumer.input.extend(new_inputs)
-                print(f"已断开边: {t_name} -> {consumer.name} (剩余输入数: {len(consumer.input)})")
-
-
-    # 5. 执行节点删除
-    new_nodes = [n for n in graph.node if n.name not in nodes_to_delete]
-    graph.node.clear()
-    graph.node.extend(new_nodes)
-
-    new_outputs = [out for out in graph.output if out.name not in nodes_to_delete]
-    graph.output.clear()
-    graph.output.extend(new_outputs)
-
-    # 6. 清理孤儿Tensor/Initializer/ValueInfo
-    used_tensors = set()
-    for n in graph.node:
-        used_tensors.update(n.input)
-        used_tensors.update(n.output)
-
-    for out in graph.output:
-        used_tensors.add(out.name)
-
-    new_input = [inp for inp in graph.input if inp.name in used_tensors]
-    graph.input.clear()
-    graph.input.extend(new_input)
-
-
-    new_value_info = [vi for vi in graph.value_info if vi.name in used_tensors]
-    graph.value_info.clear()
-    graph.value_info.extend(new_value_info)
-
-    new_initializer = [init for init in graph.initializer if init.name in used_tensors]
-    graph.initializer.clear()
-    graph.initializer.extend(new_initializer)
-
-    return nodes_to_delete
 
 def modify(yolo_type:str="yolo"):
     if yolo_type == "yolo":
