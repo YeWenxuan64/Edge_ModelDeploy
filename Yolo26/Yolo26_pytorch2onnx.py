@@ -3,6 +3,7 @@ import sys
 import re
 import yaml
 import pathlib
+import argparse
 from types import SimpleNamespace
 
 import onnx
@@ -152,7 +153,7 @@ def export(yolo_type:str="yolo"):
 
     else:
         raise ValueError("yolo_type must be 'yolo', 'yolo-pose'")
-
+    print(f"Exporting model: {yolo_type}")
 
     config = load_config(config_path)
 
@@ -170,6 +171,7 @@ def modify(yolo_type:str="yolo"):
         onnx_model_output_path = yolo_pose_onnx_output_path
     else:
         raise ValueError("yolo_type must be 'yolo' or 'yolo-pose'")
+    print(f"Simpling model: {yolo_type}")
 
     onnx_model = onnx.load_model(onnx_model_path)
 
@@ -184,8 +186,24 @@ def modify(yolo_type:str="yolo"):
     print_model_info_as_table([original_info, slimmed_info])
 
 
-yolo_type = "yolo"
-# yolo_type = "yolo-pose"
 
-export(yolo_type)
-modify(yolo_type)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='YOLO model exporter')
+
+    parser.add_argument(
+        '--yolo_type', 
+        type=str, 
+        default='yolo',
+        choices=['yolo', 'yolo-pose'],
+        required=False,
+        help='Type of YOLO model to process (default: yolo)'
+    )
+
+    yolo_type = parser.parse_args().yolo_type
+
+    # yolo_type = "yolo"
+    # yolo_type = "yolo-pose"
+
+    export(yolo_type)
+    modify(yolo_type)
