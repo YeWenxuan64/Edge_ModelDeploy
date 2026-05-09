@@ -7,3 +7,6 @@
 [submodule "NanoTrackV3_ModelDeploy"]
 	path = NanoTrackV3_ModelDeploy
 	url = https://github.com/YeWenxuan64/NanoTrackV3_ModelDeploy.git
+[submodule "MSI-Net_ModelDeploy"]
+	path = MSI-Net_ModelDeploy
+	url = https://github.com/YeWenxuan64/MSI-Net_ModelDeploy.git
