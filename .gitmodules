@@ -13,3 +13,6 @@
 [submodule "MSI-Net"]
 	path = MSI-Net
 	url = https://github.com/YeWenxuan64/MSI-Net_Saliency-Detection_ModelDeploy.git
+[submodule "AVTrack"]
+	path = AVTrack
+	url = https://github.com/YeWenxuan64/AVTrack_ModelDeploy
