@@ -1,6 +1,3 @@
-[submodule "NanoTrackV3/models_convert/original/SiamTrackers"]
-	path = NanoTrackV3/models_convert/original/SiamTrackers
-	url = https://github.com/HonglinChu/SiamTrackers.git
 [submodule "Yolo11/models_convert/original/ultralytics_yolo11"]
 	path = Yolo11/models_convert/original/ultralytics_yolo11
 	url = https://github.com/airockchip/ultralytics_yolo11.git
