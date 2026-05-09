@@ -4,3 +4,6 @@
 [submodule "AVTrack_ModelDeploy"]
 	path = AVTrack_ModelDeploy
 	url = https://github.com/YeWenxuan64/AVTrack_ModelDeploy.git
+[submodule "RetinaFace-mobile_ModelDeploy"]
+	path = RetinaFace-mobile_ModelDeploy
+	url = https://github.com/YeWenxuan64/RetinaFace-mobile_ModelDeploy
