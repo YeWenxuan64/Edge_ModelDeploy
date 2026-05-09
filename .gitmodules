@@ -13,3 +13,6 @@
 [submodule "Yolo11_ModelDeploy"]
 	path = Yolo11_ModelDeploy
 	url = https://github.com/YeWenxuan64/Yolo11_ModelDeploy.git
+[submodule "Yolo26_ModelDeploy"]
+	path = Yolo26_ModelDeploy
+	url = https://github.com/YeWenxuan64/Yolo26_ModelDeploy.git
