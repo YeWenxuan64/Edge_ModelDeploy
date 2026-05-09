@@ -1,6 +1,3 @@
-[submodule "RetinaFace-mobile/models_convert/original/Pytorch_Retinaface"]
-	path = RetinaFace-mobile/models_convert/original/Pytorch_Retinaface
-	url = https://github.com/biubug6/Pytorch_Retinaface.git
 [submodule "MSI-Net"]
 	path = MSI-Net
 	url = https://github.com/YeWenxuan64/MSI-Net_Saliency-Detection_ModelDeploy.git
