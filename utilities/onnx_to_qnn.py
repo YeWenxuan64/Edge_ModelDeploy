@@ -15,7 +15,18 @@ import cv2
 import onnx
 
 
-from utils import temporary_chdir
+try:
+    from utils import temporary_chdir
+
+except ImportError:
+    try:
+        from .utils import temporary_chdir
+
+    except ImportError:
+        import sys
+        current_dir = Path(__file__).parent.resolve()
+        sys.path.append(str(current_dir))
+        from utils import temporary_chdir
 
 
 def reorder_onnx_nodes_by_input(model:onnx.ModelProto, max_depth:int=10) -> onnx.ModelProto:
@@ -252,7 +263,19 @@ def reorder_onnx_nodes_by_output(model:onnx.ModelProto, max_depth:int=10) -> onn
 
 class OnnxToQNN:
     def __init__(self, model_path:str, qnn_model_path:str, dataset_path:str):
-        self.platform = platform.system() # 'Windows' or 'Linux'
+        """
+        Initialize the ONNX to QNN converter.
+
+        Args:
+            model_path (str): Path to the input ONNX model file that needs to be converted.
+
+            qnn_model_path (str): Path where the converted QNN model file will be saved.
+
+            dataset_path (str | None): Path to a text file containing paths to dataset images for quantization. 
+                - The text file should contain one image path per line for single-input models, 
+                or multiple image paths separated by spaces for multi-input models.
+                - Default is None. no quantization will be performed.
+        """
 
         self.model_path = Path(model_path).resolve()
         self.qnn_model_path = Path(qnn_model_path).resolve()
@@ -273,18 +296,30 @@ class OnnxToQNN:
         self.file_or_dir_to_clean = []
 
         self.set_quantization_method()
-        self.custom_alibration_data_path:str|None = None
-        self.accuracy_analysis_picture_path:str|None = None
+        self.use_custom_alibration_data()
 
-    def set_quantization_method(self, param_quant_method:str='percentile', act_quant_method:str='entropy', bitwidth:str='w8a8', use_8bit_bias:bool=False):
+
+    def set_quantization_method(self, param_quant_method:str='percentile', act_quant_method:str='entropy', bitwidth:str='w8a8', bias_bitwidth:int=8):
         """
-        重新配置量化参数
+        Configure quantization parameters for the model.
         
-        参数:
-            param_quant_method: 参数量化方法，可选 'min-max', 'sqnr', 'percentile', 'mse', 'entropy'
-            act_quant_method: 激活量化方法，可选 'min-max', 'sqnr', 'percentile', 'mse', 'entropy'
-            bitwidth: 量化位数配置，格式为'wWaA'，其中w是权重位数，A是激活位数
-                     可选 'w4a8', 'w4a16', 'w8a8', 'w8a16', 'w16a16'
+        Args:
+            param_quant_method (str): Quantization method for model parameters (weights).
+                - Available options: 'min-max', 'sqnr', 'percentile', 'mse', 'entropy'.
+                - Default: 'percentile'.
+
+            act_quant_method (str): Quantization method for activations.
+                - Available options: 'min-max', 'sqnr', 'percentile', 'mse', 'entropy'.
+                - Default: 'entropy'.
+
+            bitwidth (str): Quantization bitwidth configuration in format 'w<W>a<A>', 
+                where W is weight bitwidth and A is activation bitwidth.
+                - Available options: 'w4a8', 'w4a16', 'w8a8', 'w8a16', 'w16a16'.
+                - Default: 'w8a8'.
+
+            bias_bitwidth (int): Bitwidth for bias quantization.
+                - Available options: 8, 32.
+                - Default: 8.
         """
 
         if param_quant_method not in ['min-max', 'sqnr', 'percentile', 'mse', 'entropy']:
@@ -296,22 +331,56 @@ class OnnxToQNN:
         if bitwidth not in ['w4a8', 'w4a16', 'w8a8', 'w8a16', 'w16a16']:
             raise ValueError('bitwidth must be one of w4a8, w4a16, w8a8, w8a16, w16a16')
         
+        if bias_bitwidth not in [8, 32]:
+            raise ValueError('bias_bitwidth must be 8 or 32')
+        
         self.param_quant_method = param_quant_method
         self.act_quant_method = act_quant_method
         self.weights_bitwidth = int(bitwidth[1:2])  # 提取w后面的数字
         self.act_bitwidth = int(bitwidth[3:4])      # 提取a后面的数字
-        self.use_8bit_bias = use_8bit_bias
+        self.bias_bitwidth = bias_bitwidth
         print(f"Quantization method has been set to param_quant_method={self.param_quant_method}, act_quant_method={self.act_quant_method}, bitwidth={self.weights_bitwidth}w{self.act_bitwidth}a")
 
-    def use_custom_alibration_data(self, custom_alibration_data_path:str):
-        self.custom_alibration_data_path = Path(custom_alibration_data_path).resolve()
+    def use_custom_alibration_data(self, custom_alibration_data_path:str|None):
+        """
+        Args:
+            custom_alibration_data_path (str | None): Path to a text file containing the custom calibration dataset.
+                - Each line in the text file should represent a path to image data.
+                - If the model has multiple inputs, the paths should be separated by spaces.
+                
+                - The calibration data must be preprocessed to match the model's input dimensions, format, and data type.
+                - The data must be in .raw binary format generated by np.ndarray.tofile().
+                
+                - Example: If the model input is float32 data with shape [1, 3, 224, 224], 
+                the images must be preprocessed to match this shape and data type before being converted to .raw format.
+                ```
+                resized_image = cv2.resize(image, (224, 224))
+                tranposed_image = np.transpose(resized_image, (2, 0, 1))
+                batched_image = np.expand_dims(tranposed_image, axis=0)
+                np.float32(batched_image).tofile('image.raw')
+                ```
+        """
+
+        if custom_alibration_data_path is None:
+            self.custom_alibration_data_path = None
+        else:
+            self.custom_alibration_data_path = Path(custom_alibration_data_path).resolve()
 
     def convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]], set_input_order:str='nhwc'):
         """
         Args:
-            mean_rgb: Mean RGB values for each channel.
-            std_rgb: Standard deviation RGB values for each channel.
-            set_input_order: Input order for the model. 'nhwc' or 'nchw'.
+            mean_rgb (list[list[int | float,]], optional): Mean values for RGB channels normalization.
+                - Each inner list contains 3 values (R, G, B) representing the mean for each channel in one input.
+                - If multiple inputs are provided, For example, [[123, 116, 103], [123, 116, 103]]
+                - Defaults to [[0, 0, 0]] (no mean normalization).
+                
+            std_rgb (list[list[int | float,]], optional): Standard deviation values for RGB channels normalization.
+                - Each inner list should contain 3 values (R, G, B) representing the standard deviation for each channel in one input.
+                - Similar to mean_rgb, can provide multiple lists for multiple inputs.
+                - Defaults to [[1, 1, 1]] (no standard deviation normalization).
+
+            set_input_order (str, optional): Input order for the converted model. 'nhwc' or 'nchw'.
+                - Defaults to 'nhwc'.
         """
 
         self.run_env_script()
@@ -371,7 +440,6 @@ class OnnxToQNN:
 
     @staticmethod
     def run_subprocess(command:str) -> int:
-
         executable = '/bin/bash'
         print(f"Running command: {command}")
 
@@ -395,20 +463,17 @@ class OnnxToQNN:
         return return_code
 
     def run_env_script(self):
-
         # Linux/Unix系统使用bash脚本
-        envsetup_script = os.path.join(self.qnn_sdk_dir, 'bin/envsetup.sh')
+        envsetup_script = self.qnn_sdk_dir / 'bin/envsetup.sh'
         command = f"source '{envsetup_script}' && env"
         executable = '/bin/bash'
         encoding = 'utf-8'
-        print("Setting up Linux environment...")
+        print("Setting up QAIRT Linux environment...")
             
-
         # 执行脚本
         proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, executable=executable)
         
-        # 获取输出
-        stdout, stderr = proc.communicate()
+        stdout, stderr = proc.communicate() # 获取输出
         
         if proc.returncode != 0:
             print(f"Error executing script: {stderr.decode(encoding)}")
@@ -418,7 +483,6 @@ class OnnxToQNN:
         for line in stdout.decode().split('\n'):
             if '=' in line:
                 key, value = line.split('=', 1)
-                #print(f"Setting environment variable: {key}={value}")
                 os.environ[key] = value
         
     def get_onnx_model_info(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]) -> dict|None:
@@ -445,8 +509,8 @@ class OnnxToQNN:
                 ]
             }
         """
-        # 确保tmp目录存在
-        self.tmp_dir.mkdir(exist_ok=True)
+        
+        self.tmp_dir.mkdir(exist_ok=True) # 确保tmp目录存在
 
         if not self.model_path.exists():
             print(f"Error: ONNX file not found at {self.model_path}")
@@ -584,37 +648,31 @@ class OnnxToQNN:
             return None
 
     def convert_onnx_model(self, onnx_model_info:dict, set_input_order:str) -> str|None:
-        """
-        转换ONNX模型
-        
-        Args:
-            onnx_model_info: 包含模型输入输出信息的字典
-        """
 
         layout_params = [] # 构建输入布局参数
-        for input_info in onnx_model_info.get("inputs", []): 
+        for input_info in onnx_model_info.get("inputs"): 
             input_name = input_info["name"]
             
             if set_input_order == 'nhwc': # 为每个输入添加源布局和目标布局参数
-                layout_params.extend([f'--source_model_input_layout "{input_name}" NCHW',
-                                      f'--desired_input_layout "{input_name}" NHWC'])
+                layout_params.extend([f'--source_model_input_layout "{input_name}" NCHW', f'--desired_input_layout "{input_name}" NHWC'])
                 
             layout_params.extend([f'--desired_input_color_encoding "{input_name}" rgb rgb'])
         
         layout_args = " ".join(layout_params) # 将布局参数拼接成字符串
-        
+
+
         extra_args = '--target_backend HTP --onnx_summary' # --preserve_onnx_output_order
 
         if not self.dataset_path and not self.custom_alibration_data_path:
             extra_args += " --float_bitwidth 16"
 
-        # 运行qairt-converter命令
+
         command = f"qairt-converter --input_network {str(self.tmp_onnx_path)} {layout_args} {extra_args}"
 
         return_code = self.run_subprocess(command)
         
         if return_code == 0:
-            print("Conversion successful!")
+            print("Convert onnx to qnn-dlc successful!")
 
             dlc_path = self.tmp_onnx_path.with_suffix('.dlc')
             self.file_or_dir_to_clean.append(dlc_path)
@@ -637,6 +695,7 @@ class OnnxToQNN:
             # 读取数据集文件
             dataset_dir = str(self.dataset_path.parent)
             dataset_path_list = []
+
             with open(str(self.dataset_path), 'r') as f:
                 # 逐行读取文件
                 lines = f.readlines()
@@ -667,7 +726,6 @@ class OnnxToQNN:
 
                 def to_file_thread(img: np.ndarray, output_path: str):
                     img.tofile(output_path)
-                    #print(f"Processed: {output_path}")
 
                 max_workers = min(16, len(dataset_path_list))
                 Threadpool_to_file = ThreadPoolExecutor(max_workers=max_workers)
@@ -772,26 +830,20 @@ class OnnxToQNN:
 
     def quantize_model(self, dlc_model_path:str, calibration_data_index_path:str) -> str|None:
         dlc_model_file = Path(str(dlc_model_path))
+        input_list_str = str(calibration_data_index_path)
+        quantized_dlc_model_path = dlc_model_file.parent / f"{dlc_model_file.stem}_quantized.dlc"
 
         if not dlc_model_file.exists():
             print(f"Error: DLC model not found at {dlc_model_file}")
             return False
         
-        quantized_dlc_model_path = dlc_model_file.parent / f"{dlc_model_file.stem}_quantized.dlc"
-        input_list_str = calibration_data_index_path
 
-        if self.use_8bit_bias is True:
-            bias_bitwidth = 8
-        else:
-            bias_bitwidth = 32
-
-
-        quantize_args = f'--weights_bitwidth {self.weights_bitwidth} '
-        quantize_args += f'--act_bitwidth {self.act_bitwidth} '
-        quantize_args += f'--bias_bitwidth {bias_bitwidth} '
-        quantize_args += f'--use_per_channel_quantization '
-        quantize_args += f'--param_quantizer_calibration {self.param_quant_method} '
-        quantize_args += f'--act_quantizer_calibration {self.act_quant_method} '
+        quantize_args = f'--weights_bitwidth {self.weights_bitwidth}'
+        quantize_args += f' --act_bitwidth {self.act_bitwidth} '
+        quantize_args += f' --bias_bitwidth {self.bias_bitwidth}'
+        quantize_args += f' --use_per_channel_quantization'
+        quantize_args += f' --param_quantizer_calibration {self.param_quant_method}'
+        quantize_args += f' --act_quantizer_calibration {self.act_quant_method}'
 
         extra_args = f'{quantize_args} --target_backend HTP'
         
@@ -800,7 +852,7 @@ class OnnxToQNN:
         with temporary_chdir(self.tmp_dir):
             return_code = self.run_subprocess(command)
 
-        self.file_or_dir_to_clean.append(os.path.join(str(self.tmp_dir), 'output'))
+        self.file_or_dir_to_clean.append(self.tmp_dir / 'output')
 
         if return_code == 0:
             self.file_or_dir_to_clean.append(quantized_dlc_model_path)
@@ -812,8 +864,9 @@ class OnnxToQNN:
 
     def write_config_file(self, dlc_model_path:str) -> str:
         dlc_model_file = Path(str(dlc_model_path))
-        
+
         config_backend_path = dlc_model_file.parent / "config_backend.json"
+        config_file_path = dlc_model_file.parent / "config_file.json"
 
         # 创建配置字典
         config_backend = {
@@ -840,12 +893,9 @@ class OnnxToQNN:
         }
 
         # 将配置写入JSON文件
-        
         with open(str(config_backend_path), 'w') as f:
             json.dump(config_backend, f, indent=4)  # indent=4 使输出格式化，更易读
 
-
-        config_file_path = dlc_model_file.parent / "config_file.json"
         with open(str(config_file_path), 'w') as f:
             json.dump(config_file, f, indent=4)
 
@@ -857,11 +907,8 @@ class OnnxToQNN:
 
     def generate_context_binary_model(self, quantized_dlc_model_path:str, config_path:str):
 
-        command = f"qnn-context-binary-generator --model libQnnModelDlc.so --backend libQnnHtp.so \
-            --dlc_path {quantized_dlc_model_path} --output_dir {self.qnn_model_path.parent} \
-            --binary_file {self.qnn_model_path.stem} \
-            --config_file {config_path}"
-        #  --profiling_level detailed
+        command = f"qnn-context-binary-generator --model libQnnModelDlc.so --backend libQnnHtp.so --config_file {config_path}"
+        command += f" --dlc_path {quantized_dlc_model_path} --output_dir {self.qnn_model_path.parent} --binary_file {self.qnn_model_path.stem}"
 
         return_code = self.run_subprocess(command)
 
@@ -883,28 +930,9 @@ if __name__ == "__main__":
     std_rgb = [[255, 255, 255]]
 
     onnx_to_qnn = OnnxToQNN(onnx_path, qnn_model_path, dataset_path)
-    # onnx_to_qnn.convert(mean_rgb, std_rgb)
+    onnx_to_qnn.convert(mean_rgb, std_rgb)
 
-    onnx_to_qnn.run_env_script()
+    onnx_to_qnn.clean()
+
+
   
-
-    command = 'qairt-converter --input_network d:/Projects/IT/330Project/convert_models/yolo11s.onnx'
-    command = ['python', 'D:/Projects/IT/330Project/convert_models/utilities/qairt/2.38.0.250901/bin/x86_64-windows-msvc/qairt-converter', '--input_network', 'd:/Projects/IT/330Project/convert_models/yolo11s.onnx']
-
-    print(f"Running command: {command}")
-
-    # 使用实时输出的方式执行命令
-    process = subprocess.Popen(command, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, env=os.environ)
-    
-    # 实时打印输出
-    while True:
-        output = process.stdout.readline()
-        if output == '' and process.poll() is not None:
-            break
-        if output:
-            print(output.strip())
-
-
-
-
-    

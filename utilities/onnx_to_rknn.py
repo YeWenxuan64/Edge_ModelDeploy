@@ -2,8 +2,18 @@ import os
 from pathlib import Path
 from rknn.api import RKNN
 
+try:
+    from utils import temporary_chdir
 
-from utils import temporary_chdir
+except ImportError:
+    try:
+        from .utils import temporary_chdir
+
+    except ImportError:
+        import sys
+        current_dir = Path(__file__).parent.resolve()
+        sys.path.append(str(current_dir))
+        from utils import temporary_chdir
 
 
 
@@ -11,11 +21,20 @@ from utils import temporary_chdir
 class OnnxToRKNN:
     def __init__(self, model_path:str, rknn_model_path:str, dataset_path:str|None=None, target_platform:str='rk3588'):
         """
+        Initialize the ONNX to RKNN converter.
+
         Args:
-            model_path (str): onnx model to convert
-            rknn_model_path (str): output rknn model path
-            dataset_path (str): a dataset paths text file for accuracy analysis
-            target_platform (str): target platform, only 'rk3588' and 'rk3576' are supported
+            model_path (str): Path to the input ONNX model file that needs to be converted.
+
+            rknn_model_path (str): Path where the converted RKNN model file will be saved.
+
+            dataset_path (str | None): Path to a text file containing paths to dataset images for quantization. 
+                - The text file should contain one image path per line for single-input models, 
+                or multiple image paths separated by spaces for multi-input models.
+                - Default is None. no quantization will be performed.
+
+            target_platform (str): Target platform for the converted model. 
+                - Supported platforms are 'rk3588' and 'rk3576'. Defaults to 'rk3588'.
         """
         
         current_dir = Path(__file__).parent.resolve() # 获取当前文件所在目录的绝对路径
@@ -40,18 +59,50 @@ class OnnxToRKNN:
     def extra_optimize(self, quantized_algorithm:str='kl_divergence', compress_weight:bool=False, model_pruning:bool=False, flash_attantion:bool=False):
         """
         Args:
-            quantized_algorithm (str): 'normal' or 'kl_divergence' or 'mmse'
+            quantized_algorithm (str): The quantization algorithm to use. 
+                - Options: 'normal' for basic quantization, 'kl_divergence' for KL divergence-based or 'mmse' for minimum mean square error quantization.
+                - Default is 'kl_divergence'.
+
+            compress_weight (bool): Whether to compress model weights to reduce memory usage. 
+                - Default is False.
+
+            model_pruning (bool): Whether to apply model pruning to remove less important parameters. 
+                - Default is False.
+
+            flash_attantion (bool): Whether to use flash attention mechanism for faster attention computation. 
+                - Default is False.
         """
+
+        if quantized_algorithm not in ['normal', 'kl_divergence', 'mmse']:
+            raise ValueError("quantized_algorithm must be 'normal' or 'kl_divergence' or 'mmse'")
+        
         self.quantized_algorithm = quantized_algorithm
         self.compress_weight = compress_weight
         self.model_pruning = model_pruning
         self.flash_attantion = flash_attantion
 
-
     def do_hybrid_quantization(self, custom_hybrid:list[list[str]]|None=None):
+        """
+        Args:
+            custom_hybrid (list[list[str]], optional): A list of onnx node's input and output pair specifying the custom hybrid quantization settings.
+                - Each inner list contains two strings representing the input name and output name of a subgraph in the ONNX model.
+                - All nodes between the specified input and output will be quantized using FP16, 
+                - while nodes outside these subgraphs will remain in 8-bit quantization. 
+                - To apply hybrid quantization to multiple subgraphs, provide multiple pairs in the list, 
+                e.g., [[input_name1, output_name1], [input_name2, output_name2]]. 
+                - Defaults to None.
+        """
         self.custom_hybrid = custom_hybrid
 
     def set_do_accuracy_analysis(self, accuracy_analysis_picture_list:list[str]|None=None):
+        """
+        Args:
+            accuracy_analysis_picture_list (list[str], optional): A list of image paths required for model accuracy analysis. 
+                - Each element in the list should be a path to an image. 
+                - For models with a single input, provide a single image path. 
+                - For models with multiple inputs, provide multiple image paths. Example: ['/home/xxx/1.jpg', '/home/xxx/2.jpg']
+                - Defaults to None.
+        """
         if accuracy_analysis_picture_list is not None:
             self.accuracy_analysis_picture_list = [str(Path(path).resolve()) for path in accuracy_analysis_picture_list]
         else:
@@ -59,6 +110,21 @@ class OnnxToRKNN:
 		
 
     def convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
+        """
+        Args:
+            mean_rgb (list[list[int | float,]], optional): Mean values for RGB channels normalization.
+                - Each inner list contains 3 values (R, G, B) representing the mean for each channel in one input.
+                - If multiple inputs are provided, For example, [[123, 116, 103], [123, 116, 103]]
+                - Defaults to [[0, 0, 0]] (no mean normalization).
+                
+            std_rgb (list[list[int | float,]], optional): Standard deviation values for RGB channels normalization.
+                - Each inner list should contain 3 values (R, G, B) representing the standard deviation for each channel in one input.
+                - Similar to mean_rgb, can provide multiple lists for multiple inputs.
+                - Defaults to [[1, 1, 1]] (no standard deviation normalization).
+        """
+
+        self.tmp_dir.mkdir(exist_ok=True)
+
         with temporary_chdir(self.tmp_dir):
             self.self_convert(mean_rgb, std_rgb)
 

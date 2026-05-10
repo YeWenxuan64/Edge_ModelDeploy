@@ -10,6 +10,7 @@ class temporary_chdir:
         
     def __enter__(self):
         self.saved_path = os.getcwd() # 保存进入前的当前目录
+        os.makedirs(self.new_path, exist_ok=True)  # 确保目录存在
         os.chdir(self.new_path)       # 切换到新目录
         
     def __exit__(self, etype, value, traceback):
