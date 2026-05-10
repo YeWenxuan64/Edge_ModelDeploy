@@ -4,8 +4,8 @@ from pathlib import Path
 
 # 一个上下文管理器以安全地更改目录
 class temporary_chdir:
-    def __init__(self, new_path):
-        self.new_path = new_path
+    def __init__(self, new_path:str):
+        self.new_path = str(new_path)
         self.saved_path = None
         
     def __enter__(self):
