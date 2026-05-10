@@ -341,7 +341,7 @@ class OnnxToQNN:
         self.bias_bitwidth = bias_bitwidth
         print(f"Quantization method has been set to param_quant_method={self.param_quant_method}, act_quant_method={self.act_quant_method}, bitwidth={self.weights_bitwidth}w{self.act_bitwidth}a")
 
-    def use_custom_alibration_data(self, custom_alibration_data_path:str|None):
+    def use_custom_alibration_data(self, custom_alibration_data_path:str|None=None):
         """
         Args:
             custom_alibration_data_path (str | None): Path to a text file containing the custom calibration dataset.
