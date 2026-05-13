@@ -385,7 +385,9 @@ class OnnxToQNN:
 
         self.run_env_script()
 
-        onnx_model_info = self.get_onnx_model_info(mean_rgb, std_rgb)
+        self.modify_onnx_model(mean_rgb, std_rgb)
+
+        onnx_model_info = self.get_onnx_model_info()
         if onnx_model_info is None:
             exit(1)
 
@@ -485,31 +487,7 @@ class OnnxToQNN:
                 key, value = line.split('=', 1)
                 os.environ[key] = value
         
-    def get_onnx_model_info(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]) -> dict|None:
-        """
-        获取ONNX模型的输入输出信息
-        
-        Args:
-            onnx_path (str): ONNX模型文件路径
-            
-        Returns:
-            Dict: 包含模型输入输出信息的字典，格式如下：
-            {
-                "inputs": [
-                    {
-                        "name": str,
-                        "shape": List[int]
-                    }
-                ],
-                "outputs": [
-                    {
-                        "name": str,
-                        "shape": List[int]
-                    }
-                ]
-            }
-        """
-        
+    def modify_onnx_model(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
         self.tmp_dir.mkdir(exist_ok=True) # 确保tmp目录存在
 
         if not self.model_path.exists():
@@ -616,36 +594,60 @@ class OnnxToQNN:
         self.file_or_dir_to_clean.append(self.tmp_onnx_path)
         print(f"Copied ONNX file to {self.tmp_onnx_path}")
 
+    def get_onnx_model_info(self) -> dict|None:
+        """
+        获取ONNX模型的输入输出信息
+        
+        Args:
+            onnx_path (str): ONNX模型文件路径
+            
+        Returns:
+            Dict: 包含模型输入输出信息的字典，格式如下：
+            {
+                "inputs": [
+                    {
+                        "name": str,
+                        "shape": List[int]
+                    }
+                ],
+                "outputs": [
+                    {
+                        "name": str,
+                        "shape": List[int]
+                    }
+                ]
+            }
+        """
+        
         try:
             # 加载ONNX模型
             model = onnx.load_model(str(self.tmp_onnx_path))
-
-            # 获取输入信息
-            inputs = []
-            for input in model.graph.input:
-                input_info = {
-                    "name": input.name,
-                    "shape": [d.dim_value if d.dim_value != 0 else 'dynamic' for d in input.type.tensor_type.shape.dim]
-                }
-                inputs.append(input_info)
-
-            # 获取输出信息
-            outputs = []
-            for output in model.graph.output:
-                output_info = {
-                    "name": output.name,
-                    "shape": [d.dim_value if d.dim_value != 0 else 'dynamic' for d in output.type.tensor_type.shape.dim]
-                }
-                outputs.append(output_info)
-
-            model_info = {"inputs": inputs, "outputs": outputs}
-            print(f"Model info: {model_info}")
-
-            return model_info
-            
         except Exception as e:
             print(f"Error reading ONNX model: {str(e)}")
             return None
+        
+        # 获取输入信息
+        inputs = []
+        for input in model.graph.input:
+            input_info = {
+                "name": input.name,
+                "shape": [d.dim_value if d.dim_value != 0 else 'dynamic' for d in input.type.tensor_type.shape.dim]
+            }
+            inputs.append(input_info)
+
+        # 获取输出信息
+        outputs = []
+        for output in model.graph.output:
+            output_info = {
+                "name": output.name,
+                "shape": [d.dim_value if d.dim_value != 0 else 'dynamic' for d in output.type.tensor_type.shape.dim]
+            }
+            outputs.append(output_info)
+
+        model_info = {"inputs": inputs, "outputs": outputs}
+        print(f"Model info: {model_info}")
+
+        return model_info
 
     def convert_onnx_model(self, onnx_model_info:dict, set_input_order:str) -> str|None:
 
