@@ -42,14 +42,14 @@ Focus-Finder_ModelDeploy/
 
 本项目以 git submodule 管理多个模型部署模块：
 
-| 子模块 | 模型类型 | 原论文/来源 |
+| 子模块 | 模型类型 | 来源 |
 |--------|---------|------------|
-| [AVTrack_ModelDeploy](./AVTrack_ModelDeploy/) | 视觉目标跟踪 | ICML 2024 — *Learning Adaptive and View-Invariant Vision Transformer for Real-Time UAV Tracking* |
-| [RetinaFace-mobile_ModelDeploy](./RetinaFace-mobile_ModelDeploy/) | 人脸检测 | RetinaFace 轻量化版本 |
-| [NanoTrackV3_ModelDeploy](./NanoTrackV3_ModelDeploy/) | 视觉目标跟踪 | NanoTrack 系列 |
-| [MSI-Net_ModelDeploy](./MSI-Net_ModelDeploy/) | 显著性检测 | MSI-Net |
-| [Yolo11_ModelDeploy](./Yolo11_ModelDeploy/) | 目标检测 | YOLO11 |
-| [Yolo26_ModelDeploy](./Yolo26_ModelDeploy/) | 目标检测 | ultralytics-YOLO26 |
+| [AVTrack_ModelDeploy](./AVTrack_ModelDeploy/)                     | 视觉目标跟踪 | ICML 2024 — *Learning Adaptive and View-Invariant Vision Transformer for Real-Time UAV Tracking* |
+| [RetinaFace-mobile_ModelDeploy](./RetinaFace-mobile_ModelDeploy/) | 人脸检测     | RetinaFace 轻量化版本 |
+| [NanoTrackV3_ModelDeploy](./NanoTrackV3_ModelDeploy/)             | 视觉目标跟踪 | NanoTrack 系列 |
+| [MSI-Net_ModelDeploy](./MSI-Net_ModelDeploy/)                     | 显著性检测   | MSI-Net<br>Neural Networks — *Contextual encoder-decoder network for visual saliency prediction* |
+| [Yolo11_ModelDeploy](./Yolo11_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO11(RKNN custom-made) |
+| [Yolo26_ModelDeploy](./Yolo26_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO26 |
 
 每个子模块独立维护，包含该模型的完整转换流程与预训练权重。
 
@@ -59,7 +59,7 @@ Focus-Finder_ModelDeploy/
 ### 1. 克隆项目（含子模块）
 
 ```bash
-git clone --recursive <repo-url>
+git clone --recursive https://github.com/YeWenxuan64/Focus-Finder_ModelDeploy.git
 cd Focus-Finder_ModelDeploy
 ```
 
@@ -132,10 +132,13 @@ python Yolo26_pytorch2onnx.py
 
 # 2.1.ONNX → RKNN（复用 utilities）
 python Yolo26_onnx2rknn.py
+# 输出到: Yolo26_ModelDeploy/models_convert/rknn
 
 # 2.2.ONNX → QNN（复用 utilities）
 python Yolo26_onnx2qnn.py
+# 输出到: Yolo26_ModelDeploy/models_convert/qnn
 ```
+
 
 ## 工具链使用指南
 [工具链使用指南](./README_TOOLUSE.md)
@@ -143,11 +146,10 @@ python Yolo26_onnx2qnn.py
 
 ## 硬件兼容性
 
-| 目标平台 | 芯片 | 转换工具 | 量化格式 |
-|---------|------|---------|---------|
-| Rockchip RK3588 | NPU (6 TOPS) | `onnx_to_rknn.py` | INT8 / FP16 / 混合量化 |
-| Rockchip RK3576 | NPU | `onnx_to_rknn.py` | INT8 / FP16 / 混合量化 |
-| Qualcomm (HTP) | Hexagon DSP | `onnx_to_qnn.py` | INT8 / INT4 / FP16 |
+| 目标平台        | AI处理器    | 芯片     | 转换工具 | 量化格式 |
+|----------------|-------------|---------|---------|---------|
+| Rockchip       | NPU         | RK3588 RK3576 RK3566 | `onnx_to_rknn.py` | INT8 / FP16 / 混合量化 |
+| Qualcomm (HTP) | Hexagon DSP | QCS6490 | `onnx_to_qnn.py` | INT8 / INT4 / FP16 |
 
 ## License
 

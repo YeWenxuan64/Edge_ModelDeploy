@@ -28,7 +28,7 @@ converter = OnnxToRKNN(
     model_path='path/to/model.onnx',
     rknn_model_path='path/to/output.rknn',
     dataset_path='path/to/dataset.txt',   # 量化校准数据集（可选）
-    target_platform='rk3588'               # 或 'rk3576'
+    target_platform='rk3588'               # 'rk3588' / 'rk3576' / 'rk3566'
 )
 
 # 可选：高级优化配置
@@ -66,7 +66,8 @@ from utilities.onnx_to_qnn import OnnxToQNN
 converter = OnnxToQNN(
     model_path='path/to/model.onnx',
     qnn_model_path='path/to/output.bin',
-    dataset_path='path/to/dataset.txt'   # 量化校准数据集（可选）
+    dataset_path='path/to/dataset.txt',   # 量化校准数据集（可选）
+    target_platform='qcs6490'             # 'qcs6490' / 'qcs8550' / 'qcs9075'
 )
 
 # 可选：量化配置

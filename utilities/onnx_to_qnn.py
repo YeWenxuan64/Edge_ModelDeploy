@@ -262,7 +262,7 @@ def reorder_onnx_nodes_by_output(model:onnx.ModelProto, max_depth:int=10) -> onn
 
 
 class OnnxToQNN:
-    def __init__(self, model_path:str, qnn_model_path:str, dataset_path:str):
+    def __init__(self, model_path:str, qnn_model_path:str, dataset_path:str|None=None, target_platform:str='qcs6490'):
         """
         Initialize the ONNX to QNN converter.
 
@@ -275,6 +275,10 @@ class OnnxToQNN:
                 - The text file should contain one image path per line for single-input models, 
                 or multiple image paths separated by spaces for multi-input models.
                 - Default is None. no quantization will be performed.
+
+            target_platform (str): Target platform for the QNN model.
+                - Available options: 'qcs6490', 'qcs8550', 'QCS9075'.
+                - Default: 'qcs6490'.
         """
 
         self.model_path = Path(model_path).resolve()
@@ -283,6 +287,17 @@ class OnnxToQNN:
         self.dataset_path = dataset_path
         if dataset_path:
             self.dataset_path = Path(dataset_path).resolve()
+
+        self.target_platform = target_platform
+        self.architecture_dict = {
+            "qcs6490": {"dsp_arch": "v68", "soc_id": 35},
+            "qcs8550": {"dsp_arch": "v73", "soc_id": 603},
+            "QCS9075": {"dsp_arch": "v73", "soc_id": 77},
+        }
+
+        if target_platform not in self.architecture_dict.keys():
+            raise ValueError(f"Invalid target platform: {target_platform}. Available options: {self.architecture_dict.keys()}")
+
 
         current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
 
@@ -883,6 +898,8 @@ class OnnxToQNN:
         config_backend_path = dlc_model_file.parent / "config_backend.json"
         config_file_path = dlc_model_file.parent / "config_file.json"
 
+        architecture_config = self.architecture_dict[self.target_platform]
+
         # 创建配置字典
         config_backend = {
             "graphs": [
@@ -893,8 +910,8 @@ class OnnxToQNN:
             ],
             "devices": [
                 {
-                    "dsp_arch": "v68",
-                    "soc_id": 35
+                    "dsp_arch": architecture_config["dsp_arch"],
+                    "soc_id": architecture_config["soc_id"],
                 }
             ]
         }

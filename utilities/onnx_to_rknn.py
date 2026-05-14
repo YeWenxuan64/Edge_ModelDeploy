@@ -34,7 +34,8 @@ class OnnxToRKNN:
                 - Default is None. no quantization will be performed.
 
             target_platform (str): Target platform for the converted model. 
-                - Supported platforms are 'rk3588' and 'rk3576'. Defaults to 'rk3588'.
+                - Supported platforms are 'rk3588', 'rk3576', 'rk3566'.
+                - Defaults to 'rk3588'.
         """
         
         current_dir = Path(__file__).parent.resolve() # 获取当前文件所在目录的绝对路径
@@ -49,6 +50,8 @@ class OnnxToRKNN:
             self.dataset_path = None
 
         self.target_platform = target_platform
+        if self.target_platform not in ['rk3588', 'rk3576', 'rk3566']:
+            raise ValueError("target_platform must be 'rk3588' or 'rk3576' or 'rk3566'")
 
         self.extra_optimize()
         self.do_hybrid_quantization()
