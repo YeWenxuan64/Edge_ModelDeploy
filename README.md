@@ -60,7 +60,7 @@ Focus-Finder_ModelDeploy/
 ### 1. 克隆项目（含子模块）
 
 ```bash
-git clone --recursive https://github.com/YeWenxuan64/Focus-Finder_ModelDeploy.git
+git clone --recurse-submodules https://github.com/YeWenxuan64/Focus-Finder_ModelDeploy.git
 cd Focus-Finder_ModelDeploy
 ```
 
@@ -79,7 +79,7 @@ Eedge_ModelDeploy/
 │   ├── yolo_det_dataset_gen.py
 │   ├── utils.py
 │   └── qairt/                       # Qualcomm AI Runtime SDK # 需自行下载并放入
-|       └── 2.38.0.250901/           # SDK 版本                # 可自行挑选
+│       └── 2.38.0.250901/           # SDK 版本                # 可自行挑选
 │           ├── bin/
 │           └── ...
 └── ...                              

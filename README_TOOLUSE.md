@@ -13,12 +13,12 @@ Focus-Finder_ModelDeploy/
 │   └── ...                         
 ├── Your_ModelDeploy/                         # 新建该模型的转换工程文件夹
 │   ├── models_convert/                
-|   |   ├── original/                         # 原始模型目录
-|   |   ├── onnx/              
-|   |   └── ...
-|   ├── Your_Model_originalframework2onnx.py  # PyTorch → ONNX 转换脚本
-|   ├── Your_Model_onnx2rknn.py               # ONNX → RKNN 转换脚本（如果需要）
-|   └── Your_Model_onnx2qnn.py                # ONNX → QNN 转换脚本（如果需要）
+│   │   ├── original/                         # 原始模型目录
+│   │   ├── onnx/              
+│   │   └── ...
+│   ├── Your_Model_originalframework2onnx.py  # PyTorch → ONNX 转换脚本
+│   ├── Your_Model_onnx2rknn.py               # ONNX → RKNN 转换脚本（如果需要）
+│   └── Your_Model_onnx2qnn.py                # ONNX → QNN 转换脚本（如果需要）
 └── ...
 ```
 
