@@ -1,8 +1,9 @@
-# Focus-Finder Model Deploy
+# Edge Model Deploy
 
 ## 概述
 
 本项目提供一套**可复用的模型转换工具链**，覆盖从训练框架（PyTroch, TensorFlow）的cv模型统一转换为 ONNX，再量化部署到边缘端 NPU（Rockchip RKNN / Qualcomm QNN）
+> 同时本项目也是本小姐🍃的项目[Focus-Finder](https://github.com/YeWenxuan64/Focus-Finder)的模型部署部分喵~
 
 
 | 转换阶段 | 工具 | 说明 |

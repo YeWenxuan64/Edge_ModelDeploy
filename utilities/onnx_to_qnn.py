@@ -277,7 +277,7 @@ class OnnxToQNN:
                 - Default is None. no quantization will be performed.
 
             target_platform (str): Target platform for the QNN model.
-                - Available options: 'qcs6490', 'qcs8550', 'QCS9075'.
+                - Available options: 'qcs6490', 'qcs8550', 'qcs9075'.
                 - Default: 'qcs6490'.
         """
 
@@ -291,8 +291,8 @@ class OnnxToQNN:
         self.target_platform = target_platform
         self.architecture_dict = {
             "qcs6490": {"dsp_arch": "v68", "soc_id": 35},
-            "qcs8550": {"dsp_arch": "v73", "soc_id": 603},
-            "QCS9075": {"dsp_arch": "v73", "soc_id": 77},
+            "qcs8550": {"dsp_arch": "v73", "soc_id": 66},
+            "qcs9075": {"dsp_arch": "v73", "soc_id": 77},
         }
 
         if target_platform not in self.architecture_dict.keys():
