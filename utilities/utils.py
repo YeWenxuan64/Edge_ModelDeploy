@@ -1,4 +1,5 @@
 import os
+import random
 from pathlib import Path
 
 
@@ -21,12 +22,13 @@ class temporary_chdir:
 
 
 
-def collect_image_paths(dir_paths: list[str], max_count: int) -> str:
+def collect_image_paths(dir_paths: list[str], max_count: int, random_sample: bool = False) -> str:
     """
     从多个图片目录中收集图片绝对路径，写入 tmp 目录下的 txt 文件，并返回该 txt 的绝对路径。
     
     :param dir_paths: 图片目录路径列表（支持相对或绝对路径）
     :param max_count: 总共最大读取图片数量
+    :param random_sample: 是否随机取样。若为 True，且文件夹内图片数量大于 max_count 时，随机选取图片
     :return: 生成的 txt 文件的绝对路径字符串
     """
     if max_count <= 0:
@@ -55,17 +57,39 @@ def collect_image_paths(dir_paths: list[str], max_count: int) -> str:
             continue
 
         # 遍历当前目录下的文件（默认非递归。如需包含子目录，将 iterdir() 改为 rglob('*')）
-        for file_path in dir_path.iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in ALLOWED_EXTENSIONS:
-                collected_paths.append(str(file_path.resolve()))
+        if random_sample:
+            # 随机取样模式：需要先收集当前目录下的所有图片，以便进行等概率随机抽样
+            dir_images = [
+                str(file_path.resolve()) 
+                for file_path in dir_path.iterdir() 
+                if file_path.is_file() and file_path.suffix.lower() in ALLOWED_EXTENSIONS
+            ]
+            
+            # 计算当前目录允许抽取的最大数量
+            remaining_count = max_count - len(collected_paths)
+            if remaining_count <= 0:
+                break
                 
-                if len(collected_paths) >= max_count:
-                    break
+            # 如果当前目录图片数大于剩余所需数量，随机抽取；否则全部加入
+            if len(dir_images) > remaining_count:
+                sampled_images = random.sample(dir_images, remaining_count)
+                collected_paths.extend(sampled_images)
+            else:
+                collected_paths.extend(dir_images)
+        else:
+            # 顺序模式：保持原有逻辑，按顺序收集，达到 max_count 立即停止，节省性能
+            for file_path in dir_path.iterdir():
+                if file_path.is_file() and file_path.suffix.lower() in ALLOWED_EXTENSIONS:
+                    collected_paths.append(str(file_path.resolve()))
+                    
+                    if len(collected_paths) >= max_count:
+                        break
 
+        # 如果已收集够数量，跳出外层目录循环
         if len(collected_paths) >= max_count:
             break
 
-    # 安全截断（防止最后一次 break 后多出元素）
+    # 安全截断（防止随机抽样逻辑中因并发或计算误差多出元素）
     final_paths = collected_paths[:max_count]
 
     # 写入 txt 文件

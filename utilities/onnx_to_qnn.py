@@ -298,7 +298,6 @@ class OnnxToQNN:
         self.set_quantization_method()
         self.use_custom_alibration_data()
 
-
     def set_quantization_method(self, param_quant_method:str='percentile', act_quant_method:str='entropy', bitwidth:str='w8a8', bias_bitwidth:int=8):
         """
         Configure quantization parameters for the model.
@@ -699,14 +698,28 @@ class OnnxToQNN:
             dataset_path_list = []
 
             with open(str(self.dataset_path), 'r') as f:
-                # 逐行读取文件
-                lines = f.readlines()
+                lines = f.readlines() # 逐行读取文件
 
                 for line in lines: # 如果行不为空，则分割路径
                     line = line.strip() # 去除首尾空白字符
                     if line:
                         one_line_paths_list = [path for path in line.split(' ') if path] # 按空格分割路径，并过滤掉空字符串
-                        full_path_list = [os.path.join(dataset_dir, img_path) for img_path in one_line_paths_list] # 构建完整图片路径
+
+                        full_path_list = []
+                        for img_path in one_line_paths_list:
+                            # 将字符串转换为 Path 对象
+                            p = Path(img_path)
+                            
+                            # 判断是否为绝对路径
+                            if p.is_absolute():
+                                # 如果已经是绝对路径，直接使用
+                                full_path = p
+                            else:
+                                # 如果是相对路径，则与 dataset_dir 拼接
+                                full_path = dataset_dir / p
+                            
+                            full_path_list.append(str(full_path))
+                        
                         dataset_path_list.append(full_path_list)
 
 
