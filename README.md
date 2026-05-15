@@ -77,7 +77,7 @@ Eedge_ModelDeploy/
 ├── utilities/
 │   ├── onnx_to_rknn.py
 │   ├── onnx_to_qnn.py
-│   ├── yolo_det_dataset_gen.py
+│   ├── yolo_croped_dataset_gen.py
 │   ├── utils.py
 │   └── qairt/                       # Qualcomm AI Runtime SDK # 需自行下载并放入
 │       └── 2.38.0.250901/           # SDK 版本                # 可自行挑选

@@ -300,7 +300,12 @@ class GenYoloCroppedDataset:
         full_img_path_list, output_dir = self.prepare_work_dir()
 
         # 初始化ONNX运行时
-        session = ort.InferenceSession(self.yolo_model_path)
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.enable_mem_pattern = True
+
+        session = ort.InferenceSession(self.yolo_model_path, sess_options=sess_options)
         input_name = session.get_inputs()[0].name
 
         all_cropped_paths:list[list[str, str]] = []
