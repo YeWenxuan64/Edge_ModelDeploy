@@ -178,21 +178,79 @@ converter.clean()
 
 > 注：rknn的量化工具是单线程的，所以什么量化算法都较慢。而qnn的量化工具是多线程的，所以什么量化算法都较快
 
-### `GenYoloDetedDataset` — 量化校准数据集生成
+
+## `GenYoloCroppedDataset` — 基于 YOLO 检测的裁剪数据集生成
+
+### 使用场景
+部分多输入模型（如目标跟踪、人脸/物体识别）的工作场景是：一个输入为**完整原图**，另一个输入为**裁剪后的感兴趣区域（ROI）**。如果用未裁剪的图像做量化校准，校准数据与真实推理场景不匹配，会导致量化精度下降。
+
+`GenYoloCroppedDataset` 通过内置的 YOLO 检测模型自动识别并裁剪感兴趣区域，生成与原图一一配对的裁剪数据集，用于量化校准。
+
+### 基础用法
 
 ```python
-from utilities.yolo_det_dataset_gen import GenYoloDetedDataset
+from utilities.yolo_cropped_dataset_gen import GenYoloCroppedDataset
 
-generator = GenYoloDetedDataset(
+generator = GenYoloCroppedDataset(
+    dataset_path='datasets/datasets.txt',   # 原始数据集索引文件
+    output_dir_name='cropped_images'         # 裁剪图片输出目录名
+)
+
+# 生成裁剪数据集（返回索引文件路径）
+dataset_list_path = generator.generate()
+
+# 可选：清理临时文件（输入副本、裁剪图片、索引文件）
+# generator.clean()
+```
+
+### 进阶用法：配合另一个 AI 模型做后处理
+
+如果目标模型需要先经过另一个 AI（如跟踪模型的 backbone）再输入，可以用 `set_postprocess_by_another_model()` 让裁剪后的图片自动通过该模型推理，输出 `.npy` 或 `.raw` 格式的 Tensor 数据：
+
+```python
+generator = GenYoloCroppedDataset(
     dataset_path='datasets/datasets.txt',
     output_dir_name='cropped_images'
 )
 
-# 生成裁剪后的数据集（基于 YOLO 检测结果自动裁剪感兴趣区域）
-dataset_list_path = generator.gerenate(swap_image_pair=True)
+# 指定一个或多个模型，对裁剪后的图片做推理，替换为推理输出
+generator.set_postprocess_by_another_model(
+    another_model_path_and_target_list=[
+        ('path/to/model_T.onnx', 'input'),   # 对完整图（input 侧）推理
+        ('path/to/model_S.onnx', 'output'),  # 对裁剪图（output 侧）推理
+    ],
+    output_shape='nchw',       # 输出张量布局
+    outpur_format='.npy'       # 输出文件格式
+)
 
-# 清理临时文件
-generator.clean()
+dataset_list_path = generator.generate()
+
+# 可选：清理临时文件（输入副本、裁剪图片、索引文件）
+# generator.clean()
 ```
 
-**数据集文件格式：** 每行包含一对或多张图片路径（空格分隔），对应模型的多输入。
+> **注意：** 生成的临时文件位于 `utilities/tmp/` 目录下，使用完毕后再调用 `generator.clean()` 清理。
+
+
+### 参数说明
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `dataset_path` | `str` | — | 原始数据集索引文件路径（每行一个图片路径） |
+| `output_dir_name` | `str` | `'cropped_images'` | 裁剪图片存放目录名（在 `utilities/tmp/` 下创建） |
+| `swap_image_pair` | `bool` | `False` | 输出文件中是否交换配对顺序（`True` → `裁剪图 完整图`） |
+| `another_model_path_and_target_list` | `list[tuple[str, str]]` | `None` | 后处理模型列表，每项为 `(模型路径, 'input'\|'output')` |
+| `output_shape` | `str` | `'chw'` | 推理输出张量布局：`'chw'` / `'hwc'` / `'nchw'` / `'nhwc'` |
+| `outpur_format` | `str` | `'.npy'` | 推理输出文件格式：`'.npy'` / `'.raw'` |
+
+### `generate()` 返回值
+
+返回配对数据集索引文件的路径字符串（`.txt`），每行格式：
+
+```
+/path/to/full_image.jpg   /path/to/cropped_image.jpg
+```
+
+若 `swap_image_pair=True`，顺序反转为 `裁剪图 完整图`；若配置了后处理模型，对应侧的路径会替换为推理输出文件路径。
+
+

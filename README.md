@@ -11,7 +11,7 @@
 | **PyTorch/TensorFlow → ONNX** | 各子模块独立脚本 | 处理算子兼容、动态图固化、模型优化 |
 | **ONNX → RKNN** | `utilities/onnx_to_rknn.py` | Rockchip NPU（RK3588 / RK3576），支持 INT8 量化、混合量化|
 | **ONNX → QNN** | `utilities/onnx_to_qnn.py` | Qualcomm NPU（HTP），支持多精度量化 |
-| **数据集生成** | `utilities/yolo_det_dataset_gen.py` | 基于 YOLO 检测自动裁剪量化校准数据集 |
+| **数据集生成** | `utilities/yolo_croped_dataset_gen.py` | 基于 YOLO 检测自动裁剪量化校准数据集 |
 
 > **工具链是核心资产** — 每个子模块（AVTrack、NanoTrackV3、RetinaFace 等）都复用同一套 `utilities/` 转换工具，只需编写模型特有的 PyTorch → ONNX 导出脚本即可。
 
@@ -23,7 +23,7 @@ Focus-Finder_ModelDeploy/
 ├── utilities/                       # ⭐ 共享转换工具链（核心）
 │   ├── onnx_to_rknn.py              # ONNX → RKNN 转换（Rockchip）
 │   ├── onnx_to_qnn.py               # ONNX → QNN 转换（Qualcomm）
-│   ├── yolo_det_dataset_gen.py      # YOLO 检测辅助的量化数据集生成
+│   ├── yolo_croped_dataset_gen.py      # YOLO 检测辅助的量化数据集生成
 │   ├── utils.py                     # 通用工具函数
 │   └── qairt/                       # Qualcomm AI Runtime SDK # 需自行下载并放入
 ├── datasets/                        # 量化校准数据集
@@ -65,7 +65,8 @@ cd Focus-Finder_ModelDeploy
 ```
 
 ### 2. 安装依赖
-> **假如你在使用python虚拟环境，请在你正在使用的环境下安装**
+> **假如你在使用python虚拟环境，请在你正在使用的环境下安装**<br>
+> **RKNN 转换工作流支持Python 3.10 - 3.12，QNN 转换工作流仅支持Python 3.10**
 ```bash
 pip install -r requirements.txt
 ```
@@ -145,12 +146,19 @@ python Yolo26_onnx2qnn.py
 [工具链使用指南](./README_TOOLUSE.md)
 
 
-## 硬件兼容性
+## 兼容性
+
+### 硬件兼容性
 
 | 目标平台        | AI处理器    | 芯片     | 转换工具 | 量化格式 |
 |----------------|-------------|---------|---------|---------|
 | Rockchip       | NPU         | RK3588 RK3576 RK3566 | `onnx_to_rknn.py` | INT8 / FP16 / 混合量化 |
 | Qualcomm (HTP) | Hexagon DSP | QCS6490 | `onnx_to_qnn.py` | INT8 / INT4 / FP16 |
+
+### 软件兼容性
+> 目前本工具仅支持**计算机视觉（CV）**类的模型部署<br>
+> 目前本工具仅支持固定输入、输出尺寸的模型<br>
+
 
 ## License
 
