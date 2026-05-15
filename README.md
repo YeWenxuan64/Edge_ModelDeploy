@@ -56,6 +56,14 @@ Focus-Finder_ModelDeploy/
 
 
 ## 快速开始
+### 0. 环境要求
+
+| 工作流           | Windows   | Linux | Python 版本 |
+|-----------------|------------|------|-------------|
+| 训练框架 to ONNX | 支持       | 支持 | 3.10+ |
+| ONNX to RKNN    | 支持       | 支持 | 3.10 - 3.12 |
+| ONNX TO QNN     | 目前不支持 | 支持 | 3.10 |
+
 
 ### 1. 克隆项目（含子模块）
 
@@ -66,7 +74,7 @@ cd Focus-Finder_ModelDeploy
 
 ### 2. 安装依赖
 > **假如你在使用python虚拟环境，请在你正在使用的环境下安装**<br>
-> **RKNN 转换工作流支持Python 3.10 - 3.12，QNN 转换工作流仅支持Python 3.10**
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -94,12 +102,11 @@ Eedge_ModelDeploy/
 | 数据集 | 用途 | 官方下载链接 |
 |--------|------|------------|
 | **COCO 2017 val** | 通用目标检测/跟踪模型校准 | [val2017.zip](http://images.cocodataset.org/zips/val2017.zip) (5GB) |
-| **COCO 2017 train** | 更多校准样本（可选） | [train2017.zip](http://images.cocodataset.org/zips/train2017.zip) (19GB) |
-| **WIDER Face** | 人脸检测模型校准 | [WIDER Face Images](http://mmlab.ie.cuhk.edu.hk/projects/WIDERFace/support/wider_face_split/wider_face_split.zip) + [WIDER Face Validation](https://huggingface.co/datasets/Wilder/WIDERFace/resolve/main/wider_face_split.zip) |
+| **WIDER Face** | 人脸检测模型校准 | [WIDER Face 官网](http://mmlab.ie.cuhk.edu.hk/projects/WIDERFace) |
 | **ImageNet** | 通用分类/检测模型校准（需注册） | [ImageNet 官网](https://www.image-net.org/download) 或 [Small ImageNet](https://www.image-net.org/small/download.php) |
 
 > **提示：** <br>
-> 校准数据集不需要太大，通常 **50~500 张**具有代表性的图片即可达到良好量化精度<br>
+> 校准数据集不需要太大，通常 **50~200 张**具有代表性的图片即可达到良好量化精度<br>
 > 校准数据集推荐使用**符合模型应用场景**的通用数据集，比如自己训练的模型则需要使用自己的数据集<br>
 > 格式为每行一个图片路径的 `.txt` 文件。若模型有多个输入，则每行<输入个数>个图片路径<br>
 
