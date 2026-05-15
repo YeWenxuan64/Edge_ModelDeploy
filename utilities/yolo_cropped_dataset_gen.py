@@ -1,10 +1,12 @@
 import os
 import time
 import shutil
+from copy import deepcopy
+from pathlib import Path
 import cv2
 import numpy as np
 import onnxruntime as ort
-from pathlib import Path
+
 
 def resize_image(image:np.ndarray, input_size:tuple[int, int]) -> tuple[np.ndarray, float, int, int]:
     # 调整图像大小并保持宽高比
@@ -107,7 +109,7 @@ def process_predictions(output: np.ndarray) -> list[list[int, int, int, int, int
 
 
 
-class GenYoloCropedDataset:
+class GenYoloCroppedDataset:
     def __init__(self, dataset_path:str, output_dir_name:str='cropped_images'):
         current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
         self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
@@ -289,7 +291,7 @@ class GenYoloCropedDataset:
         
         return saved_paths
 
-    def generate(self, swap_image_pair:bool=False) -> Path|str:
+    def generate(self, swap_image_pair:bool=False) -> str:
         """
         Args:
             swap_image_pair (bool, optional): 是否交换得到的输入和输出图片对. Defaults to False.
@@ -301,7 +303,7 @@ class GenYoloCropedDataset:
         session = ort.InferenceSession(self.yolo_model_path)
         input_name = session.get_inputs()[0].name
 
-        all_cropped_paths = []
+        all_cropped_paths:list[list[str, str]] = []
         for image_path in full_img_path_list:
             # 读取图片
             image = cv2.imread(image_path)
@@ -328,35 +330,35 @@ class GenYoloCropedDataset:
                     for cropped_path in cropped_paths:
                         all_cropped_paths.append([image_path, cropped_path])
 
+
+        new_all_cropped_paths = deepcopy(all_cropped_paths)
         if self.another_model_path_list:
-            for another_model_path, process_target in self.another_model_path_list:
+            for i, (another_model_path, process_target) in enumerate(self.another_model_path_list):
 
                 process_path_list:list[str] = []
-                if process_target == 'input':
+                if process_target == 'input': # 匹配裁切前的图片
                     index = 0
-                elif process_target == 'output':
+                elif process_target == 'output': # 匹配裁切后的图片
                     index = 1
 
                 for pair_path in all_cropped_paths:
                     process_path_list.append(pair_path[index])
 
-
                 output_path_list = self.postprocess_by_another_model(another_model_path, process_path_list)
 
-
-                for i, pair_path in enumerate(all_cropped_paths):
-                    pair_path[index] = output_path_list[i]
+                for j, pair_path in enumerate(new_all_cropped_paths):
+                    pair_path[i] = output_path_list[j] # 替换为处理后的文件的路径
 
 
         # 保存裁剪图片的路径列表
-        output_txt = self.tmp_dir / str(self.output_dir_name + '_list.txt')
+        output_txt = str(self.tmp_dir / str(self.output_dir_name + '_list.txt'))
         self.file_or_dir_to_clean.append(output_txt)
 
         with open(output_txt, 'w', encoding='utf-8') as f:
-            for pair_path in all_cropped_paths:
+            for pair_path in new_all_cropped_paths:
                 if swap_image_pair:
                     pair_path = pair_path[::-1]
-
+                    
                 pair_path_full = f"{pair_path[0]} {pair_path[1]}\n"
                 f.write(pair_path_full)
 
@@ -397,12 +399,12 @@ def main():
     dataset_path = os.path.join(parent_dir, 'datasets/datasets_face.txt')  # 输入图片索引文本
 
     # 另一个AI模型路径
-    another_model_path_and_target = [('./NanoTrackV3/models_convert/onnx/NanoTrackV3_backbone_X_255.onnx', 'input'),
-                                  ('./NanoTrackV3/models_convert/onnx/NanoTrackV3_backbone_T_127.onnx', 'output')]  
+    another_model_path_and_target = [('./NanoTrackV3_ModelDeploy/models_convert/onnx/NanoTrackV3_backbone_T_127.onnx', 'output'),
+                                     ('./NanoTrackV3_ModelDeploy/models_convert/onnx/NanoTrackV3_backbone_X_255.onnx', 'input')]  
 
     # 创建对象并生成数据集
-    dataset_generator = GenYoloCropedDataset(dataset_path, 'cropped_images2')
-    #dataset_generator.set_postprocess_by_another_model(another_model_path_and_target, output_shape="nchw", outpur_format='.npy')
+    dataset_generator = GenYoloCroppedDataset(dataset_path, 'cropped_images2')
+    dataset_generator.set_postprocess_by_another_model(another_model_path_and_target, output_shape="nchw", outpur_format='.npy')
 
     cropped_list_path = dataset_generator.generate()
 
