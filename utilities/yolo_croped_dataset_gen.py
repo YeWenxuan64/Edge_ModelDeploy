@@ -107,8 +107,8 @@ def process_predictions(output: np.ndarray) -> list[list[int, int, int, int, int
 
 
 
-class GenYoloDetedDataset:
-    def __init__(self, dataset_path:str, output_dir_name:str='cropped_images', ):
+class GenYoloCropedDataset:
+    def __init__(self, dataset_path:str, output_dir_name:str='cropped_images'):
         current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
         self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
 
@@ -117,16 +117,16 @@ class GenYoloDetedDataset:
         self.output_dir_name = output_dir_name
         self.file_or_dir_to_clean = []
 
-        self.another_ai_path_list:list[tuple[str, str]]|None = None
+        self.another_model_path_list:list[tuple[str, str]]|None = None
 
         self.human_list = [0]
         self.animal_list = [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 77]
         self.vehicle_list = [2, 3, 4, 5, 6, 7, 8, 30, 31, 33, 36, 37]
 
-    def set_postprocess_by_another_ai(self, another_ai_path_and_target_list:list[tuple[str, str]], output_shape:str='chw',outpur_format:str='.npy'):
+    def set_postprocess_by_another_model(self, another_model_path_and_target_list:list[tuple[str, str]], output_shape:str='chw',outpur_format:str='.npy'):
         """
         Args:
-            another_ai_path_and_target_list (list[tuple[str, str]]): [(another_ai_path, process_target), ...]
+            another_model_path_and_target_list (list[tuple[str, str]]): [(another_model_path, process_target), ...]
                 - process_target (str): 'output' or 'input'
             output_shape (str): 'chw' or 'hwc' or 'nchw' or 'nhwc'
             outpur_format (str): '.npy' or '.raw'
@@ -138,26 +138,26 @@ class GenYoloDetedDataset:
             raise ValueError("outpur_format must be '.npy' or '.raw'")
         
 
-        new_another_ai_path_list = []
-        for another_ai_path, process_target in another_ai_path_and_target_list:
+        new_another_model_path_list = []
+        for another_model_path, process_target in another_model_path_and_target_list:
             if process_target not in ['output', 'input']:
                 raise ValueError("process_target must be 'output' or 'input'")
 
-            new_anothor_ai_path = Path(another_ai_path).resolve()
-            new_another_ai_path_list.append((new_anothor_ai_path, process_target))
+            new_anothor_model_path = Path(another_model_path).resolve()
+            new_another_model_path_list.append((new_anothor_model_path, process_target))
         
-        self.another_ai_path_list = new_another_ai_path_list
+        self.another_model_path_list = new_another_model_path_list
         
         self.output_shape = output_shape
         self.output_format = outpur_format
 
 
-    def postprocess_by_another_ai(self, another_ai_path:str, image_path_list:list[str]) -> list[str]:
-        another_ai_ort = ort.InferenceSession(another_ai_path)
-        input_details = another_ai_ort.get_inputs()[0]
+    def postprocess_by_another_model(self, another_model_path:str, image_path_list:list[str]) -> list[str]:
+        another_model_ort = ort.InferenceSession(another_model_path)
+        input_details = another_model_ort.get_inputs()[0]
 
-        another_ai_input_shape:list[int] = input_details.shape
-        input_h, input_w = another_ai_input_shape[2], another_ai_input_shape[3]
+        another_model_input_shape:list[int] = input_details.shape
+        input_h, input_w = another_model_input_shape[2], another_model_input_shape[3]
         anorher_ai_input_name:str = input_details.name
 
         output_path_list = []
@@ -165,7 +165,7 @@ class GenYoloDetedDataset:
             image = cv2.imread(image_path)
             input_tensor, scale, x_offset, y_offset = preprocess_image(image, (input_w, input_h), std_rgb=[1, 1, 1])
 
-            outputs = another_ai_ort.run(None, {anorher_ai_input_name: input_tensor})
+            outputs = another_model_ort.run(None, {anorher_ai_input_name: input_tensor})
             output:np.ndarray = outputs[0] # nchw
 
             if self.output_shape == 'chw':
@@ -289,7 +289,7 @@ class GenYoloDetedDataset:
         
         return saved_paths
 
-    def gerenate(self, swap_image_pair:bool=False) -> Path|str:
+    def generate(self, swap_image_pair:bool=False) -> Path|str:
         """
         Args:
             swap_image_pair (bool, optional): 是否交换得到的输入和输出图片对. Defaults to False.
@@ -328,8 +328,8 @@ class GenYoloDetedDataset:
                     for cropped_path in cropped_paths:
                         all_cropped_paths.append([image_path, cropped_path])
 
-        if self.another_ai_path_list:
-            for another_ai_path, process_target in self.another_ai_path_list:
+        if self.another_model_path_list:
+            for another_model_path, process_target in self.another_model_path_list:
 
                 process_path_list:list[str] = []
                 if process_target == 'input':
@@ -341,7 +341,7 @@ class GenYoloDetedDataset:
                     process_path_list.append(pair_path[index])
 
 
-                output_path_list = self.postprocess_by_another_ai(another_ai_path, process_path_list)
+                output_path_list = self.postprocess_by_another_model(another_model_path, process_path_list)
 
 
                 for i, pair_path in enumerate(all_cropped_paths):
@@ -397,14 +397,14 @@ def main():
     dataset_path = os.path.join(parent_dir, 'datasets/datasets_face.txt')  # 输入图片索引文本
 
     # 另一个AI模型路径
-    another_ai_path_and_target = [('./NanoTrackV3/models_convert/onnx/NanoTrackV3_backbone_X_255.onnx', 'input'),
+    another_model_path_and_target = [('./NanoTrackV3/models_convert/onnx/NanoTrackV3_backbone_X_255.onnx', 'input'),
                                   ('./NanoTrackV3/models_convert/onnx/NanoTrackV3_backbone_T_127.onnx', 'output')]  
 
     # 创建对象并生成数据集
-    dataset_generator = GenYoloDetedDataset(dataset_path, 'cropped_images2')
-    #dataset_generator.set_postprocess_by_another_ai(another_ai_path_and_target, output_shape="nchw", outpur_format='.npy')
+    dataset_generator = GenYoloCropedDataset(dataset_path, 'cropped_images2')
+    #dataset_generator.set_postprocess_by_another_model(another_model_path_and_target, output_shape="nchw", outpur_format='.npy')
 
-    cropped_list_path = dataset_generator.gerenate()
+    cropped_list_path = dataset_generator.generate()
 
     print(f"裁剪后的图片路径列表已保存到: {cropped_list_path}")
 
