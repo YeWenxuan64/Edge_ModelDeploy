@@ -1,12 +1,12 @@
 /.vscode
 __pycache__/*
 
-
 /datasets/original/
 /legacy/*
 
-/*/models_convert/*/*.onnx
-/MSI-net/models_convert/original/save_model/*
+/Edge_Inferencer
+
+
 
 /utilities/qairt
 /utilities/tmp
