@@ -19,4 +19,4 @@ __pycache__/*
 # *.onnx
 *.pt
 *.ts
-*.mp4
+# *.mp4
