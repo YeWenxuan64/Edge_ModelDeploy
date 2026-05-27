@@ -4,7 +4,11 @@ __pycache__/*
 /datasets/original/
 /legacy/*
 
-/Edge_Inferencer
+#/Edge_Inferencer/*
+
+
+# /Yolo11_ModelDeploy/models_convert/original/ultralytics_yolo11
+# /Yolo26_ModelDeploy/models_convert/original/ultralytics
 
 
 
