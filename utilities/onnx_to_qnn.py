@@ -861,7 +861,8 @@ class OnnxToQNN:
     def quantize_model(self, dlc_model_path:str, calibration_data_index_path:str) -> str|None:
         dlc_model_file = Path(str(dlc_model_path))
         input_list_str = str(calibration_data_index_path)
-        quantized_dlc_model_path = dlc_model_file.parent / f"{dlc_model_file.stem}_quantized.dlc"
+        #quantized_dlc_model_path = dlc_model_file.parent / f"{dlc_model_file.stem}_quantized.dlc"
+        quantized_dlc_model_path = dlc_model_file.parent / f"quantized_model.dlc"
 
         if not dlc_model_file.exists():
             print(f"Error: DLC model not found at {dlc_model_file}")
