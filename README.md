@@ -1,6 +1,16 @@
 # Edge Model Deploy
 
-## 概述
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey.svg)]()
+[![ONNX](https://img.shields.io/badge/ONNX-1.0+-005CED?logo=onnx&logoColor=white)](https://onnx.ai/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![TensorFlow](https://img.shields.io/badge/TensorFlow-2.0+-FF6F00?logo=tensorflow&logoColor=white)](https://www.tensorflow.org/)
+[![RKNN](https://img.shields.io/badge/Rockchip-RKNN-FF6600)](https://github.com/airockchip/rknn-toolkit2)
+[![QNN](https://img.shields.io/badge/Qualcomm-QNN-325CAC)](https://www.qualcomm.com/developer/software/qualcomm-ai-engine-direct-sdk)
+[![Edge AI](https://img.shields.io/badge/Edge-AI-8A2BE2)]()
+
+## 📖 概述
 
 本项目提供一套**可复用的模型转换工具链**，覆盖从训练框架（PyTroch, TensorFlow）的cv模型统一转换为 ONNX，再量化部署到边缘端 NPU（Rockchip RKNN / Qualcomm QNN）
 > 同时本项目也是本小姐🍃的项目[Focus-Finder](https://github.com/YeWenxuan64/Focus-Finder)的模型部署部分喵~
@@ -16,7 +26,7 @@
 > **工具链是核心资产** — 每个子模块（AVTrack、NanoTrackV3、RetinaFace 等）都复用同一套 `utilities/` 转换工具，只需编写模型特有的 PyTorch → ONNX 导出脚本即可。
 
 
-## 项目结构
+## 🏗️ 项目结构
 
 ```
 Focus-Finder_ModelDeploy/
@@ -39,9 +49,9 @@ Focus-Finder_ModelDeploy/
 └── Yolo26_ModelDeploy/              # git submodule → YOLO26 检测
 ```
 
-## 示例模型
+## 🧠 示例模型
 
-本项目以 git submodule 管理多个模型部署模块：
+本项目可用于本小姐的多个模型部署模块：
 
 | 子模块 | 模型类型 | 来源 |
 |--------|---------|------------|
@@ -52,17 +62,17 @@ Focus-Finder_ModelDeploy/
 | [Yolo11_ModelDeploy](./Yolo11_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO11(RKNN custom-made) |
 | [Yolo26_ModelDeploy](./Yolo26_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO26 |
 
-每个子模块独立维护，包含该模型的完整转换流程与预训练权重。
+每个子模块独立维护，包含该模型的预训练权重获取方式与完整转换流程
 
 
-## 快速开始
+## 📦 工具链部署
 ### 0. 环境要求
 
 | 工作流           | Windows   | Linux | Python 版本 |
 |-----------------|------------|------|-------------|
 | 训练框架 to ONNX | 支持       | 支持 | 3.10+ |
 | ONNX to RKNN    | 支持       | 支持 | 3.10 - 3.12 |
-| ONNX TO QNN     | 目前不支持 | 支持 | 3.10 |
+| ONNX to QNN     | 目前不支持 | 支持 | 3.10 |
 
 
 ### 1. 克隆项目（含子模块）
@@ -73,13 +83,18 @@ cd Focus-Finder_ModelDeploy
 ```
 
 ### 2. 安装依赖
-> **假如你在使用python虚拟环境，请在你正在使用的环境下安装**<br>
+> 假如你在使用python虚拟环境，请在**你正在使用的**环境下安装<br>
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**如果需要转换为QNN模型，则需要下载高通的`QAIRT SDK`，解压并放置在`onnx_to_qnn.py`同级目录下**
+**如果需要转换为QNN模型，则需要下载高通的`QAIRT SDK`，解压并放置在`onnx_to_qnn.py`同级目录下**<br>
+网页下载: [Qualcomm AI Runtime SDK](https://softwarecenter.qualcomm.com/catalog/item/Qualcomm_AI_Runtime_Community?osArch=Any&osType=All&version=2.38.0.250901)<br>
+链接下载: [Qualcomm_AI_Runtime_SDK_2.38.0.250901.zip](https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/2.38.0.250901/v2.38.0.250901.zip)
+
+> 转换模型所使用的SDK版本建议**低于等于**推理时所用的SDK版本
+
 ```
 Eedge_ModelDeploy/
 ├── utilities/
@@ -101,8 +116,8 @@ Eedge_ModelDeploy/
 
 | 数据集 | 用途 | 官方下载链接 |
 |--------|------|------------|
-| **COCO 2017 val** | 通用目标检测/跟踪模型校准 | [val2017.zip](http://images.cocodataset.org/zips/val2017.zip) (5GB) |
-| **WIDER Face** | 人脸检测模型校准 | [WIDER Face 官网](http://mmlab.ie.cuhk.edu.hk/projects/WIDERFace) |
+| **COCO 2017 val** | 通用目标检测/跟踪模型校准 | [val2017.zip](http://images.cocodataset.org/zips/val2017.zip) (~5GB) |
+| **WIDER Face** | 人脸检测模型校准 | [WIDER Face 官网](http://mmlab.ie.cuhk.edu.hk/projects/WIDERFace) (~400MB) |
 | **ImageNet** | 通用分类/检测模型校准（需注册） | [ImageNet 官网](https://www.image-net.org/download) 或 [Small ImageNet](https://www.image-net.org/small/download.php) |
 
 > **提示：** <br>
@@ -110,25 +125,6 @@ Eedge_ModelDeploy/
 > 校准数据集推荐使用**符合模型应用场景**的通用数据集，比如自己训练的模型则需要使用自己的数据集<br>
 > 格式为每行一个图片路径的 `.txt` 文件。若模型有多个输入，则每行<输入个数>个图片路径<br>
 
-
-#### 使用 `collect_image_paths` 生成数据集索引文件
-
-下载图片后，可以用 `utilities/utils.py` 中的 `collect_image_paths()` 函数自动生成路径索引文件：
-
-```python
-from utilities.utils import collect_image_paths
-
-# 从指定目录收集图片路径，生成 txt 索引文件
-dataset_txt = collect_image_paths(
-    dir_paths=['/path/to/coco/val2017'],  # 图片目录列表
-    max_count=200                          # 最多取 200 张
-)
-
-print(f"数据集索引已生成: {dataset_txt}")
-# 输出: utilities/tmp/combind_image_paths.txt
-```
-
-该函数会扫描指定目录下所有常见格式的图片（jpg/png/bmp/webp/tiff 等），将绝对路径逐行写入 `utilities/tmp/combind_image_paths.txt`，然后返回该文件的绝对路径。
 
 ### 3. 使用转换工具
 
@@ -149,25 +145,96 @@ python Yolo26_onnx2qnn.py
 ```
 
 
-## 工具链使用指南
+## 📚 工具链使用指南
+
 [工具链使用指南](./README_TOOLUSE.md)
 
+### 模型转换工作流
 
-## 兼容性
+```
+                   ┌─────────────────────────────────┐
+                   │      PyTorch / TensorFlow       │
+                   │    (Training Framework Model)   │
+                   └───────────────┬─────────────────┘
+                                   │  Per-submodule scripts
+                                   ▼
+                   ┌─────────────────────────────────┐
+                   │             ONNX                │
+                   │   (Intermediate Representation) │
+                   └───────────────┬─────────────────┘
+                                   │
+                ┌──────────────────┴─────────────────┐
+                │                                    │
+                ▼                                    ▼
+┌─────────────────────────────────┐  ┌─────────────────────────────────┐
+│           OnnxToRKNN            │  │           OnnxToQNN             │
+│  (utilities/onnx_to_rknn.py)    │  │  (utilities/onnx_to_qnn.py)     │
+│                                 │  │                                 │
+├─────────────────────────────────┤  ├─────────────────────────────────┤
+│                                 │  │                                 │
+│  1. rknn.config()               │  │  1. run_env_script()            │
+│     Config quant algorithm      │  │     Source QAIRT SDK env vars   │
+│                                 │  │                                 │
+│  2. rknn.load_onnx()            │  │  2. modify_onnx_model()         │
+│     Load ONNX model             │  │     Add normalization nodes     │
+│                                 │  │     (Sub/Div)                   │
+│  3. rknn.build()                │  │     Reorder nodes by I/O        │
+│     ├─ With dataset → INT8      │  │     ONNX validate + Shape infer │
+│     ├─ No dataset  → FP16       │  │                                 │
+│     └─ Hybrid quant → step1+2   │  │  3. get_onnx_model_info()       │
+│                                 │  │     Parse input/output dims     │
+│  4. rknn.export_rknn()          │  │                                 │
+│     Export .rknn model file     │  │  4. convert_onnx_model()        │
+│                                 │  │     qairt-converter             │
+│  5. rknn.release()              │  │     ONNX ──► DLC (unquantized)  │
+│     Release resources           │  │                                 │
+│                                 │  │  5. generate_calibration_data() │
+│  6. clean()                     │  │     Read imgs → Preprocess →    │
+│     Clean temp files            │  │     .raw files                  │
+│                                 │  │                                 │
+│                                 │  │  6. quantize_model()            │
+│                                 │  │     qairt-quantizer             │
+│                                 │  │     DLC ──► Quantized DLC       │
+│                                 │  │                                 │
+│                                 │  │  7. write_config_file()         │
+│                                 │  │     Generate HTP backend config │
+│                                 │  │     JSON                        │
+│                                 │  │                                 │
+│                                 │  │  8. generate_context_binary()   │
+│                                 │  │     qnn-context-binary-generator│
+│                                 │  │     Quantized DLC ──► .bin (HTP)│
+│                                 │  │                                 │
+│                                 │  │  9. clean()                     │
+│                                 │  │     Clean temp files            │
+└───────────────┬─────────────────┘  └───────────────┬─────────────────┘
+                │                                    │
+                ▼                                    ▼
+┌─────────────────────────────────┐  ┌─────────────────────────────────┐
+│         .rknn Model             │  │          .bin Model             │
+│     Rockchip NPU Executable     │  │     Qualcomm HTP Executable     │
+│   (RK3588 / RK3576 / RK3566)    │  │  (QCS6490 / QCS8550 / QCS9075)  │
+└─────────────────────────────────┘  └─────────────────────────────────┘
+```
+
+
+
+
+## 🔌 兼容性
 
 ### 硬件兼容性
 
 | 目标平台        | AI处理器    | 芯片     | 转换工具 | 量化格式 |
 |----------------|-------------|---------|---------|---------|
 | Rockchip       | NPU         | RK3588 RK3576 RK3566 | `onnx_to_rknn.py` | INT8 / FP16 / 混合量化 |
-| Qualcomm (HTP) | Hexagon DSP | QCS6490 | `onnx_to_qnn.py` | INT8 / INT4 / FP16 |
+| Qualcomm (HTP) | Hexagon DSP | QCS6490 QCS8550 QCS9075 | `onnx_to_qnn.py` | INT8 / INT4 / FP16 |
 
-### 软件兼容性
-> 目前本工具仅支持**计算机视觉（CV）**类的模型部署<br>
-> 目前本工具仅支持固定输入、输出尺寸的模型<br>
+### 局限性
+TODO
+- [ ] 目前本工具仅支持**计算机视觉（CV）**类的模型部署
+- [ ] 目前本工具仅支持固定输入、输出尺寸的模型
 
 
-## License
+## 📄 License
 
 MIT License — Copyright (c) 2026 叶文轩
 

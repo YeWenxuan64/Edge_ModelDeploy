@@ -3,6 +3,26 @@
 ## 0. 安装依赖与准备量化校准数据集
 已在[README.md](README.md)中介绍
 
+#### 使用 `collect_image_paths` 生成数据集索引文件
+
+下载图片后，可以用 `utilities/utils.py` 中的 `collect_image_paths()` 函数自动生成路径索引文件：
+
+```python
+from utilities.utils import collect_image_paths
+
+# 从指定目录收集图片路径，生成 txt 索引文件
+dataset_txt = collect_image_paths(
+    dir_paths=['/path/to/coco/val2017'],  # 图片目录列表
+    max_count=200                          # 最多取 200 张
+)
+
+print(f"数据集索引已生成: {dataset_txt}")
+# 输出: utilities/tmp/combind_image_paths.txt
+```
+
+该函数会扫描指定目录下所有常见格式的图片（jpg/png/bmp/webp/tiff 等），将绝对路径逐行写入 `utilities/tmp/combind_image_paths.txt`，然后返回该文件的绝对路径。
+
+
 ## 1. 创建转换工程
 模仿示例的子模块，新建文件夹转换工程文件夹，并按照以特定结构放置文件和填写转换脚本
 ```
