@@ -55,12 +55,12 @@ Focus-Finder_ModelDeploy/
 
 | 子模块 | 模型类型 | 来源 |
 |--------|---------|------------|
-| [AVTrack_ModelDeploy](./AVTrack_ModelDeploy/)                     | 视觉目标跟踪 | ICML 2024 — *Learning Adaptive and View-Invariant Vision Transformer for Real-Time UAV Tracking* |
-| [RetinaFace-mobile_ModelDeploy](./RetinaFace-mobile_ModelDeploy/) | 人脸检测     | RetinaFace 轻量化版本 |
-| [NanoTrackV3_ModelDeploy](./NanoTrackV3_ModelDeploy/)             | 视觉目标跟踪 | NanoTrack 系列 |
-| [MSI-Net_ModelDeploy](./MSI-Net_ModelDeploy/)                     | 显著性检测   | MSI-Net<br>Neural Networks — *Contextual encoder-decoder network for visual saliency prediction* |
-| [Yolo11_ModelDeploy](./Yolo11_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO11(RKNN custom-made) |
-| [Yolo26_ModelDeploy](./Yolo26_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO26 |
+| [AVTrack_ModelDeploy](https://github.com/YeWenxuan64/AVTrack_ModelDeploy/)                     | 视觉目标跟踪 | ICML 2024 — *Learning Adaptive and View-Invariant Vision Transformer for Real-Time UAV Tracking* |
+| [RetinaFace-mobile_ModelDeploy](https://github.com/YeWenxuan64/RetinaFace-mobile_ModelDeploy/) | 人脸检测     | RetinaFace 轻量化版本 |
+| [NanoTrackV3_ModelDeploy](https://github.com/YeWenxuan64/NanoTrackV3_ModelDeploy/)             | 视觉目标跟踪 | NanoTrack 系列 |
+| [MSI-Net_ModelDeploy](https://github.com/YeWenxuan64/MSI-Net_ModelDeploy/)                     | 显著性检测   | MSI-Net<br>Neural Networks — *Contextual encoder-decoder network for visual saliency prediction* |
+| [Yolo11_ModelDeploy](https://github.com/YeWenxuan64/Yolo11_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO11(RKNN custom-made) |
+| [Yolo26_ModelDeploy](https://github.com/YeWenxuan64/Yolo26_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO26 |
 
 每个子模块独立维护，包含该模型的预训练权重获取方式与完整转换流程
 
