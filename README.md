@@ -128,20 +128,20 @@ Eedge_ModelDeploy/
 
 ### 3. 使用转换工具
 
-每个子模块的转换流程一致，以 Yolo26_ModelDeploy 为例：
+每个子模块的转换流程一致，以 Yolo11_ModelDeploy 为例：
 
 ```bash
 # 1.PyTorch → ONNX（各模型独立实现）
-cd Yolo26_ModelDeploy
-python Yolo26_pytorch2onnx.py
+cd Yolo11_ModelDeploy
+python Yolo11_pytorch2onnx.py
 
 # 2.1.ONNX → RKNN（复用 utilities）
-python Yolo26_onnx2rknn.py
-# 输出到: Yolo26_ModelDeploy/models_convert/rknn
+python Yolo11_onnx2rknn.py
+# 输出到: Yolo11_ModelDeploy/models_convert/rknn
 
 # 2.2.ONNX → QNN（复用 utilities）
-python Yolo26_onnx2qnn.py
-# 输出到: Yolo26_ModelDeploy/models_convert/qnn
+python Yolo11_onnx2qnn.py
+# 输出到: Yolo11_ModelDeploy/models_convert/qnn
 ```
 
 

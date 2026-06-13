@@ -1,7 +1,7 @@
 import os
+import re
 import json
 import shutil
-import platform
 import subprocess
 import heapq
 from pathlib import Path
@@ -258,7 +258,12 @@ def reorder_onnx_nodes_by_output(model:onnx.ModelProto, max_depth:int=10) -> onn
 
     return model
 
-
+def sanitize_name(name:str, replace_chars:str=r'()[]{}-\/:*?"<>|,') -> str:
+    """将指定字符替换为 '_',并将连续下划线合并为一个"""
+    trans_table = str.maketrans(replace_chars, '_' * len(replace_chars))
+    name = name.translate(trans_table)
+    name = re.sub(r'_+', '_', name).strip('_')
+    return name
 
 
 class OnnxToQNN:
@@ -306,7 +311,10 @@ class OnnxToQNN:
         self.qnn_sdk_dir = version_dir
 
         self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
-        self.tmp_onnx_path = self.tmp_dir / self.model_path.name
+
+        sanitize_model_name = sanitize_name(self.model_path.stem)
+        tmp_onnx_path = self.tmp_dir / sanitize_model_name
+        self.tmp_onnx_path = tmp_onnx_path.with_suffix('.onnx')
 
         self.file_or_dir_to_clean = []
 
@@ -677,7 +685,7 @@ class OnnxToQNN:
         layout_args = " ".join(layout_params) # 将布局参数拼接成字符串
 
 
-        extra_args = '--target_backend HTP --onnx_summary' # --preserve_onnx_output_order
+        extra_args = "--target_backend HTP --onnx_skip_simplification" # --onnx_summary' # --preserve_onnx_output_order
 
         if not self.dataset_path and not self.custom_alibration_data_path:
             extra_args += " --float_bitwidth 16"
@@ -861,8 +869,8 @@ class OnnxToQNN:
     def quantize_model(self, dlc_model_path:str, calibration_data_index_path:str) -> str|None:
         dlc_model_file = Path(str(dlc_model_path))
         input_list_str = str(calibration_data_index_path)
-        #quantized_dlc_model_path = dlc_model_file.parent / f"{dlc_model_file.stem}_quantized.dlc"
-        quantized_dlc_model_path = dlc_model_file.parent / f"quantized_model.dlc"
+        quantized_dlc_model_path = dlc_model_file.parent / f"{dlc_model_file.stem}_quantized.dlc"
+        #quantized_dlc_model_path = dlc_model_file.parent / f"quantized_model.dlc"
 
         if not dlc_model_file.exists():
             print(f"Error: DLC model not found at {dlc_model_file}")
