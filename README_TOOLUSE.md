@@ -26,7 +26,7 @@ print(f"数据集索引已生成: {dataset_txt}")
 ## 1. 创建转换工程
 模仿示例的子模块，新建文件夹转换工程文件夹，并按照以特定结构放置文件和填写转换脚本
 ```
-Focus-Finder_ModelDeploy/
+Edge_ModelDeploy/
 ├── utilities/
 │   └── ...
 ├── datasets/                       

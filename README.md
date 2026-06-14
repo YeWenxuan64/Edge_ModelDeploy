@@ -29,7 +29,7 @@
 ## 🏗️ 项目结构
 
 ```
-Focus-Finder_ModelDeploy/
+Edge_ModelDeploy/
 ├── utilities/                       # ⭐ 共享转换工具链（核心）
 │   ├── onnx_to_rknn.py              # ONNX → RKNN 转换（Rockchip）
 │   ├── onnx_to_qnn.py               # ONNX → QNN 转换（Qualcomm）
@@ -78,8 +78,8 @@ Focus-Finder_ModelDeploy/
 ### 1. 克隆项目（含子模块）
 
 ```bash
-git clone --recurse-submodules https://github.com/YeWenxuan64/Focus-Finder_ModelDeploy.git
-cd Focus-Finder_ModelDeploy
+git clone --recurse-submodules https://github.com/YeWenxuan64/Edge_ModelDeploy.git
+cd Edge_ModelDeploy
 ```
 
 ### 2. 安装依赖
