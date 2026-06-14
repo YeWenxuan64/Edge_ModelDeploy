@@ -232,7 +232,8 @@ python Yolo11_onnx2qnn.py
 TODO
 - [ ] 目前本工具仅支持**计算机视觉（CV）**类的模型部署
 - [ ] 目前本工具仅支持固定输入、输出尺寸的模型
-
+- [ ] 由于小女子太笨了，目前本工具的 QNN 模型量化仅支持 `QAIRT` 的普通量化工作流，尚未支持 `AIMET（AI Model Efficiency Toolkit）`
+- [ ] 由于小女子太笨了，目前本工具 QNN 模型量化的工作流不支持精度分析
 
 ## 📄 License
 
