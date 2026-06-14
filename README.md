@@ -83,11 +83,49 @@ cd Focus-Finder_ModelDeploy
 ```
 
 ### 2. 安装依赖
+#### 系统依赖
+```bash
+sudo apt-get update
+
+# 如果你在VMware虚拟机
+# sudo apt-get install open-vm-tools open-vm-tools-desktop
+
+sudo apt-get install cmake git
+sudo apt install python3-pip python3-venv
+
+```
+
+#### Python 依赖
+
 > 假如你在使用python虚拟环境，请在**你正在使用的**环境下安装<br>
+> - 附上虚拟环境的创建和进入:
+> ```bash
+> python3 -m venv ~/python_venv
+> source ~/python_venv/bin/activate
+> ```
 
 ```bash
-pip install -r requirements.txt
+# 严格按此顺序执行（逐条！）
+pip install -r requirements_base.txt
+pip install -r requirements_torch_cpu.txt --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements_tensorflow.txt
+pip install -r requirements_overwrite.txt
+pip install rknn-toolkit2 --no-deps
 ```
+
+> ⚠️ **安装顺序至关重要**，请严格按以下顺序逐条执行，**不要合并为一条命令**，**不要加 `--upgrade` 标志**：
+>
+> | 步骤 | 命令 | 说明 |
+> |------|------|------|
+> | 1. | `pip install -r requirements_base.txt` | 基础依赖（numpy, opencv-python 等） |
+> | 2. | `pip install -r requirements_torch_cpu.txt --index-url https://download.pytorch.org/whl/cpu` | PyTorch **CPU 版**。也可以装普通 GPU 版（`requirements_torch.txt`），但 GPU 版体积异常膨胀，且对其他依赖的版本约束更严格，在依赖有冲突的环境中很难调通 |
+> | 3. | `pip install -r requirements_tensorflow.txt` | TensorFlow（与 PyTorch 有共同依赖，需在 base 之后安装） |
+> | 4. | `pip install -r requirements_overwrite.txt` | **包版本覆盖** — 将某些包降级/锁定到兼容版本（必须在最后装！） |
+> | 5. | `pip install rknn-toolkit2 --no-deps` | Rockchip RKNN 工具（`--no-deps` 避免上游依赖冲突） |
+>
+> **为什么顺序重要？** 核心原因是 **`protobuf`** 和 **`easydict`** 等包在 TensorFlow 与 PyTorch 不同版本间存在冲突 — 先装 A 框架拉高版本，再装 B 框架时可能不兼容。`requirements_overwrite.txt` 会在最后统一锁定兼容版本。此外 **RKNN / QNN 框架对 TensorFlow 和 PyTorch 的版本要求极其严苛**，混装极易踩坑，分步安装可以精确控制每一层的依赖版本。
+
+#### QNN 依赖
 
 **如果需要转换为QNN模型，则需要下载高通的`QAIRT SDK`，解压并放置在`onnx_to_qnn.py`同级目录下**<br>
 网页下载: [Qualcomm AI Runtime SDK](https://softwarecenter.qualcomm.com/catalog/item/Qualcomm_AI_Runtime_Community?osArch=Any&osType=All&version=2.38.0.250901)<br>
@@ -230,7 +268,7 @@ python Yolo11_onnx2qnn.py
 
 ### 局限性
 TODO
-- [ ] 目前本工具仅支持**计算机视觉（CV）**类的模型部署
+- [ ] 目前本工具仅支持 **计算机视觉(CV)** 类的模型部署
 - [ ] 目前本工具仅支持固定输入、输出尺寸的模型
 - [ ] 由于小女子太笨了，目前本工具的 QNN 模型量化仅支持 `QAIRT` 的普通量化工作流，尚未支持 `AIMET（AI Model Efficiency Toolkit）`
 - [ ] 由于小女子太笨了，目前本工具 QNN 模型量化的工作流不支持精度分析

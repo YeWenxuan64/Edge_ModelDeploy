@@ -1,0 +1,6 @@
+protobuf<=4.25.4
+easydict
+
+ml_dtypes>0.3.1
+tf2onnx
+
