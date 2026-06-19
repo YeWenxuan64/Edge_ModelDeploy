@@ -1,6 +1,7 @@
 import os
 import random
 from pathlib import Path
+import onnx  # 仅用于类型注解
 
 
 # 一个上下文管理器以安全地更改目录
@@ -18,11 +19,7 @@ class temporary_chdir:
         os.chdir(self.saved_path)     # 无论代码块是否报错，都恢复原来的目录
 
 
-
-
-
-
-def collect_image_paths(dir_paths: list[str], max_count: int, random_sample: bool = False) -> str:
+def collect_image_paths(dir_paths:list[str], max_count:int, random_sample:bool=False) -> str:
     """
     从多个图片目录中收集图片绝对路径，写入 tmp 目录下的 txt 文件，并返回该 txt 的绝对路径。
     
@@ -100,3 +97,45 @@ def collect_image_paths(dir_paths: list[str], max_count: int, random_sample: boo
             f.write('\n')  # 符合 POSIX 文本规范，末尾保留换行
 
     return str(output_txt.resolve())
+
+
+def fmt_model_name_with_shape(model:onnx.ModelProto|str, model_name:str, use_nhwc:bool=False) -> str:
+    """
+    Parse ONNX model input shapes and format them into a descriptive model name string.
+
+    Args:
+        model:      Loaded onnx.ModelProto object (obtained via onnx.load()).
+        model_name: Model name prefix, e.g. "yolo_", "track_".
+        use_nhwc:   Whether to output shapes in NHWC order. Default False = NCHW order.
+
+    Returns:
+        Formatted model name string with `{shapes}` replaced. Examples:
+            "yolo_{{shapes}}"              → "yolo_[1,3,160,320]"
+            "yolo_{{shapes}}.onnx"          → "yolo_[1,3,160,320].onnx"
+            "track_{{shapes}}"             → "track_[[1,3,128,128][1,3,256,256]]"
+    """
+    if isinstance(model, str):
+        model = onnx.load_model(model)
+
+    shapes = []
+    for inp in model.graph.input:
+        shape_dims = []
+        for dim in inp.type.tensor_type.shape.dim:
+            val = dim.dim_value if dim.dim_value > 0 else -1
+            shape_dims.append(val)
+        shapes.append(shape_dims)
+
+    # 若 use_nhwc 且为 4 维形状，重排 (N,C,H,W) → (N,H,W,C)
+    if use_nhwc and len(shapes[0]) == 4:
+        shapes = [
+            [s[0], s[2], s[3], s[1]] if len(s) == 4 else s
+            for s in shapes
+        ]
+
+    if len(shapes) == 1:
+        shape_str = str(shapes[0]).replace(" ", "")
+    else:
+        inner = "".join(str(s) for s in shapes)
+        shape_str = f"[{inner}]".replace(" ", "")
+
+    return model_name.format(shapes=shape_str)
