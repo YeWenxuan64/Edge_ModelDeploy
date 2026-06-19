@@ -1,4 +1,5 @@
 # Edge Model Deploy
+![madewithlove](https://img.shields.io/badge/made_with-%E2%9D%A4-red?style=for-the-badge&labelColor=pink)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
@@ -267,14 +268,16 @@ python Yolo11_onnx2qnn.py
 | Qualcomm (HTP) | Hexagon DSP | QCS6490 QCS8550 QCS9075 | `onnx_to_qnn.py` | INT8 / INT4 / FP16 |
 
 ### 局限性
-TODO
-- [ ] 目前本工具仅支持 **计算机视觉(CV)** 类的模型部署
-- [ ] 目前本工具仅支持固定输入、输出尺寸的模型
-- [ ] 由于小女子太笨了，目前本工具的 QNN 模型量化仅支持 `QAIRT` 的普通量化工作流，尚未支持 `AIMET（AI Model Efficiency Toolkit）`
-- [ ] 由于小女子太笨了，目前本工具 QNN 模型量化的工作流不支持精度分析
+
+> TODO — 小女子笨笨的，未来慢慢填坑喵~ 🐾
+
+- [ ] **更多模型类型** — 目前仅支持 **计算机视觉（CV）** 类的模型部署，NLP / 语音等领域的模型暂不支持
+- [ ] **动态尺寸** — 仅支持**固定输入、输出尺寸**的模型，动态 shape 的模型需要手动固定后再走转换流程
+- [ ] **QNN 量化工作流单一** — 由于小女子太笨了，目前仅支持 `QAIRT` 原生的普通量化流程，尚未接入 `AIMET（AI Model Efficiency Toolkit）` 的更高级量化方法（如跨层等价变换、编码感知训练等）
+- [ ] **QNN 精度分析缺失** — 由于小女子太笨了，QNN 的精度分析还不会用喵
 
 ## 📄 License
 
-MIT License — Copyright (c) 2026 叶文轩
+[MIT License](./LICENSE) — Copyright (c) 2026 叶文轩
 
 各子模块的模型、代码，以及数据集遵循其原始 License。
