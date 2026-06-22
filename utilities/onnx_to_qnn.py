@@ -514,9 +514,7 @@ class SnpeAccuracyDebugger:
         ax_cos.set_ylabel('Cosine Similarity', fontsize=12)
         ax_cos.set_xticks(layer_index)
         if names is not None:
-            # auto_fontsize = max(4, min(10, 800 / n_elemments))  # 层数越多，字体越小
-            # ax_cos.set_xticklabels(names, rotation=90, fontsize=auto_fontsize)
-            ax_cos.set_xticklabels(names, rotation=90, fontsize=10)
+            ax_cos.set_xticklabels(names, rotation=-45, ha='left', fontsize=10)
         
         ax_cos.axhline(0.99, color='red', linestyle='--', linewidth=1, alpha=0.6, label='Warning Threshold (0.99)')
         ax_cos.legend()
