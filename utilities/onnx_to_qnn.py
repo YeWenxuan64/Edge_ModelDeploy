@@ -275,7 +275,10 @@ class SnpeAccuracyDebugger:
         self.quant_dlc_path = Path(quant_dlc_path).resolve()
         self.debugger_picture_list = [Path(p).resolve() for p in debugger_picture_list]
 
-        self.working_dir = Path.home() / 'accuracy_analysis' #self.tmp_dir / 'accuracy_analysis'
+        self.tmp_working_dir = self.tmp_dir / 'accuracy_analysis'
+        self.tmp_working_dir.mkdir(exist_ok=True)
+
+        self.working_dir = Path.home() / 'accuracy_analysis'
         self.working_dir.mkdir(exist_ok=True)
 
         self.golden_dir = self.working_dir / 'golden_dir'
@@ -308,7 +311,7 @@ class SnpeAccuracyDebugger:
         return latest
 
     def prepare_input_data(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]], set_input_order:str='nchw'):
-        analysis_input_dir = self.working_dir / f'analysis_inputs'
+        analysis_input_dir = self.tmp_working_dir / f'analysis_inputs'
         analysis_input_dir.mkdir(exist_ok=True)
 
         input_infos:list[dict[str, str|list[int]]] = self.onnx_info['inputs']
@@ -366,7 +369,7 @@ class SnpeAccuracyDebugger:
             output_arg_list.append(f'--output_tensor "{output_name}"')
 
 
-        analysis_input_list = str(self.working_dir / f"analysis_input_list.txt")
+        analysis_input_list = str(self.tmp_working_dir / f"analysis_input_list.txt")
         with open(analysis_input_list, 'w') as f:
             f.write(' '.join(input_tensor_path_list))
 
@@ -377,7 +380,6 @@ class SnpeAccuracyDebugger:
 
 
     def qnn_infer(self, working_dir:str, dlc_model:str, analysis_input_list:list, input_arg_list:list, output_arg_list:list) -> int:
-        
         qnn_sdk_root = os.environ.get('QNN_SDK_ROOT')
 
         input_tensor_args = ' '.join(input_arg_list)
@@ -397,7 +399,7 @@ class SnpeAccuracyDebugger:
         command += f" {input_tensor_args}"
         command += f" {output_tensor_args}"
 
-        command += f" --verbose"
+        #command += f" --verbose"
 
         ret = self.command_runnr(command)
         return ret
@@ -422,56 +424,73 @@ class SnpeAccuracyDebugger:
         return ret
 
     def show_accuracy_analysis(self):
-        src = self.working_dir / "verification"
-        dst = self.tmp_dir / 'accuracy_analysis' / "latest"
+        golden_infer_src = self.find_latest_subdir(self.golden_dir / "inference_engine")
+        quant_infer_src = self.find_latest_subdir(self.quant_dir / "inference_engine")
+        verification_src = self.find_latest_subdir(self.working_dir / 'verification')
 
-        latest_ver_dir = self.find_latest_subdir(src)
-        dst.mkdir(parents=True, exist_ok=True)
+        golden_dst = self.tmp_working_dir / 'golden_dir' / "inference_engine" / "latest"
+        quant_dst = self.tmp_working_dir / 'quant_dir' / "inference_engine" / "latest"
+        verification_dst = self.tmp_working_dir / "verification"
 
-        print(f"Copying accuracy analysis results from {src} to {dst}")
-        shutil.copytree(latest_ver_dir, dst, symlinks=False, dirs_exist_ok=True, ignore_dangling_symlinks=True)
-        print(f"Copied accuracy analysis results from {src} to {dst}")
+        # 多线程并行 copytree
+        def do_copy(src: Path, dst: Path):
+            print(f"Copying inference results from {src} to {dst}")
+            shutil.copytree(src, dst, symlinks=False, dirs_exist_ok=True, ignore_dangling_symlinks=True)
 
+        copy_pairs = [(golden_infer_src, golden_dst), (quant_infer_src, quant_dst), (verification_src, verification_dst)]
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures:list[Future] = []
+            for src, dst in copy_pairs:
+                dst.parent.mkdir(parents=True, exist_ok=True) # 预创建目标父目录
+                futures.append(executor.submit(do_copy, src, dst))
+
+            for f in futures:
+                f.result()
+
+        shutil.rmtree(self.working_dir)
 
         import pandas as pd
         from matplotlib import axes
         import matplotlib.pyplot as plt
 
-        # ================= 1. 找到最新的 summary.csv =================
-        file_path = dst / 'summary.csv'
+        # 1. 找到最新的 summary.csv
+        file_path = verification_dst / 'summary.csv'
         print(f"Loading summary from: {file_path}")
         df = pd.read_csv(file_path)
 
         # 提取关键列
         sizes = df['Size'].values
         mses = df['mse'].values.astype(np.float64)
-        cossim = df["cosinesimilarity"].values.astype(np.float64)
+        cossim = df["cosinesimilarity"].values.astype(np.float32)
+        n_elemments = len(cossim)
 
         try:
             names = df['Target Name'].values
         except KeyError:
-            names = df['Name'].values
+            try:
+                names = df['Name'].values
+            except KeyError:
+                names = None
 
-        layer_index = range(len(mses))
+        layer_index = range(n_elemments)
 
-        # ================= 2. 核心计算 =================
+        # 2. 核心计算
         # 计算每一层的误差平方和 (SSE)
         squared_errors = mses * sizes
 
-        # 【逐层欧氏距离】
+        # 逐层欧氏距离
         layer_euc = np.sqrt(squared_errors)
-
 
         # 数据清洗：避免在对数坐标下 log(0) 报错，将绝对的 0 值替换为极小值
         layer_euc[layer_euc == 0] = 1e-10
 
 
-        # ================= 3. 可视化绘图 =================
+        # 3. 可视化绘图
         fig, (ax_euc, ax_cos) = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
         ax_euc:axes.Axes
         ax_cos:axes.Axes
 
-        # ========== 图1：欧氏距离（逐层柱状）+ MSE（右侧纵轴折线） ==========
+        # 图1：欧氏距离（逐层柱状）+ MSE（右侧纵轴折线）
         ax_euc.set_yscale('linear')
         ax_euc.bar(layer_index, layer_euc, color='skyblue', edgecolor='black', linewidth=0.5, alpha=0.7, label='Euc Dist Per Layer')
         ax_euc.set_title('Euclidean Distance & MSE (Per Layer)', fontsize=14, fontweight='bold')
@@ -480,7 +499,7 @@ class SnpeAccuracyDebugger:
 
         # 右侧纵轴：MSE（量级可能千分之一~个位，与欧氏距离的几十上百分离显示）
         ax_mse = ax_euc.twinx()
-        ax_mse.plot(layer_index, mses, color='blue', marker='.', linestyle='-', linewidth=1.5, markersize=4, label='MSE Per Layer')
+        ax_mse.plot(layer_index, mses, color='blue', marker='.', linestyle='-', linewidth=1, markersize=2, label='MSE Per Layer')
         ax_mse.set_ylabel('MSE', fontsize=12)
 
         # 合并两个轴的图例
@@ -488,13 +507,16 @@ class SnpeAccuracyDebugger:
         lines_mse, labels_mse = ax_mse.get_legend_handles_labels()
         ax_euc.legend(lines_euc + lines_mse, labels_euc + labels_mse, loc='upper left')
 
-        # ========== 图2：余弦相似度（逐层折线 + 累计最小值叠加） ==========
+        # 图2：余弦相似度（逐层折线 + 累计最小值叠加）
         ax_cos.set_yscale('linear')
-        ax_cos.plot(layer_index, cossim, color='green', marker='.', linestyle='-', linewidth=1.5, markersize=4, label='Per Layer')
+        ax_cos.plot(layer_index, cossim, color='green', marker='.', linestyle='-', linewidth=1, markersize=2, label='Per Layer')
         ax_cos.set_title('Cosine Similarity (Per Layer)', fontsize=14, fontweight='bold')
         ax_cos.set_ylabel('Cosine Similarity', fontsize=12)
         ax_cos.set_xticks(layer_index)
-        ax_cos.set_xticklabels(names, rotation=90, fontsize=10)
+        if names is not None:
+            # auto_fontsize = max(4, min(10, 800 / n_elemments))  # 层数越多，字体越小
+            # ax_cos.set_xticklabels(names, rotation=90, fontsize=auto_fontsize)
+            ax_cos.set_xticklabels(names, rotation=90, fontsize=10)
         
         ax_cos.axhline(0.99, color='red', linestyle='--', linewidth=1, alpha=0.6, label='Warning Threshold (0.99)')
         ax_cos.legend()
@@ -506,20 +528,32 @@ class SnpeAccuracyDebugger:
         # 调整布局、保存并显示
         plt.tight_layout()
         save_path = self.tmp_dir / 'accuracy_analysis_summary.png'
-        plt.savefig(str(save_path), dpi=200, bbox_inches='tight')
+        plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
         print(f"Figure saved to: {save_path}")
         plt.show()
 
     def accuracy_analysis(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]], set_input_order:str='nhwc') -> int:
         analysis_input_list, input_arg_list, output_arg_list = self.prepare_input_data(mean_rgb, std_rgb, set_input_order)
+        ret_golden, ret_quant = 1, 1
         
-        ret = self.qnn_infer(self.golden_dir, self.golden_dlc_path, analysis_input_list, input_arg_list, output_arg_list)
-        if ret != 0:
+        # 并行执行 Golden（未量化）和 Quantized（量化）推理，两者互不依赖
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            golden_future = executor.submit(
+                self.qnn_infer, self.golden_dir, self.golden_dlc_path,
+                analysis_input_list, input_arg_list, output_arg_list
+            )
+            quant_future = executor.submit(
+                self.qnn_infer, self.quant_dir, self.quant_dlc_path,
+                analysis_input_list, input_arg_list, output_arg_list
+            )
+            ret_golden = golden_future.result()
+            ret_quant = quant_future.result()
+
+        if ret_golden != 0:
             print(f"Failed to run framework runner")
             exit(1)
         
-        ret = self.qnn_infer(self.quant_dir, self.quant_dlc_path, analysis_input_list, input_arg_list, output_arg_list)
-        if ret != 0:
+        if ret_quant != 0:
             print(f"Failed to run inference engine")
             exit(1)
 
@@ -1498,59 +1532,16 @@ class OnnxToQNN:
 
 
 if __name__ == "__main__":
-    current_dir = Path(__file__).parent.resolve()
-    tmp_dir = current_dir / "tmp"
-    onnx_path = tmp_dir / "yolo26s_1_3_320_640.onnx"
-    qant_dlc_path = tmp_dir / "yolo26s_1_3_320_640_quantized.dlc"
-    debugger_picture_list = [str(current_dir.parent / 'datasets/bus.jpg')]
-
-    qnn_sdk_dir = "/home/yewenxuan/convert_models/Edge_ModelDeploy/utilities/qairt/2.38.0.250901"
-    os.environ["QNN_SDK_ROOT"] = qnn_sdk_dir
-
-
-    envsetup_script = Path(qnn_sdk_dir )/ 'bin/envsetup.sh'
-    command = f"source '{envsetup_script}' && env"
-    executable = '/bin/bash'
-    encoding = 'utf-8'
-    print("Setting up QAIRT Linux environment...")
-        
-    # 执行脚本
-    proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, executable=executable)
+    onnx_path = './yolo11s.onnx'
+    qnn_model_path = './yolo11s.bin'
+    dataset_path = './datasets/datasets_face.txt'
     
-    stdout, stderr = proc.communicate() # 获取输出
-    
-    if proc.returncode != 0:
-        print(f"Error executing script: {stderr.decode(encoding)}")
+    mean_rgb = [[0, 0, 0]]
+    std_rgb = [[255, 255, 255]]
 
-    
-    # 解析环境变量
-    for line in stdout.decode().split('\n'):
-        if '=' in line:
-            key, value = line.split('=', 1)
-            os.environ[key] = value
+    onnx_to_qnn = OnnxToQNN(onnx_path, qnn_model_path, dataset_path)
+    onnx_to_qnn.convert(mean_rgb, std_rgb)
+
+    onnx_to_qnn.clean()
 
 
-    ans = SnpeAccuracyDebugger(tmp_dir, onnx_path, qant_dlc_path, debugger_picture_list)
-
-
-    onnx_info = OnnxToQNN.get_onnx_model_info(onnx_path)
-
-    
-
-
-
-    ans.summary_accuracy_analysis()
-    # onnx_path = './yolo11s.onnx'
-    # qnn_model_path = './yolo11s.bin'
-    # dataset_path = './datasets/datasets_face.txt'
-    
-    # mean_rgb = [[0, 0, 0]]
-    # std_rgb = [[255, 255, 255]]
-
-    # onnx_to_qnn = OnnxToQNN(onnx_path, qnn_model_path, dataset_path)
-    # onnx_to_qnn.convert(mean_rgb, std_rgb)
-
-    # onnx_to_qnn.clean()
-
-
-  

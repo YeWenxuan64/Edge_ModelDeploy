@@ -186,8 +186,8 @@ python Yolo11_onnx2qnn.py
 
 ## 📚 工具链使用指南
 
-[工具链使用指南](./README_TOOLUSE.md)
-[量化精度分析指南](./ACCURACY_ANALYSIS_TOOLUSE.md)
+[工具链使用指南](./docs/README_TOOLUSE.md)
+[量化精度分析指南](./docs/ACCURACY_ANALYSIS_TOOLUSE.md)
 
 ### 模型转换工作流
 
@@ -275,7 +275,8 @@ python Yolo11_onnx2qnn.py
 - [ ] **更多模型类型** — 目前仅支持 **计算机视觉（CV）** 类的模型部署，NLP / 语音等领域的模型暂不支持
 - [ ] **动态尺寸** — 仅支持**固定输入、输出尺寸**的模型，动态 shape 的模型需要手动固定后再走转换流程
 - [ ] **QNN 量化工作流单一** — 由于小女子太笨了，目前仅支持 `QAIRT` 原生的普通量化流程，尚未接入 `AIMET（AI Model Efficiency Toolkit）` 的更高级量化方法（如跨层等价变换、编码感知训练等）
-- [ ] **QNN 精度分析缺失** — 由于小女子太笨了，QNN 的精度分析还不会用喵
+- [x] **QNN 精度分析缺失** — 由于小女子太笨了，QNN 的精度分析还不会用喵
+    - 🧪 实验性支持（完成于 2026-06-22）
 
 ## 📄 License
 
