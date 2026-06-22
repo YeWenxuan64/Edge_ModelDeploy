@@ -92,7 +92,7 @@ sudo apt-get update
 # sudo apt-get install open-vm-tools open-vm-tools-desktop
 
 sudo apt-get install cmake git
-sudo apt install python3-pip python3-venv
+sudo apt install python3-pip python3-venv python3-tk
 
 ```
 
@@ -187,6 +187,7 @@ python Yolo11_onnx2qnn.py
 ## 📚 工具链使用指南
 
 [工具链使用指南](./README_TOOLUSE.md)
+[量化精度分析指南](./ACCURACY_ANALYSIS_TOOLUSE.md)
 
 ### 模型转换工作流
 
