@@ -163,7 +163,7 @@ class OnnxToRKNN:
                     f.write(' '.join(paths) + '\n')
 
             self.dataset_path = tmp_dataset_path
-
+            self.temp_files_list.append(self.dataset_path)
 
         with temporary_chdir(self.tmp_dir):
             self.self_convert(mean_rgb, std_rgb)
