@@ -1,7 +1,10 @@
-# Edge Model Deploy
+<div align="center">
+
+# Edge Model Deploy | 边缘模型部署器
+
 ![madewithlove](https://img.shields.io/badge/made_with-%E2%9D%A4-red?style=for-the-badge&labelColor=pink)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey.svg)]()
 [![ONNX](https://img.shields.io/badge/ONNX-1.0+-005CED?logo=onnx&logoColor=white)](https://onnx.ai/)
@@ -10,6 +13,9 @@
 [![RKNN](https://img.shields.io/badge/Rockchip-RKNN-FF6600)](https://github.com/airockchip/rknn-toolkit2)
 [![QNN](https://img.shields.io/badge/Qualcomm-QNN-325CAC)](https://www.qualcomm.com/developer/software/qualcomm-ai-engine-direct-sdk)
 [![Edge AI](https://img.shields.io/badge/Edge-AI-8A2BE2)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+</div>
 
 ## 📖 概述
 
