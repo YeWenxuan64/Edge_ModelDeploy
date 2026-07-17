@@ -48,12 +48,12 @@ Edge_ModelDeploy/
 │   ├── datasets_face.txt            # 人脸数据集索引           # 可自行挑选和编写
 │   └── ...                          # 数据集图片文件夹         # 需自行下载和挑选
 ├── requirements.txt                 # Python 依赖
-├── AVTrack_ModelDeploy/             # git submodule → AVTrack 跟踪模型
-├── RetinaFace-mobile_ModelDeploy/   # git submodule → RetinaFace 人脸检测
-├── NanoTrackV3_ModelDeploy/         # git submodule → NanoTrackV3 跟踪模型
-├── MSI-Net_ModelDeploy/             # git submodule → MSI-Net 图像融合
-├── Yolo11_ModelDeploy/              # git submodule → YOLO11 检测
-└── Yolo26_ModelDeploy/              # git submodule → YOLO26 检测
+├── avtrack_ModelDeploy/             # git submodule → AVTrack 跟踪模型
+├── retinaface_mobile_ModelDeploy/   # git submodule → RetinaFace 人脸检测
+├── nanotrack_v3_ModelDeploy/        # git submodule → NanoTrackV3 跟踪模型
+├── msi_net_ModelDeploy/             # git submodule → MSI-Net 图像融合
+├── yolo11_ModelDeploy/              # git submodule → YOLO11 检测
+└── yolo26_ModelDeploy/              # git submodule → YOLO26 检测
 ```
 
 ## 🧠 示例模型
@@ -62,12 +62,12 @@ Edge_ModelDeploy/
 
 | 子模块 | 模型类型 | 来源 |
 |--------|---------|------------|
-| [AVTrack_ModelDeploy](https://github.com/YeWenxuan64/AVTrack_ModelDeploy/)                     | 视觉目标跟踪 | ICML 2024 — *Learning Adaptive and View-Invariant Vision Transformer for Real-Time UAV Tracking* |
-| [RetinaFace-mobile_ModelDeploy](https://github.com/YeWenxuan64/RetinaFace-mobile_ModelDeploy/) | 人脸检测     | RetinaFace 轻量化版本 |
-| [NanoTrackV3_ModelDeploy](https://github.com/YeWenxuan64/NanoTrackV3_ModelDeploy/)             | 视觉目标跟踪 | NanoTrack 系列 |
-| [MSI-Net_ModelDeploy](https://github.com/YeWenxuan64/MSI-Net_ModelDeploy/)                     | 显著性检测   | MSI-Net<br>Neural Networks — *Contextual encoder-decoder network for visual saliency prediction* |
-| [Yolo11_ModelDeploy](https://github.com/YeWenxuan64/Yolo11_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO11(RKNN custom-made) |
-| [Yolo26_ModelDeploy](https://github.com/YeWenxuan64/Yolo26_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO26 |
+| [avtrack_ModelDeploy](https://github.com/YeWenxuan64/avtrack_ModelDeploy/)                     | 视觉目标跟踪 | ICML 2024 — *Learning Adaptive and View-Invariant Vision Transformer for Real-Time UAV Tracking* |
+| [retinaface_mobile_ModelDeploy](https://github.com/YeWenxuan64/retinaface_mobile_ModelDeploy/) | 人脸检测     | RetinaFace 轻量化版本 |
+| [nanotrack_v3_ModelDeploy](https://github.com/YeWenxuan64/nanotrack_v3_ModelDeploy/)           | 视觉目标跟踪 | NanoTrack 系列 |
+| [msi_net_ModelDeploy](https://github.com/YeWenxuan64/msi_net_ModelDeploy/)                     | 显著性检测   | MSI-Net<br>Neural Networks — *Contextual encoder-decoder network for visual saliency prediction* |
+| [yolo11_ModelDeploy](https://github.com/YeWenxuan64/yolo11_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO11(RKNN custom-made) |
+| [yolo26_ModelDeploy](https://github.com/YeWenxuan64/yolo26_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO26 |
 
 每个子模块独立维护，包含该模型的预训练权重获取方式与完整转换流程
 
@@ -173,20 +173,22 @@ Eedge_ModelDeploy/
 
 ### 3. 使用转换工具
 
-每个子模块的转换流程一致，以 Yolo11_ModelDeploy 为例：
+每个子模块的转换流程一致，以 yolo26_ModelDeploy 为例：
 
 ```bash
+git clone --recurse-submodules https://github.com/YeWenxuan64/yolo26_ModelDeploy.git
+cd yolo26_ModelDeploy
+
 # 1.PyTorch → ONNX（各模型独立实现）
-cd Yolo11_ModelDeploy
-python Yolo11_pytorch2onnx.py
+python Yolo26_pytorch2onnx.py
 
 # 2.1.ONNX → RKNN（复用 utilities）
-python Yolo11_onnx2rknn.py
-# 输出到: Yolo11_ModelDeploy/models_convert/rknn
+python yolo26_onnx2rknn.py
+# 输出到: yolo26_ModelDeploy/models_convert/rknn
 
 # 2.2.ONNX → QNN（复用 utilities）
-python Yolo11_onnx2qnn.py
-# 输出到: Yolo11_ModelDeploy/models_convert/qnn
+python yolo26_onnx2qnn.py
+# 输出到: yolo26_ModelDeploy/models_convert/qnn
 ```
 
 
