@@ -15,6 +15,8 @@
 [![Edge AI](https://img.shields.io/badge/Edge-AI-8A2BE2)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+⚠️Pre-release Warning⚠️
+
 </div>
 
 ## 📖 概述
