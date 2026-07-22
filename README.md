@@ -5,15 +5,15 @@
 ![madewithlove](https://img.shields.io/badge/made_with-%E2%9D%A4-red?style=for-the-badge&labelColor=pink)
 
 
-[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey.svg)]()
-[![ONNX](https://img.shields.io/badge/ONNX-1.0+-005CED?logo=onnx&logoColor=white)](https://onnx.ai/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
-[![TensorFlow](https://img.shields.io/badge/TensorFlow-2.0+-FF6F00?logo=tensorflow&logoColor=white)](https://www.tensorflow.org/)
-[![RKNN](https://img.shields.io/badge/Rockchip-RKNN-FF6600)](https://github.com/airockchip/rknn-toolkit2)
-[![QNN](https://img.shields.io/badge/Qualcomm-QNN-325CAC)](https://www.qualcomm.com/developer/software/qualcomm-ai-engine-direct-sdk)
-[![Edge AI](https://img.shields.io/badge/Edge-AI-8A2BE2)]()
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-blue)]()
+[![Edge AI](https://img.shields.io/badge/Edge-AI-purple)]()
+[![ONNX](https://img.shields.io/badge/ONNX-1.0+-005CED?logo=onnx)](https://onnx.ai/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C?logo=pytorch)](https://pytorch.org/)
+[![TensorFlow](https://img.shields.io/badge/TensorFlow-2.0+-FF6F00?logo=tensorflow)](https://www.tensorflow.org/)
+[![RKNN](https://img.shields.io/badge/Rockchip-RKNN-EC6F16)](https://github.com/airockchip/rknn-toolkit2)
+[![QNN](https://img.shields.io/badge/Qualcomm-QNN%20(HTP)-31017D?logo=qualcomm)](https://www.qualcomm.com/developer/software/qualcomm-ai-engine-direct-sdk)
+[![License](https://img.shields.io/badge/License-MIT-brightgreen)](LICENSE)
 
 ⚠️Pre-release Warning⚠️
 
