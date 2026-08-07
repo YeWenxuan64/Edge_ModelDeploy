@@ -291,10 +291,17 @@ class GenYoloCroppedDataset:
         
         return saved_paths
 
-    def generate(self, swap_image_pair:bool=False) -> str:
+    def generate(self, swap_image_pair:bool=False, save_original_path_pair:bool=False) -> str|tuple[str, str]:
         """
         Args:
             swap_image_pair (bool, optional): 是否交换得到的输入和输出图片对. Defaults to False.
+            - True: cropped_path full_img_path
+            - False: full_img_path cropped_path
+
+            save_original_path_pair (bool, optional): 是否保存原始图片路径对, 在 set_postprocess_by_another_model 后可用. Defaults to False.
+
+        Returns:
+            str: 生成的数据集路径文本文件的路径
         """
 
         full_img_path_list, output_dir = self.prepare_work_dir()
@@ -336,6 +343,7 @@ class GenYoloCroppedDataset:
                         all_cropped_paths.append([image_path, cropped_path])
 
 
+        original_all_cropped_paths = deepcopy(all_cropped_paths)
         new_all_cropped_paths = deepcopy(all_cropped_paths)
         if self.another_model_path_list:
             for i, (another_model_path, process_target) in enumerate(self.another_model_path_list):
@@ -352,9 +360,13 @@ class GenYoloCroppedDataset:
                 output_path_list = self.postprocess_by_another_model(another_model_path, process_path_list)
 
                 for j, pair_path in enumerate(new_all_cropped_paths):
-                    pair_path[i] = output_path_list[j] # 替换为处理后的文件的路径
+                    pair_path[index] = output_path_list[j] # 替换为处理后的文件的路径
+
+        cv2.destroyAllWindows()
+        del session
 
 
+    
         # 保存裁剪图片的路径列表
         output_txt = str(self.tmp_dir / str(self.output_dir_name + '_list.txt'))
         self.file_or_dir_to_clean.append(output_txt)
@@ -363,14 +375,29 @@ class GenYoloCroppedDataset:
             for pair_path in new_all_cropped_paths:
                 if swap_image_pair:
                     pair_path = pair_path[::-1]
-                    
+
                 pair_path_full = f"{pair_path[0]} {pair_path[1]}\n"
                 f.write(pair_path_full)
 
-        cv2.destroyAllWindows()
-        del session
 
-        return output_txt
+        if save_original_path_pair:
+            original_output_txt = str(self.tmp_dir / str(self.output_dir_name + '_original_list.txt'))
+            self.file_or_dir_to_clean.append(original_output_txt)
+
+            with open(original_output_txt, 'w', encoding='utf-8') as f:
+                for pair_path in original_all_cropped_paths:
+                    if swap_image_pair:
+                        pair_path = pair_path[::-1]
+
+                    pair_path_full = f"{pair_path[0]} {pair_path[1]}\n"
+                    f.write(pair_path_full)
+
+            return output_txt, original_output_txt
+
+        else:
+            return output_txt
+
+
 
     def clean(self):
         file_count = 0
