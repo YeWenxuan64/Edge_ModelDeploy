@@ -120,12 +120,14 @@ class GenYoloCroppedDataset:
         self.file_or_dir_to_clean = []
 
         self.another_model_path_list:list[tuple[str, str]]|None = None
+        self.another_model_rgb_mean:list[int] = [0, 0, 0]
+        self.another_model_rgb_std:list[int] = [1, 1, 1]
 
         self.human_list = [0]
         self.animal_list = [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 77]
         self.vehicle_list = [2, 3, 4, 5, 6, 7, 8, 30, 31, 33, 36, 37]
 
-    def set_postprocess_by_another_model(self, another_model_path_and_target_list:list[tuple[str, str]], output_shape:str='chw',outpur_format:str='.npy'):
+    def set_postprocess_by_another_model(self, another_model_path_and_target_list:list[tuple[str, str]], output_shape:str='chw',outpur_format:str='.npy', rgb_mean:list[int]=[0, 0, 0], rgb_std:list[int]=[1, 1, 1]):
         """
         Args:
             another_model_path_and_target_list (list[tuple[str, str]]): [(another_model_path, process_target), ...]
@@ -152,6 +154,8 @@ class GenYoloCroppedDataset:
         
         self.output_shape = output_shape
         self.output_format = outpur_format
+        self.another_model_rgb_mean = rgb_mean
+        self.another_model_rgb_std = rgb_std
 
 
     def postprocess_by_another_model(self, another_model_path:str, image_path_list:list[str]) -> list[str]:
@@ -165,7 +169,7 @@ class GenYoloCroppedDataset:
         output_path_list = []
         for image_path in image_path_list:
             image = cv2.imread(image_path)
-            input_tensor, scale, x_offset, y_offset = preprocess_image(image, (input_w, input_h), std_rgb=[1, 1, 1])
+            input_tensor, scale, x_offset, y_offset = preprocess_image(image, (input_w, input_h), mean_rgb=self.another_model_rgb_mean, std_rgb=self.another_model_rgb_std)
 
             outputs = another_model_ort.run(None, {anorher_ai_input_name: input_tensor})
             output:np.ndarray = outputs[0] # nchw
@@ -347,6 +351,7 @@ class GenYoloCroppedDataset:
         new_all_cropped_paths = deepcopy(all_cropped_paths)
         if self.another_model_path_list:
             for i, (another_model_path, process_target) in enumerate(self.another_model_path_list):
+                print(f"Processing by another model: {another_model_path} ...")
 
                 process_path_list:list[str] = []
                 if process_target == 'input': # 匹配裁切前的图片
