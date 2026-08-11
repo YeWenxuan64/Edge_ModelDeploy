@@ -332,60 +332,36 @@ class OnnxToQNN:
             for index, input_node in enumerate(model.graph.input):
                 input_name = input_node.name
 
-                mean_sub_node_name = f"{input_name}_Normalization_Sub"
-                std_div_node_name = f"{input_name}_Normalization_Div"
+                input_mean = np.array(mean_rgb[index], np.float32)
+                input_std = np.array(std_rgb[index], np.float32)
+                channel_num = len(input_mean)
 
-                input_mean = mean_rgb[index]
-                input_std = std_rgb[index]
-                mean = np.array(input_mean, np.float32).reshape(1, len(input_mean), 1, 1)
-                std = np.array(input_std, np.float32).reshape(1, len(input_std), 1, 1)
+                # 用 1x1 卷积实现归一化: y = (x - mean) / std = x * (1/std) - mean/std
+                # 权重为对角矩阵 diag(1/std)，偏置为 -mean/std
+                conv_weight = (np.diag(1.0 / input_std)).astype(np.float32).reshape(channel_num, channel_num, 1, 1)
+                conv_bias = (-input_mean / input_std).astype(np.float32)
 
-                current_input = input_name
-                # 添加减法节点
-                if need_mean_normalization:
-                    # 将mean转换为ONNX张量
-                    mean_tensor = onnx.numpy_helper.from_array(mean, name=f"{input_name}_mean_tensor")
-                    
-                    # 创建减法节点：(input - mean)
-                    sub_output = input_name + "_sub"
-                    sub_node = onnx.helper.make_node(
-                        'Sub',
-                        inputs=[input_name, mean_tensor.name],
-                        outputs=[sub_output],
-                        name=mean_sub_node_name
-                    )
+                weight_tensor = onnx.numpy_helper.from_array(conv_weight, name=f"{input_name}_norm_weight")
+                bias_tensor = onnx.numpy_helper.from_array(conv_bias, name=f"{input_name}_norm_bias")
 
-                    nodes_to_add.append(sub_node)
-                    initializers_to_add.append(mean_tensor)
+                conv_output = f"{input_name}_normalized"
+                conv_node = onnx.helper.make_node(
+                    'Conv',
+                    inputs=[input_name, weight_tensor.name, bias_tensor.name],
+                    outputs=[conv_output],
+                    name=f"{input_name}_Normalization_Conv"
+                )
 
-                    current_input = sub_output
-
-                # 添加除法节点
-                if need_std_normalization:
-                    # 将std转换为ONNX张量
-                    std_tensor = onnx.numpy_helper.from_array(std, name=f"{input_name}_std_tensor")
-                    
-                    # 创建除法节点：input / std
-                    div_output = f"{input_name}_normalized"
-                    div_node = onnx.helper.make_node(
-                        'Div',
-                        inputs=[current_input, std_tensor.name],
-                        outputs=[div_output],
-                        name=std_div_node_name
-                    )
-
-                    nodes_to_add.append(div_node)
-                    initializers_to_add.append(std_tensor)
-
-                    current_input = div_output
-
+                nodes_to_add.append(conv_node)
+                initializers_to_add.append(weight_tensor)
+                initializers_to_add.append(bias_tensor)
 
                 # 更新所有使用原始输入的节点
+                # (新节点尚未插入 graph，因此这里无需像原来那样跳过自身)
                 for node in model.graph.node:
-                    if node.name != mean_sub_node_name and node.name != std_div_node_name:
-                        for i, node_input in enumerate(node.input):
-                            if node_input == input_name:
-                                node.input[i] = current_input
+                    for i, node_input in enumerate(node.input):
+                        if node_input == input_name:
+                            node.input[i] = conv_output
 
 
             nodes_to_add.reverse()
@@ -659,6 +635,7 @@ class OnnxToQNN:
         quantize_args += f' --use_per_channel_quantization'
         quantize_args += f' --param_quantizer_calibration {self.param_quant_method}'
         quantize_args += f' --act_quantizer_calibration {self.act_quant_method}'
+
 
         extra_args = f'{quantize_args} --target_backend HTP'
         

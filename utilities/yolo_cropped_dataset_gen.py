@@ -101,8 +101,10 @@ def process_predictions(output: np.ndarray) -> list[list[int, int, int, int, int
 
 
     # 根据综合得分排序，取前3个
-    if len(results) > 0:
-        sorted_indices = np.argsort(final_scores)[::-1][:3]
+    results_num = len(results)
+    if results_num:
+        clipped_results_num = min(results_num, 3)
+        sorted_indices = np.argsort(final_scores)[::-1][:clipped_results_num]
         results = [results[i] for i in sorted_indices]
 
     return results
@@ -120,15 +122,13 @@ class GenYoloCroppedDataset:
         self.output_dir_name = output_dir_name
         self.file_or_dir_to_clean = []
 
-        self.another_model_path_list:list[tuple[str, str]]|None = None
-        self.another_model_rgb_mean:list[int] = [0, 0, 0]
-        self.another_model_rgb_std:list[int] = [1, 1, 1]
+        self.another_args_list:list[tuple[str, str, str, str, list[int|float,], list[int|float,]]] = []
 
         self.human_list = [0]
         self.animal_list = [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 77]
         self.vehicle_list = [2, 3, 4, 5, 6, 7, 8, 30, 31, 33, 36, 37]
 
-    def set_postprocess_by_another_model(self, another_model_path_and_target_list:list[tuple[str, str]], output_shape:str='chw',outpur_format:str='.npy', rgb_mean:list[int]=[0, 0, 0], rgb_std:list[int]=[1, 1, 1]):
+    def set_postprocess_by_another_model(self, another_model_path:str, process_target:str, output_shape:str='chw',outpur_format:str='.npy', rgb_mean:list[int]=[0, 0, 0], rgb_std:list[int]=[1, 1, 1]):
         """
         Args:
             another_model_path_and_target_list (list[tuple[str, str]]): [(another_model_path, process_target), ...]
@@ -136,31 +136,25 @@ class GenYoloCroppedDataset:
             output_shape (str): 'chw' or 'hwc' or 'nchw' or 'nhwc'
             outpur_format (str): '.npy' or '.raw'
         """
+        if process_target not in ['output', 'input']:
+            raise ValueError("process_target must be 'output' or 'input'")
+
         if output_shape not in ['chw', 'hwc', 'nchw', 'nhwc']:
             raise ValueError("output_shape must be 'chw' or 'hwc' or 'nchw' or 'nhwc'")
 
         if outpur_format not in ['.npy', '.raw']:
             raise ValueError("outpur_format must be '.npy' or '.raw'")
         
-
-        new_another_model_path_list = []
-        for another_model_path, process_target in another_model_path_and_target_list:
-            if process_target not in ['output', 'input']:
-                raise ValueError("process_target must be 'output' or 'input'")
-
-            new_anothor_model_path = Path(another_model_path).resolve()
-            new_another_model_path_list.append((new_anothor_model_path, process_target))
+        self.another_args_list.append((another_model_path, process_target, output_shape, outpur_format, rgb_mean, rgb_std))
         
-        self.another_model_path_list = new_another_model_path_list
-        
-        self.output_shape = output_shape
-        self.output_format = outpur_format
-        self.another_model_rgb_mean = rgb_mean
-        self.another_model_rgb_std = rgb_std
+    @staticmethod
+    def postprocess_by_another_model(another_model_path:str, image_path_list:list[str], output_shape, output_format, mean_rgb, std_rgb) -> list[str]:
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        #sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.enable_mem_pattern = True
 
-
-    def postprocess_by_another_model(self, another_model_path:str, image_path_list:list[str]) -> list[str]:
-        another_model_ort = ort.InferenceSession(another_model_path)
+        another_model_ort = ort.InferenceSession(another_model_path, sess_options=sess_options)
         input_details = another_model_ort.get_inputs()[0]
 
         another_model_input_shape:list[int] = input_details.shape
@@ -170,26 +164,28 @@ class GenYoloCroppedDataset:
         output_path_list = []
         for image_path in image_path_list:
             image = cv2.imread(image_path)
-            input_tensor, scale, x_offset, y_offset = preprocess_image(image, (input_w, input_h), mean_rgb=self.another_model_rgb_mean, std_rgb=self.another_model_rgb_std)
+            cv2.imshow('image', image)
+            cv2.waitKey(1)
+            input_tensor, scale, x_offset, y_offset = preprocess_image(image, (input_w, input_h), mean_rgb=mean_rgb, std_rgb=std_rgb)
 
             outputs = another_model_ort.run(None, {anorher_ai_input_name: input_tensor})
             output:np.ndarray = outputs[0] # nchw
 
-            if self.output_shape == 'chw':
+            if output_shape == 'chw':
                 output = output.squeeze()
-            elif self.output_shape == 'hwc':
+            elif output_shape == 'hwc':
                 output = output.squeeze().transpose(1, 2, 0)
-            elif self.output_shape == 'nchw':
+            elif output_shape == 'nchw':
                 pass
-            elif self.output_shape == 'nhwc':
+            elif output_shape == 'nhwc':
                 output = output.transpose(0, 2, 3, 1)
 
-            output_path = str(Path(image_path).with_suffix(self.output_format))
+            output_path = str(Path(image_path).with_suffix(output_format))
 
-            if self.output_format == '.npy':
+            if output_format == '.npy':
                 np.save(output_path, output)
 
-            elif self.output_format == '.raw':
+            elif output_format == '.raw':
                 output.tofile(output_path)
 
             output_path_list.append(output_path)
@@ -346,12 +342,12 @@ class GenYoloCroppedDataset:
                 if cropped_paths:
                     for cropped_path in cropped_paths:
                         all_cropped_paths.append([image_path, cropped_path])
-
+        cv2.destroyAllWindows()
 
         original_all_cropped_paths = deepcopy(all_cropped_paths)
         new_all_cropped_paths = deepcopy(all_cropped_paths)
-        if self.another_model_path_list:
-            for i, (another_model_path, process_target) in enumerate(self.another_model_path_list):
+        if self.another_args_list:
+            for i, (another_model_path, process_target, output_shape, output_format, mean_rgb, std_rgb) in enumerate(self.another_args_list):
                 print(f"Processing by another model: {another_model_path} ...")
 
                 process_path_list:list[str] = []
@@ -363,7 +359,7 @@ class GenYoloCroppedDataset:
                 for pair_path in all_cropped_paths:
                     process_path_list.append(pair_path[index])
 
-                output_path_list = self.postprocess_by_another_model(another_model_path, process_path_list)
+                output_path_list = self.postprocess_by_another_model(another_model_path, process_path_list, output_shape, output_format, mean_rgb, std_rgb)
 
                 for j, pair_path in enumerate(new_all_cropped_paths):
                     pair_path[index] = output_path_list[j] # 替换为处理后的文件的路径
@@ -404,7 +400,6 @@ class GenYoloCroppedDataset:
             return output_txt
 
 
-
     def clean(self):
         file_count = 0
         dir_count = 0
@@ -428,6 +423,8 @@ class GenYoloCroppedDataset:
                 print(f"failed to delete {file_or_dir} due to {e}")
 
         print(f"cleaned {file_count} files and {dir_count} dirs")
+
+
 
 def main():
     current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
