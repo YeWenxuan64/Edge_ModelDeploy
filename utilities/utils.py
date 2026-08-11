@@ -7,6 +7,90 @@ from collections import defaultdict, deque
 import onnx  # 仅用于类型注解
 
 
+import os
+import re
+import random
+import heapq
+from pathlib import Path
+from collections import defaultdict, deque
+import numpy as np
+import cv2
+import onnx  # 仅用于类型注解
+
+
+def letterbox_image(img:np.ndarray, target_shape:tuple[int, int], output_format:str='hwc', output_dtype:str='float32', border_value:tuple[int, int, int]|None=None) -> np.ndarray:
+    """
+    等比缩放并居中填充 (letterbox)，BGR -> RGB，并按指定布局/数据类型输出。
+
+    Args:
+        img (np.ndarray): OpenCV 读取的 BGR 图像。
+        target_shape (tuple[int, int]): 目标尺寸，格式为 (宽, 高)。
+        output_format (str): 输出布局。
+            - 'hwc': [H, W, C]
+            - 'chw': [C, H, W]
+            - 'nhwc': [1, H, W, C]
+            - 'nchw': [1, C, H, W]
+            - Default: 'hwc'.
+        output_dtype (str): 输出数据类型。
+            - 'float32': Float32, 数值范围为原始像素 (0-255)。
+            - 'uint8': Uint8, 数值范围为原始像素 (0-255)。
+            - Default: 'float32'.
+        border_value (tuple[int, int, int] | None): 填充像素值 (B,G,R)。
+            - None (默认): 使用 cv2.BORDER_REFLECT 镜像填充。
+            - 指定如 (114, 114, 114): 使用 cv2.BORDER_CONSTANT 纯色填充 (YOLO 惯例灰色)。
+
+    Returns:
+        np.ndarray: 处理后的 RGB 图像。
+    """
+    if output_format not in ['nchw', 'nhwc', 'chw', 'hwc']:
+        raise ValueError("output_format must be one of 'nchw', 'nhwc', 'chw', 'hwc'")
+
+    if output_dtype not in ['float32', 'uint8']:
+        raise ValueError("output_dtype must be 'float32' or 'uint8'")
+
+    width, height = target_shape  # 元组解包: (宽, 高)
+
+    orig_h, orig_w = img.shape[:2]
+
+    # 计算缩放比例
+    scale = min(width / orig_w, height / orig_h)
+    new_w = max(1, int(orig_w * scale))
+    new_h = max(1, int(orig_h * scale))
+
+    # 等比缩放
+    img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+
+    # 创建目标尺寸的画布并居中放置图片
+    x_offset = (width - new_w) // 2
+    y_offset = (height - new_h) // 2
+    x1_pad = x_offset
+    x2_pad = max(0, width - (x_offset + new_w))
+    y1_pad = y_offset
+    y2_pad = max(0, height - (y_offset + new_h))
+
+    if border_value is None:
+        padded_image = cv2.copyMakeBorder(img_resized, y1_pad, y2_pad, x1_pad, x2_pad, cv2.BORDER_REFLECT)
+    else:
+        padded_image = cv2.copyMakeBorder(img_resized, y1_pad, y2_pad, x1_pad, x2_pad, cv2.BORDER_CONSTANT, value=border_value)
+
+    # BGR转RGB
+    rgb_image = cv2.cvtColor(padded_image, cv2.COLOR_BGR2RGB)
+
+    # 按指定布局排列
+    if output_format == 'chw':
+        rgb_image = np.transpose(rgb_image, (2, 0, 1))              # [C, H, W]
+    elif output_format == 'nhwc':
+        rgb_image = rgb_image[None, ...]                            # [1, H, W, C]
+    elif output_format == 'nchw':
+        rgb_image = np.transpose(rgb_image, (2, 0, 1))[None, ...]   # [1, C, H, W]
+    # 'hwc': 保持 [H, W, C]
+
+    # 按指定数据类型输出
+    if output_dtype == 'float32':
+        return rgb_image.astype(np.float32)
+    return rgb_image.astype(np.uint8)
+
+
 # 一个上下文管理器以安全地更改目录
 class temporary_chdir:
     def __init__(self, new_path:str):
@@ -379,3 +463,144 @@ def sanitize_name(name:str, replace_chars:str=r'()[]{}-\/:*?"<>|,') -> str:
     name = name.translate(trans_table)
     name = re.sub(r'_+', '_', name).strip('_')
     return name
+
+
+
+def generate_calibration_data(dataset_path:str, tmp_dir:str, onnx_model_info:dict, set_input_order:str='nhwc', process_singal_column:int=-1) -> str|None:
+    """
+    生成校准数据
+    
+    Args:
+        onnx_model_info (dict): 模型信息，包含输入尺寸
+    
+    Returns:
+        list[str] | None: 校准数据文件路径列表，每个输入对应一个文件
+    """
+    from itertools import zip_longest
+    import concurrent.futures
+    from concurrent.futures import ThreadPoolExecutor, Future
+
+    dataset_path:Path = Path(dataset_path)
+    tmp_dir:Path = Path(tmp_dir)
+    file_or_dir_to_clean = []
+
+
+    # 读取数据集文件
+    dataset_dir = str(dataset_path.parent)
+    dataset_path_list = []
+    with open(str(dataset_path), 'r') as f:
+        lines = f.readlines() # 逐行读取文件
+
+        for line in lines: # 如果行不为空，则分割路径
+            line = line.strip() # 去除首尾空白字符
+            if line:
+                one_line_paths_list = [path for path in line.split(' ') if path] # 按空格分割路径，并过滤掉空字符串
+                full_path_list = []
+                for img_path in one_line_paths_list:
+                    p = Path(img_path) # 将字符串转换为 Path 对象
+                    if p.is_absolute():
+                        full_path = p # 如果已经是绝对路径，直接使用
+                    else:
+                        full_path = dataset_dir / p # 如果是相对路径，则与 dataset_dir 拼接
+                    full_path_list.append(str(full_path))
+                
+                dataset_path_list.append(full_path_list)
+
+
+    # 为每个输入创建目录和文件列表
+    calibration_files = []
+    for idx, input_info in enumerate(onnx_model_info["inputs"]):
+        # 创建输出目录
+        output_dir = tmp_dir / f"calibration_data_for_input{idx + 1}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        file_or_dir_to_clean.append(output_dir)
+
+        # 获取当前输入的尺寸
+        input_shape = input_info["shape"]
+        if len(input_shape) != 4 or input_shape[0] != 1:
+            print(f"Error: Unsupported input shape for input {idx + 1}")
+            continue
+
+        height, width = input_shape[2], input_shape[3]
+
+        def to_file_thread(img: np.ndarray, output_path: str):
+            img.tofile(output_path)
+
+        max_workers = min(16, len(dataset_path_list))
+        Threadpool_to_file = ThreadPoolExecutor(max_workers=max_workers)
+        futures: list[Future] = []
+
+        calibration_data_list = []
+
+        # 处理每张图片
+        for j, one_line_paths_list in enumerate(dataset_path_list):
+            full_img_path = one_line_paths_list[idx]
+
+            # 使用OpenCV读取图片
+            img = cv2.imread(full_img_path)
+            if img is None:
+                print(f"Warning: Could not read image {full_img_path}")
+                continue
+
+            # 等比缩放 + 居中填充 + BGR转RGB + 布局/类型转换 (复用 utils.letterbox_image)
+            img_float = letterbox_image(
+                img,
+                (width, height),
+                output_format=('nchw' if set_input_order == 'nchw' else 'nhwc'),
+                output_dtype='float32',
+            )
+
+            # 调试窗口: 显示处理后的图像 (RGB -> BGR 保持颜色正确)
+            if set_input_order == 'nhwc':
+                display_img = img_float[0]
+            else:
+                display_img = np.transpose(img_float[0], (1, 2, 0))
+            cv2.imshow("padded_image", cv2.cvtColor(display_img, cv2.COLOR_RGB2BGR))
+            cv2.waitKey(1)
+
+            # 生成输出文件名
+            base_name = os.path.splitext(os.path.basename(full_img_path))[0]
+            output_path = os.path.join(output_dir, f"{base_name}.raw")
+
+            calibration_data_list.append(output_path)
+
+            # 提交文件保存任务到线程池
+            future = Threadpool_to_file.submit(to_file_thread, img_float, output_path)
+            futures.append(future)
+
+            if len(futures) >= max_workers:
+                print(f"Processed a batch of {max_workers} images")
+                concurrent.futures.wait(futures, timeout=2)
+
+                for i in range(len(futures)):
+                    future = futures.pop(0)
+                    if future.done() is False:
+                        futures.append(future)
+
+        cv2.destroyAllWindows()
+        # 等待所有文件保存任务完成
+        concurrent.futures.wait(futures)
+        Threadpool_to_file.shutdown(wait=True)
+
+        file_list = [os.path.abspath(file_path) for file_path in calibration_data_list]
+
+        calibration_files.append(file_list)
+
+
+    # 创建当前输入的校准数据索引文件
+    calibration_data_index = tmp_dir / f"calibration_data.txt"
+    file_or_dir_to_clean.append(calibration_data_index)
+    for file_list in calibration_files:
+        file_or_dir_to_clean.extend(file_list)
+
+    with open(str(calibration_data_index), 'w') as f:
+        # 使用zip_longest处理不等长列表，空值用空字符串填充
+        for row in zip_longest(*calibration_files, fillvalue=''):
+            # 过滤掉空字符串，但保留位置（这样列对齐）
+            formatted_row = ' '.join(item if item else '' for item in row)
+            f.write(formatted_row + '\n')
+        print(f'{calibration_data_index} created listing {len(calibration_files)} columns.')
+
+    print("Calibration data generation completed successfully!")
+    return calibration_data_index
+

@@ -73,32 +73,37 @@ class SnpeAccuracyDebugger:
             std_value = std_rgb[i % len(std_rgb)]
             image_path = self.debugger_picture_list[i % len(self.debugger_picture_list)]
 
-            image = cv2.imread(str(image_path))
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
             input_name:str = input_info["name"]
             input_shape:list[int] = input_info["shape"] # nchw
             channels, height, width = input_shape[1], input_shape[2], input_shape[3]
 
 
-            # 将图片缩放到目标空间尺寸
-            image_resized = cv2.resize(image_rgb, (width, height))  # [H, W, 3]
-            image_float = image_resized.astype(np.float32)
+            if image_path.suffix == '.npy':
+                image_float = np.load(str(image_path))
+            elif image_path.suffix == '.raw':
+                image_float = np.fromfile(str(image_path), dtype=np.float32)
+            else:
+                image = cv2.imread(str(image_path))
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-            mean_arr = np.array(mean_value, dtype=np.float32)
-            std_arr = np.array(std_value, dtype=np.float32)
-            image_float = (image_float - mean_arr) / std_arr
+                # 将图片缩放到目标空间尺寸
+                image_resized = cv2.resize(image_rgb, (width, height))  # [H, W, 3]
+                image_float = image_resized.astype(np.float32)
 
-            # 处理通道数不匹配的情况（如 [1,96,16,16] NCHW）
-            if channels != 3:
-                image_float = cv2.cvtColor(image_float, cv2.COLOR_RGB2GRAY)
-                image_float = np.tile(image_float, (1, 1, channels))[:, :, :channels] # 裁剪到精确通道数
+                mean_arr = np.array(mean_value, dtype=np.float32)
+                std_arr = np.array(std_value, dtype=np.float32)
+                image_float = (image_float - mean_arr) / std_arr
 
-            image_float = np.expand_dims(image_float, axis=0)  # [1, H, W, C]
+                # 处理通道数不匹配的情况（如 [1,96,16,16] NCHW）
+                if channels != 3:
+                    image_float = cv2.cvtColor(image_float, cv2.COLOR_RGB2GRAY)
+                    image_float = np.tile(image_float, (1, 1, channels))[:, :, :channels] # 裁剪到精确通道数
 
-            if set_input_order == 'nchw':
-                # [1, H, W, C] -> [1, C, H, W]
-                image_float = np.transpose(image_float, (0, 3, 1, 2))
+                image_float = np.expand_dims(image_float, axis=0)  # [1, H, W, C]
+
+                if set_input_order == 'nchw':
+                    # [1, H, W, C] -> [1, C, H, W]
+                    image_float = np.transpose(image_float, (0, 3, 1, 2))
 
 
             input_tensor_path = str(analysis_input_dir / f'{input_name}.raw')

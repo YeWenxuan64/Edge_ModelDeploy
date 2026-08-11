@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import shutil
 from copy import deepcopy
@@ -7,25 +8,25 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
+current_dir = os.path.dirname(os.path.abspath(__file__))  # 获取当前文件所在目录的绝对路径
+sys.path.append(current_dir)
+
+from utils import letterbox_image
+
 
 def resize_image(image:np.ndarray, input_size:tuple[int, int]) -> tuple[np.ndarray, float, int, int]:
-    # 调整图像大小并保持宽高比
+    # 调整图像大小并保持宽高比 (复用 utils.letterbox_image, BORDER_CONSTANT 灰色填充)
     h, w = image.shape[:2]
     r = min(input_size[1] / h, input_size[0] / w)
     new_h, new_w = int(h * r), int(w * r)
-    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-    
-    # 计算填充大小
+
+    # 计算填充大小 (letterbox_image 内部已做居中填充, 这里仅需坐标映射参数)
     pad_h = input_size[1] - new_h
     pad_w = input_size[0] - new_w
     top = pad_h // 2
-    bottom = pad_h - top
     left = pad_w // 2
-    right = pad_w - left
-    
-    # 使用copyMakeBorder填充图像
-    padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))  # 灰色填充
+
+    padded = letterbox_image(image, (input_size[0], input_size[1]), output_format='hwc', output_dtype='uint8', border_value=(114, 114, 114))
     return padded, r, left, top
 
 def preprocess_image(image:np.ndarray, input_size:tuple[int, int], mean_rgb:list[int]=[0, 0, 0], std_rgb:list[int]=[1, 1, 1]) -> tuple[np.ndarray, float, int, int]:

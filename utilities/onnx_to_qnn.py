@@ -18,7 +18,7 @@ import onnx
 current_dir = Path(__file__).parent.resolve()
 sys.path.append(str(current_dir))
 
-from utils import temporary_chdir, reorder_onnx_nodes_by_input, reorder_onnx_nodes_by_output, sanitize_name
+from utils import temporary_chdir, reorder_onnx_nodes_by_input, reorder_onnx_nodes_by_output, sanitize_name, letterbox_image
 from qnn_accuracy_debugger import SnpeAccuracyDebugger
 
 
@@ -313,12 +313,15 @@ class OnnxToQNN:
         need_std_normalization = False
         
         # 检查均值是否不为0
-        if not np.allclose(np.array(mean_rgb, np.float32), 0.0):
-            need_mean_normalization = True
+        for mean in mean_rgb:
+            if not np.allclose(np.array(mean, np.float32).flatten(), 0.0):
+                need_mean_normalization = True
+                break
         
         # 检查标准差是否不为1
-        if not np.allclose(np.array(std_rgb, np.float32), 1.0):
-            need_std_normalization = True
+        for std in std_rgb:
+            if not np.allclose(np.array(std, np.float32).flatten(), 1.0):
+                need_std_normalization = True
         
 
         if need_mean_normalization or need_std_normalization:
@@ -572,39 +575,21 @@ class OnnxToQNN:
                         print(f"Warning: Could not read image {full_img_path}")
                         continue
 
-                    # 获取原始尺寸
-                    orig_h, orig_w = img.shape[:2]
+                    # 等比缩放 + 居中填充 + BGR转RGB + 布局/类型转换 (复用 utils.letterbox_image)
+                    img_float = letterbox_image(
+                        img,
+                        (width, height),
+                        output_format=('nchw' if set_input_order == 'nchw' else 'nhwc'),
+                        output_dtype='float32',
+                    )
 
-                    # 计算缩放比例
-                    scale = min(width/orig_w, height/orig_h)
-                    new_w, new_h = int(orig_w * scale), int(orig_h * scale)
-
-                    # 等比缩放
-                    img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-
-                    # 创建目标尺寸的画布并居中放置图片
-                    y_offset = (height - new_h) // 2
-                    x_offset = (width - new_w) // 2
-                    x1_pad = x_offset
-                    x2_pad = width - (x_offset + new_w)
-                    y1_pad = y_offset
-                    y2_pad = height - (y_offset + new_h)
-
-                    padded_image = cv2.copyMakeBorder(img_resized, y1_pad, y2_pad, x1_pad, x2_pad, cv2.BORDER_REFLECT)
-
-                    cv2.imshow("padded_image", padded_image)
+                    # 调试窗口: 显示处理后的图像 (RGB -> BGR 保持颜色正确)
+                    if set_input_order == 'nhwc':
+                        display_img = img_float[0]
+                    else:
+                        display_img = np.transpose(img_float[0], (1, 2, 0))
+                    cv2.imshow("padded_image", cv2.cvtColor(display_img, cv2.COLOR_RGB2BGR))
                     cv2.waitKey(1)
-
-                    # BGR转RGB
-                    padded_image = cv2.cvtColor(padded_image, cv2.COLOR_BGR2RGB)
-                    padded_image = np.expand_dims(padded_image, axis=0)
-
-                    if set_input_order == 'nchw':
-                        # 转换为CHW格式
-                        padded_image = np.transpose(padded_image, (0, 3, 1, 2)).copy(order='C')
-
-                    # 转换为float32
-                    img_float = padded_image.astype(np.float32)
 
                     # 生成输出文件名
                     base_name = os.path.splitext(os.path.basename(full_img_path))[0]
