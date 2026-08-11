@@ -185,6 +185,11 @@ def collect_image_paths(dir_paths:list[str], max_count:int, random_sample:bool=F
 
     return str(output_txt.resolve())
 
+def read_txt_first_line(txt_path: str) -> list[str]:
+    with open(txt_path, 'r', encoding='utf-8') as f:
+        first_line = f.readline()
+
+    return first_line.split()
 
 def fmt_model_name_with_shape(model:onnx.ModelProto|str, model_name:str, use_nhwc:bool=False) -> str:
     """

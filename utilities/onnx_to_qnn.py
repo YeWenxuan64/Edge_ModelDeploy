@@ -76,6 +76,8 @@ class OnnxToQNN:
 
         self.file_or_dir_to_clean = []
 
+        self.hybrid_quantization = None
+
         self.set_quantization_method()
         self.use_custom_alibration_data()
         self.set_do_accuracy_analysis()
@@ -122,6 +124,61 @@ class OnnxToQNN:
         self.act_bitwidth = int(bw_match.group(2))  
         self.bias_bitwidth = bias_bitwidth
         print(f"Quantization method has been set to param_quant_method={self.param_quant_method}, act_quant_method={self.act_quant_method}, bitwidth={self.weights_bitwidth}w{self.act_bitwidth}a")
+
+    def do_hybrid_quantization(self, custom_hybrid:list[list[str]],
+                               weights_bitwidth:int=8, act_bitwidth:int=16,
+                               bias_bitwidth:int=8, float_bitwidth:int|None=None):
+        """
+        设置混合量化(与 onnx_to_rknn.py 的 do_hybrid_quantization 一致)：
+        通过子图的输入张量与输出张量指定区域，自动识别两者之间的所有节点，
+        对这些节点使用指定精度，子图之外的节点仍按 set_quantization_method
+        的全局设置(默认 w8a8)量化为 INT8。
+
+        两种模式(二选一)：
+        1. 整数混合量化(默认)：weights_bitwidth / act_bitwidth / bias_bitwidth
+           指定区域内权重 / 激活 / 偏置的整数位宽。
+           例如全局 w8a8、区域 w8a16：weights_bitwidth=8, act_bitwidth=16。
+        2. 浮点保留：float_bitwidth 指定区域保持浮点精度，16=FP16，32=FP32。
+
+        Args:
+            custom_hybrid (list[list[str]]): 每个内层列表为 [输入张量名, 输出张量名]，
+                表示一个混合量化子图：输入张量与输出张量之间的所有节点被选中。
+                可传入多个子图，例如 [[in1, out1], [in2, out2]]。
+                张量名也可以是节点名(自动取该节点的输出张量作为边界)。
+            weights_bitwidth (int): 整数模式下区域内的权重位宽，可选 4/8/16。默认 8。
+            act_bitwidth (int): 整数模式下区域内的激活位宽，可选 8/16。默认 16。
+            bias_bitwidth (int): 整数模式下区域内的偏置位宽，可选 8/32。默认 8。
+            float_bitwidth (int | None): 若设置(16/32)，区域保持浮点(FP16/FP32)，
+                此时忽略三个整数位宽参数。默认 None 表示使用整数混合量化。
+        """
+        if float_bitwidth is not None:
+            if float_bitwidth not in (16, 32):
+                raise ValueError('float_bitwidth must be 16 or 32')
+            dtype = 'float'
+            weights_bitwidth = float_bitwidth
+            act_bitwidth = float_bitwidth
+            bias_bitwidth = float_bitwidth
+        else:
+            dtype = 'int'
+            if weights_bitwidth not in (4, 8, 16):
+                raise ValueError('weights_bitwidth must be 4, 8 or 16')
+            if act_bitwidth not in (8, 16):
+                raise ValueError('act_bitwidth must be 8 or 16')
+            if bias_bitwidth not in (8, 32):
+                raise ValueError('bias_bitwidth must be 8 or 32')
+
+        if not isinstance(custom_hybrid, list) or not custom_hybrid:
+            raise ValueError('custom_hybrid must be a non-empty list of [input_tensor, output_tensor] pairs')
+
+        self.hybrid_quantization = {
+            "custom_hybrid": custom_hybrid,
+            "dtype": dtype,
+            "weights_bitwidth": weights_bitwidth,
+            "act_bitwidth": act_bitwidth,
+            "bias_bitwidth": bias_bitwidth,
+        }
+        print(f"Hybrid quantization is set: {len(custom_hybrid)} subgraph(s) dtype={dtype} "
+              f"w{weights_bitwidth}a{act_bitwidth}b{bias_bitwidth}, rest quantized by global settings")
 
     def use_custom_alibration_data(self, custom_alibration_data_path:str|None=None):
         """
@@ -187,7 +244,13 @@ class OnnxToQNN:
         if onnx_model_info is None:
             exit(1)
 
-        dlc_model_path = self.convert_onnx_model(onnx_model_info, set_input_order)
+        quantization_overrides_path = None
+        if self.hybrid_quantization is not None:
+            quantization_overrides_path = self.generate_hybrid_quantization_overrides()
+            if quantization_overrides_path is None:
+                exit(1)
+
+        dlc_model_path = self.convert_onnx_model(onnx_model_info, set_input_order, quantization_overrides_path)
         if dlc_model_path is None:
             exit(1)
 
@@ -385,6 +448,140 @@ class OnnxToQNN:
         self.file_or_dir_to_clean.append(self.tmp_onnx_path)
         print(f"Copied ONNX file to {self.tmp_onnx_path}")
 
+    def generate_hybrid_quantization_overrides(self) -> str|None:
+        """
+        根据子图的输入/输出张量生成 QAIRT 混合量化的 quantization_overrides JSON。
+        每个 [输入张量, 输出张量] 对之间的所有节点按 do_hybrid_quantization 指定的
+        精度标记，转换器会在子图边界自动插入 Convert 节点。
+
+        Returns:
+            str | None: overrides JSON 文件路径；失败返回 None。
+        """
+        try:
+            model = onnx.load_model(str(self.tmp_onnx_path))
+        except Exception as e:
+            print(f"Error loading ONNX model for hybrid quantization: {e}")
+            return None
+
+        nodes = list(model.graph.node)
+
+        # 张量 -> 产生它的节点下标
+        producer: dict[str, int] = {}
+        for idx, n in enumerate(nodes):
+            for out in n.output:
+                producer[out] = idx
+
+        # 张量 -> 消费它的节点下标列表
+        consumers: dict[str, list[int]] = {}
+        for idx, n in enumerate(nodes):
+            for inp in n.input:
+                consumers.setdefault(inp, []).append(idx)
+
+        graph_input_names = {i.name for i in model.graph.input}
+
+        def resolve_tensor(name: str) -> str:
+            """张量名 -> 张量名；若为节点名则取其第一个输出张量作为边界"""
+            if name in producer or name in graph_input_names:
+                return name
+            for n in nodes:
+                if n.name == name:
+                    if not n.output:
+                        raise ValueError(f"Node '{name}' has no output tensor")
+                    return n.output[0]
+            raise ValueError(f"Tensor or node '{name}' not found in the model")
+
+        def downstream_of(tensor: str) -> set[int]:
+            """消费该张量(直接或间接)的节点集合"""
+            result: set[int] = set()
+            stack = list(consumers.get(tensor, []))
+            while stack:
+                idx = stack.pop()
+                if idx in result:
+                    continue
+                result.add(idx)
+                for out in nodes[idx].output:
+                    stack.extend(consumers.get(out, []))
+            return result
+
+        def upstream_of(tensor: str) -> set[int]:
+            """产生该张量(直接或间接)的节点集合"""
+            result: set[int] = set()
+            start = producer.get(tensor)
+            if start is None:
+                return result
+            stack = [start]
+            while stack:
+                idx = stack.pop()
+                if idx in result:
+                    continue
+                result.add(idx)
+                for inp in nodes[idx].input:
+                    p = producer.get(inp)
+                    if p is not None:
+                        stack.append(p)
+            return result
+
+        middle: set[int] = set()
+        try:
+            for pair in self.hybrid_quantization["custom_hybrid"]:
+                if len(pair) != 2:
+                    raise ValueError(f"Each custom_hybrid pair must be [input_tensor, output_tensor], got {pair}")
+                in_tensor = resolve_tensor(pair[0])
+                out_tensor = resolve_tensor(pair[1])
+                sub_middle = downstream_of(in_tensor) & upstream_of(out_tensor)
+                if not sub_middle:
+                    print(f"Warning: no nodes found between '{in_tensor}' and '{out_tensor}', skipped")
+                middle |= sub_middle
+        except ValueError as e:
+            print(f"Error: {e}")
+            return None
+
+        if not middle:
+            print("Error: no nodes selected for hybrid quantization")
+            return None
+
+        mp = self.hybrid_quantization
+        dtype = mp["dtype"]
+        act_bw = mp["act_bitwidth"]
+        weight_bw = mp["weights_bitwidth"]
+        bias_bw = mp["bias_bitwidth"]
+
+        initializer_names = {init.name for init in model.graph.initializer}
+        activation_encodings: dict[str, list[dict]] = {}
+        param_encodings: dict[str, list[dict]] = {}
+
+        # 识别 bias: 作为 Conv/ConvTranspose/Gemm 第3个输入(index 2)的 initializer
+        bias_names = set()
+        for n in nodes:
+            if n.op_type in ('Conv', 'ConvTranspose', 'Gemm') and len(n.input) > 2:
+                bias_names.add(n.input[2])
+
+        for idx in middle:
+            n = nodes[idx]
+            for out in n.output:
+                if out and out not in activation_encodings:
+                    activation_encodings[out] = [{"bitwidth": act_bw, "dtype": dtype}]
+            for inp in n.input:
+                if inp in initializer_names and inp not in param_encodings:
+                    param_bw = bias_bw if inp in bias_names else weight_bw
+                    param_encodings[inp] = [{"bitwidth": param_bw, "dtype": dtype}]
+
+        overrides = {
+            "activation_encodings": activation_encodings,
+            "param_encodings": param_encodings,
+            "version": "0.5.0",
+        }
+
+        overrides_path = self.tmp_dir / "quantization_overrides.json"
+        with open(str(overrides_path), 'w') as f:
+            json.dump(overrides, f, indent=4)
+
+        self.file_or_dir_to_clean.append(overrides_path)
+
+        print(f"Hybrid quantization overrides generated: {len(middle)} nodes, "
+              f"{len(activation_encodings)} activation tensors, {len(param_encodings)} param tensors -> {overrides_path}")
+        return str(overrides_path)
+
     @staticmethod
     def get_onnx_model_info(tmp_onnx_path:str) -> dict|None:
         """
@@ -441,7 +638,7 @@ class OnnxToQNN:
 
         return model_info
 
-    def convert_onnx_model(self, onnx_model_info:dict, set_input_order:str) -> str|None:
+    def convert_onnx_model(self, onnx_model_info:dict, set_input_order:str, quantization_overrides_path:str|None=None) -> str|None:
 
         layout_params = [] # 构建输入布局参数
         for input_info in onnx_model_info.get("inputs"): 
@@ -459,6 +656,11 @@ class OnnxToQNN:
 
         if not self.dataset_path and not self.custom_alibration_data_path:
             extra_args += " --float_bitwidth 16"
+
+        if quantization_overrides_path:
+            extra_args += f" --quantization_overrides {quantization_overrides_path}"
+            if self.hybrid_quantization is not None and self.hybrid_quantization["dtype"] == "float":
+                extra_args += f" --float_bitwidth {self.hybrid_quantization['weights_bitwidth']}"
 
 
         command = f"qairt-converter --input_network {str(self.tmp_onnx_path)} {layout_args} {extra_args}"
@@ -560,10 +762,11 @@ class OnnxToQNN:
                     )
 
                     # 调试窗口: 显示处理后的图像 (RGB -> BGR 保持颜色正确)
+                    display_img = img_float.squeeze().astype(np.uint8)
                     if set_input_order == 'nhwc':
-                        display_img = img_float[0]
+                        display_img = display_img
                     else:
-                        display_img = np.transpose(img_float[0], (1, 2, 0))
+                        display_img = np.transpose(display_img, (1, 2, 0))
                     cv2.imshow("padded_image", cv2.cvtColor(display_img, cv2.COLOR_RGB2BGR))
                     cv2.waitKey(1)
 
@@ -724,6 +927,18 @@ if __name__ == "__main__":
     std_rgb = [[255, 255, 255]]
 
     onnx_to_qnn = OnnxToQNN(onnx_path, qnn_model_path, dataset_path)
+    onnx_to_qnn.set_quantization_method(param_quant_method='percentile', act_quant_method='entropy', bitwidth='w8a8', bias_bitwidth=8)
+
+    # 可选: 混合量化 —— 与 onnx_to_rknn.py 的 do_hybrid_quantization 一致,
+    # 通过子图输入/输出张量指定区域(自动识别两者之间的节点), 可指定多个子图,
+    # 子图之外仍按全局 w8a8 量化。张量名可以是节点名(自动取该节点输出张量)。
+    # 1) 整数混合量化: 区域 w8a16 (权重8bit, 激活16bit), 全局默认 w8a8
+    # onnx_to_qnn.do_hybrid_quantization([['/model.0/conv/Conv', '/model.10/conv/Conv']], weights_bitwidth=8, act_bitwidth=16)
+    # 2) 浮点保留: 区域保持 FP16
+    # onnx_to_qnn.do_hybrid_quantization([['/model.0/conv/Conv', '/model.10/conv/Conv']], float_bitwidth=16)
+    # 3) 多个子图
+    # onnx_to_qnn.do_hybrid_quantization([['in1', 'out1'], ['in2', 'out2']], float_bitwidth=16)
+
     onnx_to_qnn.convert(mean_rgb, std_rgb)
 
     onnx_to_qnn.clean()
