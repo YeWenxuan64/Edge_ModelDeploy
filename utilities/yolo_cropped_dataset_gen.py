@@ -151,7 +151,7 @@ class GenYoloCroppedDataset:
     def postprocess_by_another_model(another_model_path:str, image_path_list:list[str], output_shape, output_format, mean_rgb, std_rgb) -> list[str]:
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        #sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         sess_options.enable_mem_pattern = True
 
         another_model_ort = ort.InferenceSession(another_model_path, sess_options=sess_options)
