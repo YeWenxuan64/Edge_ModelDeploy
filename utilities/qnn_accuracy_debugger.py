@@ -271,7 +271,7 @@ class SnpeAccuracyDebugger:
         ax_cos.grid(True, which="both", ls="--", alpha=0.5)
 
         # 消除 x 轴两端默认的 5% 空白边距（留半个柱宽避免首尾柱被裁切）
-        ax_cos.set_xlim(-0.5, len(layer_euc) - 0.5)
+        ax_cos.set_xlim(-0.5, n_elemments - 0.5)
 
         # 调整布局、保存并显示
         plt.tight_layout()

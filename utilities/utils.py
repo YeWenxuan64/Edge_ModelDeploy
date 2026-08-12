@@ -186,10 +186,44 @@ def collect_image_paths(dir_paths:list[str], max_count:int, random_sample:bool=F
     return str(output_txt.resolve())
 
 def read_txt_first_line(txt_path: str) -> list[str]:
+    """
+    Read the first line of a text file, split it by whitespace, and
+    convert each token into a full path string.
+
+    - Relative paths are resolved against the directory containing the txt file.
+    - Absolute paths are kept as-is.
+    - Returns an empty list if the first line is empty.
+
+    Args:
+        txt_path (str): Path to the text file (e.g. a quantization dataset list).
+
+    Returns:
+        list[str]: Full path strings parsed from the first line.
+
+    Raises:
+        FileNotFoundError: If txt_path does not exist.
+    """
+    txt_path:Path = Path(txt_path).resolve()
+
+    if not txt_path.is_file():
+        raise FileNotFoundError(f"数据文件不存在: {txt_path}")
+
     with open(txt_path, 'r', encoding='utf-8') as f:
         first_line = f.readline()
 
-    return first_line.split()
+    # 按任意空白字符（空格/Tab/多空格）分割第一行，并过滤掉空字符串
+    one_line_paths = first_line.split()
+
+    full_path_list = []
+    for img_path in one_line_paths:
+        p = Path(img_path)
+        if p.is_absolute():  # 已经是绝对路径，直接使用
+            full_path = p
+        else:  # 相对路径则与 txt 文件所在目录拼接
+            full_path = txt_path.parent / p
+        full_path_list.append(str(full_path))
+
+    return full_path_list
 
 def fmt_model_name_with_shape(model:onnx.ModelProto|str, model_name:str, use_nhwc:bool=False) -> str:
     """

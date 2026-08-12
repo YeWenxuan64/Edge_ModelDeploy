@@ -77,6 +77,7 @@ RKNN Toolkit2 内置的 `rknn.accuracy_analysis()` 自动执行
 | `utilities/tmp/snapshot/simulator/` | Simulator（量化）模型逐层中间张量（`.npy` 文件） |
 | `utilities/tmp/snapshot/error_analysis.txt` | 完整逐层精度对比表（全部层数据） |
 | `utilities/tmp/snapshot/map_name_to_file.txt` | 层名与中间张量文件的映射表 |
+| `utilities/tmp/rknn_accuracy_analysis_summary.png` | 可视化汇总图表（调用 `plot_accuracy_analysis()` 生成，见[1.5](#15-可视化图表解读)） |
 
 > 📁 以上文件在调用 `clean()` 清理前均可查阅。
 
@@ -126,7 +127,27 @@ I The error analysis results save to: ./snapshot/error_analysis.txt
 | `euc` | 欧氏距离 | 辅助指标，与 cos 结合判断量化误差的量级 |
 
 
-### 1.5 混合量化优化
+### 1.5 可视化图表解读
+
+精度分析完成后会自动读取 `utilities/tmp/snapshot/error_analysis.txt` 并生成可视化汇总图（指标含义参见[概述 · 关注的指标](#关注的指标)），默认保存为 `utilities/tmp/rknn_accuracy_analysis_summary.png`：
+
+![rknn_accuracy_analysis_summary.png](./rknn_accuracy_analysis_summary.png)
+
+`rknn_accuracy_analysis_summary.png` 包含两个子图（布局与 QNN 精度分析保持一致）：
+
+**上图 — 欧氏距离（Euclidean Distance）（逐层柱状图 + 折线图）**
+- 天蓝色柱状图：每层的**单层**欧氏距离（`single euc`），柱子突出的层即为单层量化损失最大的层
+- 蓝色折线（右轴）：每层的**累积**欧氏距离（`entire euc`），反映误差逐层累积后的绝对量级
+
+**下图 — 余弦相似度（Cosine Similarity）（逐层折线图）**
+- 绿色折线：每层的**单层**余弦相似度（`single cos`），**低于红线的层需重点关注**
+- 蓝色折线：每层的**累积**余弦相似度（`entire cos`），反映误差逐层累积的影响
+- 红色虚线：0.99 警戒阈值（对于 INT8 量化，0.9 以上通常可接受）
+
+> 💡 绘图时会同步在终端打印单层余弦相似度最低的前 `top_k` 层（默认 10），可直接作为混合量化的候选层清单。
+
+
+### 1.6 混合量化优化
 
 当精度分析发现特定层量化损失较大时，可使用混合量化将这些层保留为 FP16：
 
@@ -260,7 +281,7 @@ converter.do_hybrid_quantization(
 | 发现的问题 | 建议的优化方案 |
 |-----------|--------------|
 | 整体余弦相似度（Cosine Similarity）偏低（< 0.95） | ① 更换量化算法（如 `entropy` → `kl_divergence`）<br>② 扩充/替换量化校准数据集 |
-| 仅个别层余弦相似度（Cosine Similarity）偏低 | 对该层/子图做**混合量化**（QNN：16-bit 整数子图或 FP16/FP32 浮点子图，见[2.5](#25-qnn-混合量化优化)；RKNN：FP16 子图，见[1.5](#15-混合量化优化)） |
+| 仅个别层余弦相似度（Cosine Similarity）偏低 | 对该层/子图做**混合量化**（QNN：16-bit 整数子图或 FP16/FP32 浮点子图，见[2.5](#25-qnn-混合量化优化)；RKNN：FP16 子图，见[1.6](#16-混合量化优化)） |
 | 某些层欧氏距离（Euclidean Distance）特别大 | 检查该层是否为激活函数层（如 Sigmoid/Softmax），<br>此类层对量化敏感，建议混合量化 |
 | QNN 中某些层 Name 显示为 "lost" | 该层在 Golden 和 Quant 模型间无法匹配，<br>可能是图优化过程中被融合或消除，通常可忽略 |
 

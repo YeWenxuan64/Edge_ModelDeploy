@@ -1,19 +1,15 @@
+import re
+import sys
 import os
 from pathlib import Path
+import numpy as np
 from rknn.api import RKNN
 
-try:
-    from utils import temporary_chdir
 
-except ImportError:
-    try:
-        from .utils import temporary_chdir
+current_dir = Path(__file__).parent.resolve()
+sys.path.append(str(current_dir))
 
-    except ImportError:
-        import sys
-        current_dir = Path(__file__).parent.resolve()
-        sys.path.append(str(current_dir))
-        from utils import temporary_chdir
+from utils import temporary_chdir
 
 
 
@@ -59,12 +55,12 @@ class OnnxToRKNN:
 
         self.temp_files_list = ["check0_base_optimize.onnx", "check1_fold_constant.onnx", "check2_correct_ops.onnx", "check3_fuse_ops.onnx"]
 
-    def extra_optimize(self, quantized_algorithm:str='kl_divergence', compress_weight:bool=False, model_pruning:bool=False, flash_attantion:bool=False):
+    def extra_optimize(self, quantized_algorithm:str='normal', compress_weight:bool=False, model_pruning:bool=False, flash_attantion:bool=False):
         """
         Args:
             quantized_algorithm (str): The quantization algorithm to use. 
-                - Options: 'normal' for basic quantization, 'kl_divergence' for KL divergence-based or 'mmse' for minimum mean square error quantization.
-                - Default is 'kl_divergence'.
+                - Options: 'normal' for min-max quantization, 'kl_divergence' for KL divergence-based or 'mmse' for minimum mean square error quantization.
+                - Default is 'normal'.
 
             compress_weight (bool): Whether to compress model weights to reduce memory usage. 
                 - Default is False.
@@ -110,7 +106,7 @@ class OnnxToRKNN:
             self.accuracy_analysis_picture_list = [str(Path(path).resolve()) for path in accuracy_analysis_picture_list]
         else:
             self.accuracy_analysis_picture_list = None
-		
+
 
     def convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
         """
@@ -167,6 +163,22 @@ class OnnxToRKNN:
 
         with temporary_chdir(self.tmp_dir):
             self.self_convert(mean_rgb, std_rgb)
+
+        if self.accuracy_analysis_picture_list is not None:
+            self.plot_accuracy_analysis()
+
+    def clean(self):
+        for file_name in self.temp_files_list:
+            file_path = str(self.tmp_dir / file_name)
+            
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    print(f"deleted tmp file {file_path}")
+
+            except Exception as e:
+                print(f"failed to delete {file_path}: {str(e)}")
+
 
     def self_convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
         rknn = RKNN(verbose=True)
@@ -226,14 +238,163 @@ class OnnxToRKNN:
         rknn.release()
         print('--> Released rknn')
 
-    def clean(self):
-        for file_name in self.temp_files_list:
-            file_path = str(self.tmp_dir / file_name)
-            
-            try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                    print(f"deleted tmp file {file_path}")
+    def read_error_analysis(self) -> list[dict]:
+        """
+        读取 RKNN 精度分析结果文件 (snapshot/error_analysis.txt)。
 
-            except Exception as e:
-                print(f"failed to delete {file_path}: {str(e)}")
+        Args:
+            error_analysis_path (str | None): 精度分析结果文件路径。
+                - None (默认): 使用 self.tmp_dir/snapshot/error_analysis.txt。
+
+        Returns:
+            list[dict]: 逐层精度数据列表，每个元素包含:
+                - op_type (str): 算子类型，如 'Conv'、'LeakyRelu'
+                - layer_name (str): 层名称
+                - entire_cos (float | None): 累积余弦相似度（从输入累计到该层）
+                - entire_euc (float | None): 累积欧氏距离
+                - single_cos (float | None): 单层余弦相似度（反映该层自身量化误差）
+                - single_euc (float | None): 单层欧氏距离
+                - 少数层（如部分 Concat）无数值，对应字段为 None。
+
+        Raises:
+            FileNotFoundError: 当结果文件不存在时。
+        """
+
+        error_analysis_path = self.tmp_dir / 'snapshot' / 'error_analysis.txt'
+
+        if not error_analysis_path.exists():
+            raise FileNotFoundError(
+                f"error_analysis.txt not found: {error_analysis_path}\n"
+                "请先通过 set_do_accuracy_analysis() 启用精度分析并运行 convert() 生成结果。"
+            )
+
+        rows: list[dict] = []
+        with open(error_analysis_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.rstrip()
+                if not line:
+                    continue
+                # 跳过注释行、表头行和分隔线
+                if line.startswith('#') or line.startswith('layer_name') or line.startswith('---'):
+                    continue
+
+                # 数据行格式: [OpType] layer_name   entire_cos | entire_euc   single_cos | single_euc
+                if not line.startswith('['):
+                    continue
+                end_bracket = line.find(']')
+                if end_bracket == -1:
+                    continue
+                op_type = line[1:end_bracket]
+                rest = line[end_bracket + 1:].strip()
+
+                # 匹配末尾的 4 个数值: cos | euc   cos | euc
+                m = re.match(r'^(.*?)\s+([\d.]+)\s*\|\s*([\d.]+)\s+([\d.]+)\s*\|\s*([\d.]+)\s*$', rest)
+                if m:
+                    layer_name = m.group(1).strip()
+                    entire_cos = float(m.group(2))
+                    entire_euc = float(m.group(3))
+                    single_cos = float(m.group(4))
+                    single_euc = float(m.group(5))
+                else:
+                    # 无数值的层（如部分 Concat 层）
+                    layer_name = rest
+                    entire_cos = entire_euc = single_cos = single_euc = None
+
+                rows.append({
+                    'op_type': op_type,
+                    'layer_name': layer_name,
+                    'entire_cos': entire_cos,
+                    'entire_euc': entire_euc,
+                    'single_cos': single_cos,
+                    'single_euc': single_euc,
+                })
+
+        print(f"Loaded {len(rows)} layers from {error_analysis_path}")
+        return rows
+
+    def plot_accuracy_analysis(self, top_k:int=10) -> list[dict]:
+        """
+        读取并可视化 RKNN 精度分析结果（欧氏距离柱状图 + 余弦相似度折线图）。
+
+        Args:
+            top_k (int): 打印单层余弦相似度最低的前 top_k 个层（便于定位混合量化候选层）。默认 10。
+
+        Returns:
+            list[dict]: 解析出的逐层精度数据（同 read_error_analysis）。
+        """
+        from matplotlib import axes
+        import matplotlib.pyplot as plt
+
+        rows = self.read_error_analysis()
+        if not rows:
+            print("No data to plot.")
+            return rows
+
+        layer_names = [r['layer_name'] for r in rows]
+        n = len(rows)
+        x = np.arange(n)
+
+        entire_cos = np.array([r['entire_cos'] for r in rows], dtype=float)
+        entire_euc = np.array([r['entire_euc'] for r in rows], dtype=float)
+        single_cos = np.array([r['single_cos'] for r in rows], dtype=float)
+        single_euc = np.array([r['single_euc'] for r in rows], dtype=float)
+
+        # 图例颜色/样式与 QNN 精度分析保持一致
+        fig, (ax_euc, ax_cos) = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
+        ax_euc:axes.Axes
+        ax_cos:axes.Axes
+
+        # 图1：欧氏距离（逐层柱状）+ 累积欧氏距离（右侧纵轴折线）
+        ax_euc.set_yscale('linear')
+        ax_euc.bar(x, single_euc, color='skyblue', edgecolor='black', linewidth=0.5, alpha=0.7, label='Euc Dist Per Layer')
+        ax_euc.set_title('Euclidean Distance & Euc(entire) (Per Layer)', fontsize=14, fontweight='bold')
+        ax_euc.set_ylabel('Euclidean Distance', fontsize=12)
+        ax_euc.grid(True, which='both', ls='--', alpha=0.5)
+
+        # 右侧纵轴：累积欧氏距离（entire，与单层欧氏距离量级接近，分离显示便于对比）
+        ax_entire = ax_euc.twinx()
+        ax_entire.plot(x, entire_euc, color='orange', marker='.', linestyle='-', linewidth=1, markersize=2, label='Euc (entire)')
+        ax_entire.set_ylabel('Euc (entire)', fontsize=12)
+
+        # 合并两个轴的图例
+        lines_euc, labels_euc = ax_euc.get_legend_handles_labels()
+        lines_entire, labels_entire = ax_entire.get_legend_handles_labels()
+        ax_euc.legend(lines_euc + lines_entire, labels_euc + labels_entire, loc='upper left')
+
+        # 图2：余弦相似度（逐层折线）
+        ax_cos.set_yscale('linear')
+        ax_cos.plot(x, single_cos, color='green', marker='.', linestyle='-', linewidth=1, markersize=2, label='Cosine (single)')
+        ax_cos.plot(x, entire_cos, color='orange', marker='.', linestyle='-', linewidth=1, markersize=2, label='Cosine (entire)')
+        ax_cos.set_title('Cosine Similarity (Per Layer)', fontsize=14, fontweight='bold')
+        ax_cos.set_ylabel('Cosine Similarity', fontsize=12)
+        ax_cos.set_xticks(range(n))
+        ax_cos.set_xticklabels(layer_names, rotation=-45, ha='left', fontsize=10)
+
+        ax_cos.axhline(0.99, color='red', linestyle='--', linewidth=1, alpha=0.6, label='Warning Threshold (0.99)')
+        ax_cos.legend(loc='lower left')
+        ax_cos.grid(True, which='both', ls='--', alpha=0.5)
+
+        # 消除 x 轴两端默认的 5% 空白边距（留半个柱宽避免首尾柱被裁切）
+        ax_cos.set_xlim(-0.5, n - 0.5)
+
+        # 打印问题层摘要（按单层余弦相似度升序，数值层优先）
+        valid_idx = [i for i in range(n) if not np.isnan(single_cos[i])]
+        if valid_idx:
+            sorted_idx = sorted(valid_idx, key=lambda i: single_cos[i])
+            print('\n' + '=' * 100)
+            print(f'Top-{min(top_k, len(sorted_idx))} worst layers by single cosine similarity (candidates for hybrid quantization):')
+            print(f"{'rank':<6}{'op_type':<16}{'layer_name':<60}{'single_cos':<12}{'single_euc':<12}{'entire_cos':<12}")
+            print('-' * 100)
+            for rank, i in enumerate(sorted_idx[:top_k], start=1):
+                print(f"{rank:<6}{rows[i]['op_type']:<16}{rows[i]['layer_name']:<60}{single_cos[i]:<12.5f}{single_euc[i]:<12.4f}{entire_cos[i]:<12.5f}")
+            print('=' * 100 + '\n')
+
+        plt.tight_layout()
+        save_path = self.tmp_dir / 'rknn_accuracy_analysis_summary.png'
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+        plt.show()
+        return rows
+
+
