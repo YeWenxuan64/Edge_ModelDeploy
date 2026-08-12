@@ -28,8 +28,8 @@
 | 转换阶段 | 工具 | 说明 |
 |---------|------|------|
 | **PyTorch/TensorFlow → ONNX** | 各子模块独立脚本 | 处理算子兼容、动态图固化、模型优化 |
-| **ONNX → RKNN** | `utilities/onnx_to_rknn.py` | Rockchip NPU（RK3588 / RK3576），支持 INT8 量化、混合量化|
-| **ONNX → QNN** | `utilities/onnx_to_qnn.py` | Qualcomm NPU（HTP），支持多精度量化 |
+| **ONNX → RKNN** | `utilities/onnx_to_rknn.py` | Rockchip NPU（RK3588 / RK3576），支持 INT8 量化、混合精度量化|
+| **ONNX → QNN** | `utilities/onnx_to_qnn.py` | Qualcomm NPU（HTP），支持 INT8/INT4 量化、混合精度量化 |
 | **数据集生成** | `utilities/yolo_croped_dataset_gen.py` | 基于 YOLO 检测自动裁剪量化校准数据集 |
 
 > **工具链是核心资产** — 每个子模块（AVTrack、NanoTrackV3、RetinaFace 等）都复用同一套 `utilities/` 转换工具，只需编写模型特有的 PyTorch → ONNX 导出脚本即可。
@@ -234,13 +234,17 @@ python yolo26_onnx2qnn.py
 │     └─ Hybrid quant → step1+2   │  │  3. get_onnx_model_info()       │
 │                                 │  │     Parse input/output dims     │
 │  4. rknn.export_rknn()          │  │                                 │
-│     Export .rknn model file     │  │  4. convert_onnx_model()        │
-│                                 │  │     qairt-converter             │
-│  5. rknn.release()              │  │     ONNX ──► DLC (unquantized)  │
+│     Export .rknn model file     │  │  3.5 do_hybrid_quantization()   │
+│                                 │  │     Hybrid overrides JSON       │
+│  5. rknn.release()              │  │     16-bit / FP16 subgraph      │
 │     Release resources           │  │                                 │
+│                                 │  │  4. convert_onnx_model()        │
+│  6. clean()                     │  │     qairt-converter             │
+│     Clean temp files            │  │     ONNX ──► DLC (unquantized)  │
+│                                 │  │                                 │
 │                                 │  │  5. generate_calibration_data() │
-│  6. clean()                     │  │     Read imgs → Preprocess →    │
-│     Clean temp files            │  │     .raw files                  │
+│                                 │  │     Read imgs → Preprocess →    │
+│                                 │  │     .raw files                  │
 │                                 │  │                                 │
 │                                 │  │  6. quantize_model()            │
 │                                 │  │     qairt-quantizer             │
@@ -276,16 +280,21 @@ python yolo26_onnx2qnn.py
 | 目标平台        | AI处理器    | 芯片     | 转换工具 | 量化格式 |
 |----------------|-------------|---------|---------|---------|
 | Rockchip       | NPU         | RK3588 RK3576 RK3566 | `onnx_to_rknn.py` | INT8 / FP16 / 混合量化 |
-| Qualcomm (HTP) | Hexagon DSP | QCS6490 QCS8550 QCS9075 | `onnx_to_qnn.py` | INT8 / INT4 / FP16 |
+| Qualcomm (HTP) | Hexagon DSP | QCS6490 QCS8550 QCS9075 | `onnx_to_qnn.py` | INT8 / INT4 / FP16 / 混合量化 |
 
 ### 局限性
 
 > TODO — 小女子笨笨的，未来慢慢填坑喵~ 🐾
 
 - [ ] **更多模型类型** — 目前仅支持 **计算机视觉（CV）** 类的模型部署，NLP / 语音等领域的模型暂不支持
+
 - [ ] **动态尺寸** — 仅支持**固定输入、输出尺寸**的模型，动态 shape 的模型需要手动固定后再走转换流程
-- [ ] **QNN 量化工作流单一** — 由于小女子太笨了，目前仅支持 `QAIRT` 原生的普通量化流程，尚未接入 `AIMET（AI Model Efficiency Toolkit）` 的更高级量化方法（如跨层等价变换、编码感知训练等）
-- [x] **QNN 精度分析缺失** — 由于小女子太笨了，QNN 的精度分析还不会用喵
+
+- [x] **QNN 混合量化** — 支持 `QAIRT` 原生的混合精度量化：可对指定子图使用 16-bit 整数量化（如 w16a16）或保留 FP16/FP32 浮点精度，其余部分仍按全局设置（默认 w8a8）量化为 INT8，通过 `do_hybrid_quantization()` 指定敏感子图（完成于 2026-08-12）
+
+- [ ] **QNN 高级量化（AIMET）** — 由于小女子太笨了，尚未接入 `AIMET（AI Model Efficiency Toolkit）` 的更高级量化方法
+
+- [x] **QNN 精度分析** — 支持基于 `snpe-accuracy-debugger` 的精度分析，混合量化场景下自动使用纯浮点 DLC 作为 Golden 参考
     - 🧪 实验性支持（完成于 2026-06-22）
 
 ## 📄 License

@@ -219,6 +219,32 @@ QNN 精度分析自动执行以下三步：
 
 ![QNN_accuracy_analysis_summary.png](./QNN_accuracy_analysis_summary.png)
 
+### 2.5 QNN 混合量化优化
+
+当精度分析发现特定层/子图损失较大时，可对这些子图使用混合量化（16-bit 整数或 FP16/FP32 浮点），其余部分仍保持全局 INT8：
+
+```python
+# 方式一：整数混合量化 —— 区域内 w8a16（权重 8bit，激活 16bit）
+converter.do_hybrid_quantization(
+    custom_hybrid=[
+        ['敏感子图输入张量名', '敏感子图输出张量名'],
+    ],
+    weights_bitwidth=8,
+    act_bitwidth=16,
+    bias_bitwidth=8
+)
+
+# 方式二：浮点保留 —— 区域内保持 FP16
+converter.do_hybrid_quantization(
+    custom_hybrid=[
+        ['敏感子图输入张量名', '敏感子图输出张量名'],
+    ],
+    float_bitwidth=16      # 16 = FP16 / 32 = FP32
+)
+```
+
+> **注意：** 混合量化场景下，精度分析的 Golden 参考会自动改用**纯浮点 DLC**（`{模型名}_golden.dlc`）——带 16-bit 混合量化编码的未量化 DLC 无法在 x86 CPU 的 `--stage converted` 阶段运行（报 `No backend could validate`），会导致 Golden 输出无法生成、精度分析失败。转换工具会在开启混合量化时自动生成该浮点 DLC，无需手动干预。
+
 ---
 
 ## 💡 3. 精度分析最佳实践
@@ -234,7 +260,7 @@ QNN 精度分析自动执行以下三步：
 | 发现的问题 | 建议的优化方案 |
 |-----------|--------------|
 | 整体余弦相似度（Cosine Similarity）偏低（< 0.95） | ① 更换量化算法（如 `entropy` → `kl_divergence`）<br>② 扩充/替换量化校准数据集 |
-| 仅个别层余弦相似度（Cosine Similarity）偏低 | 对该层/子图做**混合量化**（保留 FP16） |
+| 仅个别层余弦相似度（Cosine Similarity）偏低 | 对该层/子图做**混合量化**（QNN：16-bit 整数子图或 FP16/FP32 浮点子图，见[2.5](#25-qnn-混合量化优化)；RKNN：FP16 子图，见[1.5](#15-混合量化优化)） |
 | 某些层欧氏距离（Euclidean Distance）特别大 | 检查该层是否为激活函数层（如 Sigmoid/Softmax），<br>此类层对量化敏感，建议混合量化 |
 | QNN 中某些层 Name 显示为 "lost" | 该层在 Golden 和 Quant 模型间无法匹配，<br>可能是图优化过程中被融合或消除，通常可忽略 |
 

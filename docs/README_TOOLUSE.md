@@ -111,7 +111,7 @@ converter.extra_optimize(
 
 # 可选：混合量化（部分子图 FP16，其余 INT8）
 # converter.do_hybrid_quantization(
-#     custom_hybrid=[['input_node', 'output_node']]
+#     custom_hybrid=[['input_node', 'output_node']] # 子图判断逻辑同下 QNN 部分
 # )
 
 # 可选：精度分析（放置模型输入节点所对应的图片）
@@ -174,6 +174,28 @@ converter.set_quantization_method(
 #     custom_alibration_data_path='path/to/calibration_data.txt'
 # )
 
+# 可选：混合精度量化（部分敏感子图使用更高精度，其余仍按全局设置量化为 INT8）
+# 两种模式（二选一）：
+# 1) 整数混合量化：指定区域内权重 / 激活 / 偏置的整数位宽
+#    e.g. 全局 w8a8、区域内 w8a16（权重 8bit，激活 16bit）
+# converter.do_hybrid_quantization(
+#     custom_hybrid=[['子图输入张量名', '子图输出张量名']],
+#     weights_bitwidth=8,   # 区域内权重位宽: 4 / 8 / 16
+#     act_bitwidth=16,      # 区域内激活位宽: 8 / 16
+#     bias_bitwidth=8       # 区域内偏置位宽: 8 / 32
+# )
+# 2) 浮点保留：指定区域内保持 FP16 / FP32 浮点精度（此时忽略上述三个整数参数）
+# converter.do_hybrid_quantization(
+#     custom_hybrid=[['子图输入张量名', '子图输出张量名']],
+#     float_bitwidth=16     # 16 = FP16 / 32 = FP32
+# )
+# 注：custom_hybrid 支持同时指定多个子图；边界可以是张量名，也可以是节点名（自动取该节点的输出张量）
+
+# 可选：精度分析（放置模型输入节点所对应的图片）
+# converter.set_do_accuracy_analysis(
+#     accuracy_analysis_picture_list=['img1.jpg']
+# )
+
 # 执行转换
 converter.convert(
     mean_rgb=[[123.675, 116.28, 103.53]],
@@ -184,6 +206,23 @@ converter.convert(
 # 清理临时文件
 converter.clean()
 ```
+
+### QNN 混合精度量化说明
+
+QNN 混合量化通过 `do_hybrid_quantization()` 指定一个或多个**子图**（用子图的输入张量与输出张量界定），子图内的节点使用更高精度，子图外的节点仍按 `set_quantization_method()` 的全局设置（默认 w8a8）量化为 INT8：
+
+| 模式 | 关键参数 | 区域精度 | 适用场景 |
+|------|---------|---------|---------|
+| **整数混合量化**（默认） | `weights_bitwidth` / `act_bitwidth` / `bias_bitwidth` | 区域内权重 / 激活 / 偏置为整数位宽（如 w8a16） | 精度敏感但无需浮点，HTP 上性能与精度兼顾 |
+| **浮点保留** | `float_bitwidth=16/32` | 区域内保持 FP16 / FP32 浮点 | 精度极度敏感的层，可接受更高计算开销 |
+
+**子图边界的确定：**
+- 边界可以是**张量名**，也可以是**节点名**（自动取该节点的输出张量作为边界）
+- 子图 = 「输入张量与输出张量」之间的所有节点
+- 可同时传入多个子图，例如 `[[in1, out1], [in2, out2]]`
+- 建议先做**精度分析**（见 [量化精度分析指南](./ACCURACY_ANALYSIS_TOOLUSE.md)）定位余弦相似度偏低的层，再对其所在子图做混合量化
+
+
 
 > **关于 `mean_rgb` 与 `std_rgb`（输入归一化参数）：**
 > 

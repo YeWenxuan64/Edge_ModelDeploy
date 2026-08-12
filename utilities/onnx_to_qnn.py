@@ -147,11 +147,11 @@ class QnnHybridQuantGen:
             print("Error: no nodes selected for hybrid quantization")
             return None
 
-        mp = self.hybrid_quantization
-        dtype = mp["dtype"]
-        act_bw = mp["act_bitwidth"]
-        weight_bw = mp["weights_bitwidth"]
-        bias_bw = mp["bias_bitwidth"]
+        hq = self.hybrid_quantization
+        dtype = hq["dtype"]
+        act_bw = hq["act_bitwidth"]
+        weight_bw = hq["weights_bitwidth"]
+        bias_bw = hq["bias_bitwidth"]
 
         initializer_names = {init.name for init in model.graph.initializer}
         activation_encodings: dict[str, list[dict]] = {}
@@ -241,12 +241,11 @@ class OnnxToQNN:
         self.tmp_onnx_path = tmp_onnx_path.with_suffix('.onnx')
 
         self.file_or_dir_to_clean = []
-
+        self.accuracy_analyzer = None
         self.hybrid_quantizer = None
 
         self.set_quantization_method()
         self.use_custom_alibration_data()
-        self.set_do_accuracy_analysis()
 
     def use_custom_alibration_data(self, custom_alibration_data_path:str|None=None):
         """
@@ -352,10 +351,8 @@ class OnnxToQNN:
                 - For models with multiple inputs, provide multiple image paths. Example: ['/home/xxx/1.jpg', '/home/xxx/2.jpg']
                 - Defaults to None.
         """
-        if accuracy_analysis_picture_list is not None:
-            self.accuracy_analysis_picture_list = [str(Path(path).resolve()) for path in accuracy_analysis_picture_list]
-        else:
-            self.accuracy_analysis_picture_list = None
+
+        self.accuracy_analyzer = SnpeAccuracyDebugger(self.tmp_dir, self.tmp_onnx_path, accuracy_analysis_picture_list, self.run_subprocess)
 
 
     def convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]], set_input_order:str='nhwc'):
@@ -384,10 +381,17 @@ class OnnxToQNN:
             exit(1)
 
         quantization_overrides_path = None
+        golden_dlc_path = None
         if self.hybrid_quantizer is not None:
-            quantization_overrides_path = self.hybrid_quantizer.generate_hybrid_quantization_overrides()
+            quantization_overrides_path = self.hybrid_quantizer.generate_hybrid_quantization_overrides(self.tmp_onnx_path)
             if quantization_overrides_path is None:
                 exit(1)
+
+            # 混合量化时，精度分析的 golden 参考必须使用纯浮点 DLC：
+            # 带混合量化编码(如 16-bit)的未量化 DLC 无法在 x86 CPU 的 --stage converted 阶段执行
+            # (报 "No backend could validate")，会导致 golden 输出无法生成、精度分析失败。
+            golden_dlc_path = self.convert_onnx_model(onnx_model_info, set_input_order, None, output_dlc_name=f"{self.tmp_onnx_path.stem}_golden")
+
 
         dlc_model_path = self.convert_onnx_model(onnx_model_info, set_input_order, quantization_overrides_path)
         if dlc_model_path is None:
@@ -413,14 +417,13 @@ class OnnxToQNN:
 
         self.generate_context_binary_model(quantized_dlc_model_path, config_path)
 
-        if self.accuracy_analysis_picture_list is not None and quantized_dlc_model_path is not None:
-            accuracy_analyzer = SnpeAccuracyDebugger(self.tmp_dir, self.tmp_onnx_path, dlc_model_path, quantized_dlc_model_path, self.accuracy_analysis_picture_list)
-            accuracy_analyzer.get_parent_args(onnx_model_info, self.run_subprocess)
+        if self.accuracy_analyzer is not None and quantized_dlc_model_path is not None:
+            golden_dlc_path = golden_dlc_path or dlc_model_path
+            self.accuracy_analyzer.set_model_inof(onnx_model_info, golden_dlc_path, quantized_dlc_model_path)
 
-            return_code = accuracy_analyzer.accuracy_analysis(mean_rgb, std_rgb, set_input_order)
+            return_code = self.accuracy_analyzer.accuracy_analysis(mean_rgb, std_rgb, set_input_order)
 
-
-            self.file_or_dir_to_clean.append(str(accuracy_analyzer.working_dir))
+            self.file_or_dir_to_clean.append(str(self.accuracy_analyzer.working_dir))
             self.file_or_dir_to_clean.append(str(self.tmp_dir / "working_directory"))
 
             if return_code == 0:
@@ -643,8 +646,7 @@ class OnnxToQNN:
 
         return model_info
 
-    def convert_onnx_model(self, onnx_model_info:dict, set_input_order:str, quantization_overrides_path:str|None=None) -> str|None:
-
+    def convert_onnx_model(self, onnx_model_info:dict, set_input_order:str, quantization_overrides_path:str|None=None, output_dlc_name:str|None=None) -> str|None:
         layout_params = [] # 构建输入布局参数
         for input_info in onnx_model_info.get("inputs"): 
             input_name = input_info["name"]
@@ -666,18 +668,25 @@ class OnnxToQNN:
             self.file_or_dir_to_clean.append(quantization_overrides_path)
 
             extra_args += f" --quantization_overrides {quantization_overrides_path}"
-            if self.hybrid_quantization is not None and self.hybrid_quantization["dtype"] == "float":
-                extra_args += f" --float_bitwidth {self.hybrid_quantization['weights_bitwidth']}"
+
+            if self.hybrid_quantizer is not None:
+                hybrid_quantization_dict = self.hybrid_quantizer.hybrid_quantization
+                if hybrid_quantization_dict["dtype"] == "float":
+                    extra_args += f" --float_bitwidth {hybrid_quantization_dict['weights_bitwidth']}"
 
 
-        command = f"qairt-converter --input_network {str(self.tmp_onnx_path)} {layout_args} {extra_args}"
+        if output_dlc_name is not None:
+            dlc_path = self.tmp_onnx_path.parent / f"{output_dlc_name}.dlc"
+        else:
+            dlc_path = self.tmp_onnx_path.with_suffix('.dlc')
+
+        command = f"qairt-converter --input_network {str(self.tmp_onnx_path)} {layout_args} {extra_args} -o {dlc_path}"
 
         return_code = self.run_subprocess(command)
         
         if return_code == 0:
             print("Convert onnx to qnn-dlc successful!")
 
-            dlc_path = self.tmp_onnx_path.with_suffix('.dlc')
             self.file_or_dir_to_clean.append(dlc_path)
             return dlc_path
         

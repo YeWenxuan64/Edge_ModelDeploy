@@ -15,12 +15,11 @@ import matplotlib.pyplot as plt
 
 
 class SnpeAccuracyDebugger:
-    def __init__(self, tmp_dir:str, onnx_path:str, golden_dlc_path:str, quant_dlc_path:str, debugger_picture_list:list[str]):
+    def __init__(self, tmp_dir:str, onnx_path:str, debugger_picture_list:list[str], run_subprocess:Callable[[str], int]):
         self.tmp_dir = Path(tmp_dir).resolve()
         self.onnx_path = Path(onnx_path).resolve()
-        self.golden_dlc_path = Path(golden_dlc_path).resolve()
-        self.quant_dlc_path = Path(quant_dlc_path).resolve()
         self.debugger_picture_list = [Path(p).resolve() for p in debugger_picture_list]
+        self.command_runnr = run_subprocess
 
         self.tmp_working_dir = self.tmp_dir / 'accuracy_analysis'
         self.tmp_working_dir.mkdir(exist_ok=True)
@@ -34,9 +33,10 @@ class SnpeAccuracyDebugger:
         self.quant_dir = self.working_dir / 'quant_dir'
         self.quant_dir.mkdir(exist_ok=True)
 
-    def get_parent_args(self, onnx_info:dict, command_runnr:Callable[[str], int]):
+    def set_model_inof(self, onnx_info:dict, golden_dlc_path:str, quant_dlc_path:str):
         self.onnx_info = onnx_info
-        self.command_runnr = command_runnr
+        self.golden_dlc_path = Path(golden_dlc_path).resolve()
+        self.quant_dlc_path = Path(quant_dlc_path).resolve()
 
     @staticmethod
     def find_latest_subdir(base_dir: Path) -> Path:
