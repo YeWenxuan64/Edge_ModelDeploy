@@ -282,6 +282,9 @@ python yolo26_onnx2qnn.py
 | Rockchip       | NPU         | RK3588 RK3576 RK3566 | `onnx_to_rknn.py` | INT8 / FP16 / 混合量化 |
 | Qualcomm (HTP) | Hexagon DSP | QCS6490 QCS8550 QCS9075 | `onnx_to_qnn.py` | INT8 / INT4 / FP16 / 混合量化 |
 
+> 提issues时请附上想要硬件信息，小女子可以适配喵~ 🐾
+
+
 ### 局限性
 
 > TODO — 小女子笨笨的，未来慢慢填坑喵~ 🐾
@@ -290,12 +293,17 @@ python yolo26_onnx2qnn.py
 
 - [ ] **动态尺寸** — 仅支持**固定输入、输出尺寸**的模型，动态 shape 的模型需要手动固定后再走转换流程
 
-- [x] **QNN 混合量化** — 支持 `QAIRT` 原生的混合精度量化：可对指定子图使用 16-bit 整数量化（如 w16a16）或保留 FP16/FP32 浮点精度，其余部分仍按全局设置（默认 w8a8）量化为 INT8，通过 `do_hybrid_quantization()` 指定敏感子图（完成于 2026-08-12）
+- [x] **QNN 混合量化** — 由于小女子太笨了，不会树和图数据结构，不会遍历计算图的特定节点来指定混合量化
+    - 支持 `QAIRT` 原生的混合精度量化：可对**指定子图**使用 16-bit 整数量化（如 w16a16）或保留 FP16/FP32 浮点精度，其余部分仍按全局设置（默认 w8a8）量化为 INT8
+    - 🛠️ 测试性支持（完成于 2026-08-12）
 
-- [ ] **QNN 高级量化（AIMET）** — 由于小女子太笨了，尚未接入 `AIMET（AI Model Efficiency Toolkit）` 的更高级量化方法
+- [x] **QNN 高级量化（AIMET）** — 由于小女子太笨了，尚未接入 `AIMET (AI Model Efficiency Toolkit)` 的更高级量化方法
+    - 支持基于 `AIMET (AI Model Efficiency Toolkit)` 的 **PQT** 量化方法，可作为独立的 QNNX 量化器或 QNN 的外置量化器使用
+    - 🧪 实验性支持（完成于 2026-08-14）
 
-- [x] **QNN 精度分析** — 支持基于 `snpe-accuracy-debugger` 的精度分析，混合量化场景下自动使用纯浮点 DLC 作为 Golden 参考
-    - 🧪 实验性支持（完成于 2026-06-22）
+- [x] **QNN 精度分析** — 由于小女子太笨了，QNN 的精度分析还不会用喵
+    - 支持基于 `snpe-accuracy-debugger` 的精度分析，混合量化场景下自动使用纯浮点 DLC 作为 Golden 参考
+    - 🛠️ 测试性支持（完成于 2026-06-22）
 
 ## 📄 License
 

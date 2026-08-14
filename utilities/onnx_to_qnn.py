@@ -2,7 +2,6 @@ import os
 import sys
 import re
 import json
-import shutil
 import subprocess
 from pathlib import Path
 from itertools import zip_longest
@@ -18,8 +17,11 @@ import onnx
 current_dir = Path(__file__).parent.resolve()
 sys.path.append(str(current_dir))
 
-from utils import temporary_chdir, reorder_onnx_nodes_by_input, reorder_onnx_nodes_by_output, sanitize_name, letterbox_image
+from utils import temporary_chdir, sanitize_name, letterbox_image, clean_files_or_dirs
+from utils import parse_bitwidth
+from utils import normalize_onnx_model, reorder_onnx_nodes_by_input, reorder_onnx_nodes_by_output, find_hybrid_subgraph_nodes
 from qnn_accuracy_debugger import SnpeAccuracyDebugger
+from onnx_aimet_quant import AimetOnnxQuantizer, _resolve_aimet_config_path
 
 
 
@@ -72,73 +74,10 @@ class QnnHybridQuantGen:
 
         nodes = list(model.graph.node)
 
-        # 张量 -> 产生它的节点下标
-        producer: dict[str, int] = {}
-        for idx, n in enumerate(nodes):
-            for out in n.output:
-                producer[out] = idx
-
-        # 张量 -> 消费它的节点下标列表
-        consumers: dict[str, list[int]] = {}
-        for idx, n in enumerate(nodes):
-            for inp in n.input:
-                consumers.setdefault(inp, []).append(idx)
-
-        graph_input_names = {i.name for i in model.graph.input}
-
-        def resolve_tensor(name: str) -> str:
-            """张量名 -> 张量名；若为节点名则取其第一个输出张量作为边界"""
-            if name in producer or name in graph_input_names:
-                return name
-            for n in nodes:
-                if n.name == name:
-                    if not n.output:
-                        raise ValueError(f"Node '{name}' has no output tensor")
-                    return n.output[0]
-            raise ValueError(f"Tensor or node '{name}' not found in the model")
-
-        def downstream_of(tensor: str) -> set[int]:
-            """消费该张量(直接或间接)的节点集合"""
-            result: set[int] = set()
-            stack = list(consumers.get(tensor, []))
-            while stack:
-                idx = stack.pop()
-                if idx in result:
-                    continue
-                result.add(idx)
-                for out in nodes[idx].output:
-                    stack.extend(consumers.get(out, []))
-            return result
-
-        def upstream_of(tensor: str) -> set[int]:
-            """产生该张量(直接或间接)的节点集合"""
-            result: set[int] = set()
-            start = producer.get(tensor)
-            if start is None:
-                return result
-            stack = [start]
-            while stack:
-                idx = stack.pop()
-                if idx in result:
-                    continue
-                result.add(idx)
-                for inp in nodes[idx].input:
-                    p = producer.get(inp)
-                    if p is not None:
-                        stack.append(p)
-            return result
-
-        middle: set[int] = set()
+        # 识别子图节点：每个 [输入张量, 输出张量] 对 -> 输入下游 ∩ 输出上游的节点并集
+        # （复用共享的 utils.find_hybrid_subgraph_nodes，与 AIMET 路径的搜索逻辑一致）
         try:
-            for pair in self.hybrid_quantization["custom_hybrid"]:
-                if len(pair) != 2:
-                    raise ValueError(f"Each custom_hybrid pair must be [input_tensor, output_tensor], got {pair}")
-                in_tensor = resolve_tensor(pair[0])
-                out_tensor = resolve_tensor(pair[1])
-                sub_middle = downstream_of(in_tensor) & upstream_of(out_tensor)
-                if not sub_middle:
-                    print(f"Warning: no nodes found between '{in_tensor}' and '{out_tensor}', skipped")
-                middle |= sub_middle
+            middle = find_hybrid_subgraph_nodes(model, self.hybrid_quantization["custom_hybrid"])
         except ValueError as e:
             print(f"Error: {e}")
             return None
@@ -183,11 +122,276 @@ class QnnHybridQuantGen:
         with open(str(overrides_path), 'w') as f:
             json.dump(overrides, f, indent=4)
 
-        
-
         print(f"Hybrid quantization overrides generated: {len(middle)} nodes, "
               f"{len(activation_encodings)} activation tensors, {len(param_encodings)} param tensors -> {overrides_path}")
         return str(overrides_path)
+
+
+class QnnAimetConnector:
+    """AIMET 2.x 量化路径连接器（OnnxToQNN.set_use_aimet 创建）。
+
+    封装 AIMET 量化路径：AIMET PTQ -> QDQ ONNX + encodings -> qairt-converter
+    转量化 DLC -> context binary（可选精度分析）。OnnxToQNN.convert() 检测到
+    self.aimet_connector 后调用其 convert()。
+    """
+
+    def __init__(self, converter:'OnnxToQNN', quant_method:str, bitwidth:str, param_quant_schema:str='symmetric', act_quant_schema:str='asymmetric',
+                 encoding_version:str='2.0.0', config_file:str|None=None):
+        """创建连接器并保存 AIMET 量化配置。
+
+        Args:
+            converter: 父级 OnnxToQNN；回调 convert_onnx_model / write_config_file /
+                generate_context_binary_model 等，并读取校准数据 / 精度分析器状态。
+            quant_method: AIMET 方案（'min_max'/'tf_enhanced'/'percentile' 及别名）。
+            bitwidth: 全局位宽 'w<W>a<A>'，如 'w8a8'。
+            param_quant_schema: 权重对称性（'asymmetric'/'symmetric'/'unsignedsymmetric'）。
+                默认 'symmetric'。
+            act_quant_schema: 激活对称性（'asymmetric'/'symmetric'/'unsignedsymmetric'）。
+                默认 'asymmetric'。
+            encoding_version: encodings 版本（'0.6.1'/'1.0.0'/'2.0.0'）。默认 '2.0.0'。
+            config_file: AIMET quantsim_config 路径或别名；传 htp 版本（如 'htp_v68'）
+                会解析为对应内置配置绝对路径；None 用 'default'。
+        """
+        if param_quant_schema not in ['asymmetric', 'symmetric', 'unsignedsymmetric']:
+            raise ValueError('param_quant_schema must be one of asymmetric, symmetric, unsignedsymmetric')
+        
+        if act_quant_schema not in ['asymmetric', 'symmetric', 'unsignedsymmetric']:
+            raise ValueError('act_quant_schema must be one of asymmetric, symmetric, unsignedsymmetric')
+
+        self.converter = converter
+        self.quant_method = quant_method
+        self.bitwidth = bitwidth
+        self.param_quant_schema = param_quant_schema
+        self.act_quant_schema = act_quant_schema
+        self.encoding_version = encoding_version
+
+        # 传入 htp 版本（如 'htp_v68'/'htp_v73'）时，在此加载对应版本的内置
+        # quantsim_config，得到其绝对路径。对称性等后续由 AimetOnnxQuantizer.
+        # _build_sim 基于该内置配置改写（defaults 级）后应用，绝不改动算子级配置。
+        self.config_file = (_resolve_aimet_config_path(config_file)
+                            if config_file is not None else None)
+        if self.config_file is not None:
+            print(f"[AIMET] load quantsim_config: {self.config_file}")
+
+        print(f"Enabled AIMET 2.x quantization path (scheme={self.quant_method}, {bitwidth}")
+
+    def current_hybrid_config(self) -> tuple:
+        """实时读取 converter.hybrid_quantizer 的混合量化配置（与调用顺序无关）。
+
+        Returns:
+            (hybrid_subgraphs, hybrid_weights_bitwidth, hybrid_act_bitwidth,
+             hybrid_float_bitwidth)；未设置时返回 (None, 8, 16, None)。
+        """
+        hybrid_quantizer = self.converter.hybrid_quantizer
+        if hybrid_quantizer is None:
+            return None, "w8a16", None
+        
+        hq = hybrid_quantizer.hybrid_quantization
+        hybrid_subgraphs = hq["custom_hybrid"]
+        hybrid_bitwidth = f"w{hq['weights_bitwidth']}a{hq['act_bitwidth']}"
+
+        if hq["dtype"] == "float": 
+            return (hybrid_subgraphs, hybrid_bitwidth, hq["weights_bitwidth"]) # 浮点保留模式：w/a/b 同为 float 位宽
+        
+        return hybrid_subgraphs, hybrid_bitwidth, None
+
+    def convert(self, onnx_model_info:dict, mean_rgb:list, std_rgb:list, set_input_order:str):
+        """执行 AIMET 量化路径：AIMET PTQ -> QDQ ONNX + encodings -> 量化 DLC
+        -> context binary，可选精度分析。由 OnnxToQNN.convert() 调用。
+
+        Args:
+            onnx_model_info: ONNX 模型信息（get_onnx_model_info 产出，含 inputs 等）。
+            mean_rgb / std_rgb: 每个输入的 RGB 归一化参数（精度分析用）。
+            set_input_order: 输入布局，'nhwc'/'nchw'（校准 .raw 的布局解释）。
+        """
+        converter = self.converter
+        tmp_onnx_path = converter.tmp_onnx_path
+        tmp_dir = converter.tmp_dir
+
+        # 混合量化实时读取 converter.hybrid_quantizer（兼容 do_hybrid_quantization
+        # 在 set_use_aimet 之后调用的顺序），避免 set_use_aimet 快照时 hybrid 尚未设置
+        quantizer = AimetOnnxQuantizer(str(tmp_onnx_path), config_file=self.config_file)
+
+        quantizer.set_quantization_method(self.quant_method, self.bitwidth,
+                                          param_quant_schema=self.param_quant_schema, act_quant_schema=self.act_quant_schema)
+
+
+        hybrid_subgraphs, hybrid_bitwidth, hybrid_float_bitwidth = self.current_hybrid_config()
+        if hybrid_subgraphs:
+            quantizer.do_hybrid_quantization(hybrid_subgraphs, hybrid_bitwidth, hybrid_float_bitwidth)
+
+        # AIMET 量化必须有真实校准数据：随机 dummy 无法反映真实激活分布，直接报错
+        if converter.custom_alibration_data_path is None and converter.dataset_path is None:
+            raise ValueError(
+                "AIMET quantization requires calibration data: provide dataset_path or "
+                "call use_custom_alibration_data(path) before convert()."
+            )
+
+        # 生成 AIMET 校准输入（与 QAIRT 校准数据使用同一套预处理）
+        calibration_inputs = self.generate_calibration_inputs(onnx_model_info, set_input_order)
+        quantizer.quantize(calibration_data=calibration_inputs)
+
+        # 导出 QDQ ONNX + encodings
+        qdq_path, enc_path = quantizer.export(
+            str(tmp_dir),
+            f"{tmp_onnx_path.stem}_aimet_qdq",
+            encoding_version=self.encoding_version,
+        )
+        converter.file_or_dir_to_clean.append(qdq_path)
+        converter.file_or_dir_to_clean.append(enc_path)
+
+        # AIMET 导出的 QDQ 输入消费链排列顺序可能与 graph.input 不一致（多输入模型常见），
+        # 会导致 qairt-converter 推导出的 DLC 输入顺序错位（运行时按 graph.input 顺序
+        # 喂数据时 NPU 输入错乱）。按 graph.input 顺序重排 QDQ 输入链后再转换。
+        self.reorder_qdq_input_chains_by_graph_order(qdq_path)
+
+        # 转换 QDQ ONNX -> 量化 DLC（AIMET 编码直接进入 DLC，无需 qairt-quantizer）
+        # is_quantized=True 时 convert_onnx_model 自动给 DLC 命名加 _quantized 后缀
+        dlc_model_path = converter.convert_onnx_model(onnx_model_info, set_input_order,
+                                                      input_network_path=qdq_path, is_quantized=True)
+        if dlc_model_path is None:
+            exit(1)
+
+        config_path = converter.write_config_file(dlc_model_path)
+        converter.generate_context_binary_model(dlc_model_path, config_path)
+
+        if converter.accuracy_analyzer is not None and dlc_model_path is not None:
+            # 精度分析 golden：纯浮点 DLC
+            golden_dlc_path = converter.convert_onnx_model(onnx_model_info, set_input_order,
+                                                           input_network_path=str(tmp_onnx_path),
+                                                           output_dlc_name=f"{tmp_onnx_path.stem}_golden")
+
+            converter.accuracy_analyzer.set_model_inof(onnx_model_info, golden_dlc_path, dlc_model_path)
+            return_code = converter.accuracy_analyzer.accuracy_analysis(mean_rgb, std_rgb, set_input_order)
+
+            if return_code == 0:
+                print("Accuracy analysis completed successfully.")
+            else:
+                print("Accuracy analysis failed.")
+
+    def generate_calibration_inputs(self, onnx_model_info:dict, set_input_order:str):
+        """生成 AIMET 校准输入（始终为 NCHW）。
+
+        优先级：1) custom_alibration_data_path（.raw，布局由 set_input_order 解释，
+        'nhwc' 先按 NHWC reshape 再转 NCHW）；2) dataset_path（图片 letterbox NCHW）；
+        3) 都没有 -> 报错。
+
+        Args:
+            onnx_model_info: ONNX 模型信息（含 inputs，用于输入名 / shape）。
+            set_input_order: 输入布局，'nhwc'/'nchw'（决定 .raw 的 reshape 与转置）。
+
+        Yields:
+            每个样本为 {输入名: np.ndarray}（NCHW）。
+        """
+        converter = self.converter
+        input_infos = onnx_model_info["inputs"]
+        needs_nhwc_to_nchw = (set_input_order == 'nhwc')
+
+        # 1) 自定义 .raw 校准数据
+        if converter.custom_alibration_data_path is not None:
+            raw_dir = Path(converter.custom_alibration_data_path).parent
+            with open(str(converter.custom_alibration_data_path)) as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+            for line in lines:
+                raws = [p for p in line.split(' ') if p]
+                if len(raws) != len(input_infos):
+                    print(f"Warning: line has {len(raws)} files but model has {len(input_infos)} inputs, skipped")
+                    continue
+                sample = {}
+                for idx, info in enumerate(input_infos):
+                    model_shape = [d if d != 'dynamic' else 1 for d in info['shape']]
+                    p = Path(raws[idx])
+                    if not p.is_absolute():
+                        p = raw_dir / p
+                    arr = np.fromfile(str(p), dtype=np.float32)
+                    # 自定义 .raw 布局由 set_input_order 决定：
+                    #   'nhwc' -> 用户数据为 NHWC [N,H,W,C]，先按 NHWC reshape 再转 NCHW
+                    #   'nchw' -> 用户数据即 NCHW，直接 reshape 为模型输入 shape
+                    if needs_nhwc_to_nchw and len(model_shape) == 4:
+                        target_shape = [model_shape[0], model_shape[2], model_shape[3], model_shape[1]]
+                    else:
+                        target_shape = model_shape
+                    try:
+                        arr = arr.reshape(target_shape)
+                    except ValueError:
+                        print(f"Warning: {p} cannot be reshaped to {target_shape}, skipped")
+                        sample = {}
+                        break
+                    if needs_nhwc_to_nchw and len(model_shape) == 4:
+                        arr = np.transpose(arr, (0, 3, 1, 2))
+                    sample[info['name']] = np.ascontiguousarray(arr)
+                if sample:
+                    yield sample
+            return
+
+        # 2) 图片数据集
+        if converter.dataset_path is not None:
+            dataset_dir = converter.dataset_path.parent
+            with open(str(converter.dataset_path)) as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+            for line in lines:
+                img_paths = [p for p in line.split(' ') if p]
+                if len(img_paths) != len(input_infos):
+                    print(f"Warning: line has {len(img_paths)} images but model has {len(input_infos)} inputs, skipped")
+                    continue
+                sample = {}
+                for idx, info in enumerate(input_infos):
+                    shape = info['shape']
+                    if len(shape) != 4 or shape[0] != 1:
+                        raise ValueError(f"Unsupported input shape {shape} for input {info['name']}")
+                    height, width = shape[2], shape[3]
+                    p = Path(img_paths[idx])
+                    if not p.is_absolute():
+                        p = dataset_dir / p
+                    img = cv2.imread(str(p))
+                    if img is None:
+                        print(f"Warning: could not read {p}")
+                        sample = {}
+                        break
+                    arr = letterbox_image(img, (width, height),
+                                          output_format='nchw',
+                                          output_dtype='float32')
+                    sample[info['name']] = np.ascontiguousarray(arr)
+                if sample:
+                    yield sample
+            return
+
+        # 3) 未提供任何校准数据：直接报错（随机 dummy 无法反映真实分布，量化编码无意义）
+        raise ValueError(
+            "No calibration data provided for AIMET quantization. "
+            "Provide dataset_path or call use_custom_alibration_data(path) "
+            "before convert()."
+        )
+
+    @staticmethod
+    def reorder_qdq_input_chains_by_graph_order(qdq_model_path:str, aggressive:bool=True) -> str:
+        """按 graph.input 顺序重排 QDQ 输入消费链，保证 qairt-converter 推导的 DLC
+        输入顺序与运行时一致（多输入模型，如 lightFC）。仅调整节点顺序、不改数值。
+
+        Args:
+            qdq_model_path: QDQ ONNX 路径（原地重排保存）。
+            aggressive: 是否激进重排（回传 weight_dq 分支优先级）。默认 True。
+
+        Returns:
+            str: 重排后的 QDQ ONNX 路径。
+        """
+        model = onnx.load_model(qdq_model_path)
+        graph = model.graph
+        input_names = [i.name for i in graph.input]
+        init_names = {init.name for init in graph.initializer}
+        real_inputs = [n for n in input_names if n not in init_names]
+        if len(real_inputs) < 2:
+            return qdq_model_path
+
+        model = reorder_onnx_nodes_by_input(model, 5, aggressive=aggressive)
+        model = reorder_onnx_nodes_by_output(model, 10, aggressive=aggressive)
+
+        onnx.checker.check_model(model, full_check=True)
+        onnx.save_model(model, qdq_model_path)
+        print(f"[AIMET] Reordered QDQ input chains to match graph input order: {real_inputs}"
+              f" (aggressive={aggressive})")
+        return qdq_model_path
+
 
 
 class OnnxToQNN:
@@ -222,6 +426,7 @@ class OnnxToQNN:
             "qcs6490": {"dsp_arch": "v68", "soc_id": 35},
             "qcs8550": {"dsp_arch": "v73", "soc_id": 66},
             "qcs9075": {"dsp_arch": "v73", "soc_id": 77},
+            "SC8280X": {"dsp_arch": "v68", "soc_id": 37},
         }
 
         if target_platform not in self.architecture_dict.keys():
@@ -244,8 +449,77 @@ class OnnxToQNN:
         self.accuracy_analyzer = None
         self.hybrid_quantizer = None
 
+        # AIMET 2.x 量化路径连接器（set_use_aimet 创建，None 表示未启用）
+        self.aimet_connector = None
+
         self.set_quantization_method()
         self.use_custom_alibration_data()
+
+    def set_quantization_method(self, param_quant_method:str='percentile', act_quant_method:str='entropy', bitwidth:str='w8a8', bias_bitwidth:int=8,
+                                param_quant_schema:str='asymmetric', act_quant_schema:str='asymmetric', use_cle_algorithm:bool=False):
+        """
+        Configure quantization parameters for the model.
+        
+        Args:
+            param_quant_method (str): Quantization method for model parameters (weights).
+                - Available options: 'min-max', 'sqnr', 'percentile', 'mse', 'entropy'.
+                - Default: 'percentile'.
+
+            act_quant_method (str): Quantization method for activations.
+                - Available options: 'min-max', 'sqnr', 'percentile', 'mse', 'entropy'.
+                - Default: 'entropy'.
+
+            bitwidth (str): Quantization bitwidth configuration in format 'w<W>a<A>', 
+                where W is weight bitwidth and A is activation bitwidth.
+                - Available options: 'w4a8', 'w4a16', 'w8a8', 'w8a16', 'w16a16'.
+                - Default: 'w8a8'.
+
+            bias_bitwidth (int): Bitwidth for bias quantization.
+                - Available options: 8, 32.
+                - Default: 8.
+
+            param_quant_schema (str): Parameter(weight) quantization schema
+                - Available options: 'asymmetric', 'symmetric', 'unsignedsymmetric'.
+                - Default: 'asymmetric'.
+
+            act_quant_schema (str): Activation quantization schema
+                - Available options: 'asymmetric', 'symmetric', 'unsignedsymmetric'.
+                - Default: 'asymmetric'.
+            use_cle_algorithm (bool): Whether to use the Cross Layer Equalization algorithm for quantization.
+        """
+
+        if param_quant_method not in ['min-max', 'sqnr', 'percentile', 'mse', 'entropy']:
+            raise ValueError('param_quantization_method must be one of min-max, sqnr, percentile, mse, entropy')
+        
+        if act_quant_method not in ['min-max', 'sqnr', 'percentile', 'mse', 'entropy']:
+            raise ValueError('act_quantization_method must be one of min-max, sqnr, percentile, mse, entropy')
+        
+        if bitwidth not in ['w4a8', 'w4a16', 'w8a8', 'w8a16', 'w16a16']:
+            raise ValueError('bitwidth must be one of w4a8, w4a16, w8a8, w8a16, w16a16')
+        
+        if bias_bitwidth not in [8, 32]:
+            raise ValueError('bias_bitwidth must be 8 or 32')
+
+        if param_quant_schema not in ['asymmetric', 'symmetric', 'unsignedsymmetric']:
+            raise ValueError('param_quant_schema must be one of asymmetric, symmetric, unsignedsymmetric')
+        
+        if act_quant_schema not in ['asymmetric', 'symmetric', 'unsignedsymmetric']:
+            raise ValueError('act_quant_schema must be one of asymmetric, symmetric, unsignedsymmetric')
+        
+
+        self.param_quant_method = param_quant_method
+        self.act_quant_method = act_quant_method
+
+        self.weights_bitwidth, self.act_bitwidth = parse_bitwidth(bitwidth)
+
+        self.bias_bitwidth = bias_bitwidth
+        self.param_quant_schema = param_quant_schema
+
+        self.act_quant_schema = act_quant_schema
+        self.use_cle_algorithm = use_cle_algorithm
+        
+        print(f"Quantization method has been set to param_quant_method={self.param_quant_method}, act_quant_method={self.act_quant_method}, bitwidth={self.weights_bitwidth}w{self.act_bitwidth}a"
+              f", schema: act={self.act_quant_schema}, param={self.param_quant_schema}, use_cle_algorithm={self.use_cle_algorithm}")
 
     def use_custom_alibration_data(self, custom_alibration_data_path:str|None=None):
         """
@@ -272,50 +546,7 @@ class OnnxToQNN:
         else:
             self.custom_alibration_data_path = Path(custom_alibration_data_path).resolve()
 
-    def set_quantization_method(self, param_quant_method:str='percentile', act_quant_method:str='entropy', bitwidth:str='w8a8', bias_bitwidth:int=8):
-        """
-        Configure quantization parameters for the model.
-        
-        Args:
-            param_quant_method (str): Quantization method for model parameters (weights).
-                - Available options: 'min-max', 'sqnr', 'percentile', 'mse', 'entropy'.
-                - Default: 'percentile'.
-
-            act_quant_method (str): Quantization method for activations.
-                - Available options: 'min-max', 'sqnr', 'percentile', 'mse', 'entropy'.
-                - Default: 'entropy'.
-
-            bitwidth (str): Quantization bitwidth configuration in format 'w<W>a<A>', 
-                where W is weight bitwidth and A is activation bitwidth.
-                - Available options: 'w4a8', 'w4a16', 'w8a8', 'w8a16', 'w16a16'.
-                - Default: 'w8a8'.
-
-            bias_bitwidth (int): Bitwidth for bias quantization.
-                - Available options: 8, 32.
-                - Default: 8.
-        """
-
-        if param_quant_method not in ['min-max', 'sqnr', 'percentile', 'mse', 'entropy']:
-            raise ValueError('param_quantization_method must be one of min-max, sqnr, percentile, mse, entropy')
-        
-        if act_quant_method not in ['min-max', 'sqnr', 'percentile', 'mse', 'entropy']:
-            raise ValueError('act_quantization_method must be one of min-max, sqnr, percentile, mse, entropy')
-        
-        if bitwidth not in ['w4a8', 'w4a16', 'w8a8', 'w8a16', 'w16a16']:
-            raise ValueError('bitwidth must be one of w4a8, w4a16, w8a8, w8a16, w16a16')
-        
-        if bias_bitwidth not in [8, 32]:
-            raise ValueError('bias_bitwidth must be 8 or 32')
-        
-        self.param_quant_method = param_quant_method
-        self.act_quant_method = act_quant_method
-        bw_match = re.match(r'w(\d+)a(\d+)', bitwidth)
-        self.weights_bitwidth = int(bw_match.group(1))  # 提取w后面的完整数字
-        self.act_bitwidth = int(bw_match.group(2))  
-        self.bias_bitwidth = bias_bitwidth
-        print(f"Quantization method has been set to param_quant_method={self.param_quant_method}, act_quant_method={self.act_quant_method}, bitwidth={self.weights_bitwidth}w{self.act_bitwidth}a")
-
-    def do_hybrid_quantization(self, custom_hybrid:list[list[str]], weights_bitwidth:int=8, act_bitwidth:int=16, bias_bitwidth:int=8, float_bitwidth:int|None=None):
+    def do_hybrid_quantization(self, custom_hybrid:list[list[str, str]], bitwidth:str="w8a16", bias_bitwidth:int=8, float_bitwidth:int|None=None):
         """
         设置混合量化(与 onnx_to_rknn.py 的 do_hybrid_quantization 一致)：
         通过子图的输入张量与输出张量指定区域，自动识别两者之间的所有节点，
@@ -333,14 +564,67 @@ class OnnxToQNN:
                 表示一个混合量化子图：输入张量与输出张量之间的所有节点被选中。
                 可传入多个子图，例如 [[in1, out1], [in2, out2]]。
                 张量名也可以是节点名(自动取该节点的输出张量作为边界)。
-            weights_bitwidth (int): 整数模式下区域内的权重位宽，可选 4/8/16。默认 8。
-            act_bitwidth (int): 整数模式下区域内的激活位宽，可选 8/16。默认 16。
+
+            bitwidth (str): Quantization bitwidth configuration in format 'w<W>a<A>', 
+                where W is weight bitwidth and A is activation bitwidth.
+                - Available options: 'w4a8', 'w4a16', 'w8a8', 'w8a16', 'w16a16'.
+                - Default: 'w8a16'.
+
             bias_bitwidth (int): 整数模式下区域内的偏置位宽，可选 8/32。默认 8。
             float_bitwidth (int | None): 若设置(16/32)，区域保持浮点(FP16/FP32)，
                 此时忽略三个整数位宽参数。默认 None 表示使用整数混合量化。
         """
 
+        weights_bitwidth, act_bitwidth = parse_bitwidth(bitwidth)
         self.hybrid_quantizer = QnnHybridQuantGen(custom_hybrid, weights_bitwidth, act_bitwidth, bias_bitwidth, float_bitwidth)
+
+    def set_use_aimet(self, quant_method:str='tf_enhanced', bitwidth:str="w8a8", param_quant_schema:str='symmetric', act_quant_schema:str='asymmetric',
+                      encoding_version:str='2.0.0'):
+        """启用 AIMET 2.x 量化路径（替代 QAIRT 自带的 qairt-quantizer 校准）。
+
+        启用后 convert() 流程变为：
+            ONNX（已烘焙归一化）-> AIMET PTQ 量化 -> QDQ ONNX + encodings
+            -> qairt-converter 直接转量化 DLC -> context binary
+
+        只创建并保存 QnnAimetConnector 连接器；AIMET 量化、QDQ 输入链重排、
+        DLC 转换、精度分析等具体流程封装在连接器内（参数说明见连接器）。
+
+        Args:
+            quant_method: AIMET 方案 'min_max'/'tf_enhanced'/'percentile'
+                （含别名 'min-max'/'minmax'/'tf'/'tf-enhanced'）。默认 'tf_enhanced'。
+            bitwidth: AIMET 全局位宽 'w<W>a<A>'，如 'w8a8'/'w8a16'。默认 'w8a8'。
+            param_quant_schema: 权重对称性 'asymmetric'/'symmetric'/'unsignedsymmetric'。
+                默认 'symmetric'。
+            act_quant_schema: 激活对称性 'asymmetric'/'symmetric'/'unsignedsymmetric'。
+                默认 'asymmetric'。
+            encoding_version: AIMET encodings 版本 '0.6.1'/'1.0.0'/'2.0.0'。默认 '2.0.0'。
+
+        说明：
+            - 混合精度不在此传入：先调用 do_hybrid_quantization() 指定子图与精度，
+              本方法在 convert 时自动读取。
+            - quantsim config 无需手动指定：按 self.target_platform 的 dsp_arch
+              自动选用对应 HTP config（'htp_v68'/'htp_v73'...），贴合目标硬件。
+            - set_quantization_method 中 param/act 校准方法会映射为 AIMET 方案，
+              但优先级低于这里显式传入的 quant_method。
+        """
+        # 创建连接器：归一化量化方案别名（'min-max' -> 'min_max'、'tf' -> 'tf_enhanced' 等）
+        # 在 QnnAimetConnector.__init__ 内尽早校验并统一存储；混合精度由连接器在
+        # convert 时通过 current_hybrid_config() 实时读取（与 do_hybrid_quantization
+        # 的调用顺序无关，即使在其之前调用也能生效）。
+        # 根据目标平台 DSP 架构自动选用 AIMET HTP quantsim config（'htp_v68'/'htp_v73'...），
+        # 针对 HTP 后端做算子级量化约束优化（比默认 default_config 更贴合目标硬件）。
+        dsp_arch = self.architecture_dict[self.target_platform]["dsp_arch"]
+        config_file = f"htp_{dsp_arch}"
+
+        self.aimet_connector = QnnAimetConnector(
+            self,
+            quant_method=quant_method,
+            bitwidth=bitwidth,
+            param_quant_schema=param_quant_schema,
+            act_quant_schema=act_quant_schema,
+            encoding_version=encoding_version,
+            config_file=config_file,
+        )
 
     def set_do_accuracy_analysis(self, accuracy_analysis_picture_list:list[str]|None=None):
         """
@@ -372,38 +656,40 @@ class OnnxToQNN:
                 - Defaults to 'nhwc'.
         """
 
+        # 1.
         self.run_env_script()
 
+        # 2.
         self.modify_onnx_model(mean_rgb, std_rgb)
 
+        # 3.
         onnx_model_info = self.get_onnx_model_info(self.tmp_onnx_path)
         if onnx_model_info is None:
             exit(1)
 
-        quantization_overrides_path = None
-        golden_dlc_path = None
+        # 4.1 AIMET 2.x 量化路径：AIMET 量化出 QDQ ONNX -> qairt-converter 转量化 DLC
+        if self.aimet_connector is not None:
+            self.aimet_connector.convert(onnx_model_info, mean_rgb, std_rgb, set_input_order)
+            return
+
+        # 4.2
         if self.hybrid_quantizer is not None:
             quantization_overrides_path = self.hybrid_quantizer.generate_hybrid_quantization_overrides(self.tmp_onnx_path)
-            if quantization_overrides_path is None:
-                exit(1)
+        else:
+            quantization_overrides_path = None
 
-            # 混合量化时，精度分析的 golden 参考必须使用纯浮点 DLC：
-            # 带混合量化编码(如 16-bit)的未量化 DLC 无法在 x86 CPU 的 --stage converted 阶段执行
-            # (报 "No backend could validate")，会导致 golden 输出无法生成、精度分析失败。
-            golden_dlc_path = self.convert_onnx_model(onnx_model_info, set_input_order, None, output_dlc_name=f"{self.tmp_onnx_path.stem}_golden")
-
-
+        # 5.
         dlc_model_path = self.convert_onnx_model(onnx_model_info, set_input_order, quantization_overrides_path)
         if dlc_model_path is None:
             exit(1)
 
-        calibration_data_index_path = None
-        if self.custom_alibration_data_path is None:
-            if self.dataset_path:
-                calibration_data_index_path = self.generate_calibration_data(onnx_model_info, set_input_order)
+        # 6.
+        if self.dataset_path is not None and self.custom_alibration_data_path is None:
+            calibration_data_index_path = self.generate_calibration_data(onnx_model_info, set_input_order)
         else:
             calibration_data_index_path = self.custom_alibration_data_path
 
+        # 7.
         if calibration_data_index_path is not None:
             quantized_dlc_model_path = self.quantize_model(dlc_model_path, calibration_data_index_path)
         else:
@@ -412,19 +698,22 @@ class OnnxToQNN:
         if quantized_dlc_model_path is None:
             exit(1)
 
-
+        # 8.
         config_path = self.write_config_file(dlc_model_path)
 
+        # 9.
         self.generate_context_binary_model(quantized_dlc_model_path, config_path)
 
+        # 10. accuracy_analyze
         if self.accuracy_analyzer is not None and quantized_dlc_model_path is not None:
-            golden_dlc_path = golden_dlc_path or dlc_model_path
+            if self.hybrid_quantizer is None:
+                golden_dlc_path = dlc_model_path
+            else:
+                # 混合量化时，精度分析的 golden 参考必须使用纯浮点 DLC：
+                golden_dlc_path = self.convert_onnx_model(onnx_model_info, set_input_order, None, output_dlc_name=f"{self.tmp_onnx_path.stem}_golden")
+
             self.accuracy_analyzer.set_model_inof(onnx_model_info, golden_dlc_path, quantized_dlc_model_path)
-
             return_code = self.accuracy_analyzer.accuracy_analysis(mean_rgb, std_rgb, set_input_order)
-
-            self.file_or_dir_to_clean.append(str(self.accuracy_analyzer.working_dir))
-            self.file_or_dir_to_clean.append(str(self.tmp_dir / "working_directory"))
 
             if return_code == 0:
                 print("Accuracy analysis completed successfully.")
@@ -432,28 +721,11 @@ class OnnxToQNN:
                 print("Accuracy analysis failed.")
 
     def clean(self):
-        file_count = 0
-        dir_count = 0
+        """清理本次转换产生的临时文件/目录: file_or_dir_to_clean 中登记的项"""
+        clean_files_or_dirs(self.file_or_dir_to_clean)
 
-        for file_or_dir in self.file_or_dir_to_clean:
-            try:
-                if os.path.isfile(file_or_dir):
-                    os.remove(file_or_dir)
-                    file_count += 1
-
-                elif os.path.isdir(file_or_dir):
-                    # 统计目录中的文件数量
-                    for root, dirs, files in os.walk(file_or_dir):
-                        file_count += len(files)
-                        dir_count += len(dirs)
-                    
-                    shutil.rmtree(file_or_dir) # 删除目录
-                    dir_count += 1  # 加上被删除的目录本身
-
-            except Exception as e:
-                print(f"failed to delete {file_or_dir} due to {e}")
-
-        print(f"cleaned {file_count} files and {dir_count} dirs")
+        if self.accuracy_analyzer:
+            self.accuracy_analyzer.clean()
 
 
     @staticmethod
@@ -512,77 +784,14 @@ class OnnxToQNN:
         
         model = onnx.load_model(str(self.model_path))
 
-        # 检查是否需要归一化
-        need_mean_normalization = False
-        need_std_normalization = False
-        
-        # 检查均值是否不为0
-        for mean in mean_rgb:
-            if not np.allclose(np.array(mean, np.float32).flatten(), 0.0):
-                need_mean_normalization = True
-                break
-        
-        # 检查标准差是否不为1
-        for std in std_rgb:
-            if not np.allclose(np.array(std, np.float32).flatten(), 1.0):
-                need_std_normalization = True
-        
-
-        if need_mean_normalization or need_std_normalization:
-            nodes_to_add = []
-            initializers_to_add = []
-
-            # 获取原始输入信息
-            for index, input_node in enumerate(model.graph.input):
-                input_name = input_node.name
-
-                input_mean = np.array(mean_rgb[index], np.float32)
-                input_std = np.array(std_rgb[index], np.float32)
-                channel_num = len(input_mean)
-
-                # 用 1x1 卷积实现归一化: y = (x - mean) / std = x * (1/std) - mean/std
-                # 权重为对角矩阵 diag(1/std)，偏置为 -mean/std
-                conv_weight = (np.diag(1.0 / input_std)).astype(np.float32).reshape(channel_num, channel_num, 1, 1)
-                conv_bias = (-input_mean / input_std).astype(np.float32)
-
-                weight_tensor = onnx.numpy_helper.from_array(conv_weight, name=f"{input_name}_norm_weight")
-                bias_tensor = onnx.numpy_helper.from_array(conv_bias, name=f"{input_name}_norm_bias")
-
-                conv_output = f"{input_name}_normalized"
-                conv_node = onnx.helper.make_node(
-                    'Conv',
-                    inputs=[input_name, weight_tensor.name, bias_tensor.name],
-                    outputs=[conv_output],
-                    name=f"{input_name}_Normalization_Conv"
-                )
-
-                nodes_to_add.append(conv_node)
-                initializers_to_add.append(weight_tensor)
-                initializers_to_add.append(bias_tensor)
-
-                # 更新所有使用原始输入的节点
-                # (新节点尚未插入 graph，因此这里无需像原来那样跳过自身)
-                for node in model.graph.node:
-                    for i, node_input in enumerate(node.input):
-                        if node_input == input_name:
-                            node.input[i] = conv_output
-
-
-            nodes_to_add.reverse()
-            initializers_to_add.reverse()
-
-            for node in nodes_to_add:
-                model.graph.node.insert(0, node)
-            for initializer in initializers_to_add:
-                model.graph.initializer.insert(0, initializer)
-
+        # 归一化
+        model = normalize_onnx_model(model, mean_rgb, std_rgb)
 
         model = reorder_onnx_nodes_by_input(model, 5)
         model = reorder_onnx_nodes_by_output(model, 10)
 
         onnx.checker.check_model(model, full_check=True)
         model = onnx.shape_inference.infer_shapes(model, check_type=True, strict_mode=True)
-
 
         # 复制ONNX文件到tmp目录
         onnx.save_model(model, str(self.tmp_onnx_path))
@@ -646,7 +855,18 @@ class OnnxToQNN:
 
         return model_info
 
-    def convert_onnx_model(self, onnx_model_info:dict, set_input_order:str, quantization_overrides_path:str|None=None, output_dlc_name:str|None=None) -> str|None:
+    def convert_onnx_model(self, onnx_model_info:dict, set_input_order:str, quantization_overrides_path:str|None=None, output_dlc_name:str|None=None, input_network_path:str|None=None, is_quantized:bool=False) -> str|None:
+        """
+        Args:
+            onnx_model_info (dict): 模型输入输出信息。
+            set_input_order (str): 'nhwc' 或 'nchw'。
+            quantization_overrides_path (str | None): QAIRT quantization_overrides JSON。
+            output_dlc_name (str | None): 输出 DLC 文件名（不含后缀）。
+            input_network_path (str | None): 输入 ONNX 路径；None 使用 self.tmp_onnx_path。
+            is_quantized (bool): 输入是否为已量化(QDQ) ONNX。True 时不再追加
+                --float_bitwidth（QDQ 模型自带编码），且未指定 output_dlc_name 时
+                输出名自动带 _quantized 后缀（与 QAIRT 标准路径 quantize_model 一致）。
+        """
         layout_params = [] # 构建输入布局参数
         for input_info in onnx_model_info.get("inputs"): 
             input_name = input_info["name"]
@@ -659,9 +879,9 @@ class OnnxToQNN:
         layout_args = " ".join(layout_params) # 将布局参数拼接成字符串
 
 
-        extra_args = "--target_backend HTP --onnx_skip_simplification" # --onnx_summary' # --preserve_onnx_output_order
+        extra_args = "--target_backend HTP --onnx_skip_simplification " # --onnx_summary' # --preserve_onnx_output_order
 
-        if not self.dataset_path and not self.custom_alibration_data_path:
+        if not is_quantized and not self.dataset_path and not self.custom_alibration_data_path:
             extra_args += " --float_bitwidth 16"
 
         if quantization_overrides_path:
@@ -675,12 +895,19 @@ class OnnxToQNN:
                     extra_args += f" --float_bitwidth {hybrid_quantization_dict['weights_bitwidth']}"
 
 
+        if output_dlc_name is None and is_quantized:
+            # 量化(QDQ) DLC 自动带 _quantized 后缀（与 QAIRT 标准路径 quantize_model 输出一致）
+            output_dlc_name = f"{self.tmp_onnx_path.stem}_quantized"
+
         if output_dlc_name is not None:
             dlc_path = self.tmp_onnx_path.parent / f"{output_dlc_name}.dlc"
         else:
             dlc_path = self.tmp_onnx_path.with_suffix('.dlc')
 
-        command = f"qairt-converter --input_network {str(self.tmp_onnx_path)} {layout_args} {extra_args} -o {dlc_path}"
+        if input_network_path is None:
+            input_network_path = str(self.tmp_onnx_path)
+
+        command = f"qairt-converter --input_network {input_network_path} {layout_args} {extra_args} -o {dlc_path}"
 
         return_code = self.run_subprocess(command)
         
@@ -773,7 +1000,7 @@ class OnnxToQNN:
                     img_float = letterbox_image(
                         img,
                         (width, height),
-                        output_format=('nchw' if set_input_order == 'nchw' else 'nhwc'),
+                        output_format=set_input_order,
                         output_dtype='float32',
                     )
 
@@ -853,7 +1080,10 @@ class OnnxToQNN:
         quantize_args += f' --use_per_channel_quantization'
         quantize_args += f' --param_quantizer_calibration {self.param_quant_method}'
         quantize_args += f' --act_quantizer_calibration {self.act_quant_method}'
-        quantize_args += " --algorithms cle"
+        quantize_args += f" --param_quantizer_schema {self.param_quant_schema}"
+        quantize_args += f" --act_quantizer_schema {self.act_quant_schema}"
+        if self.use_cle_algorithm:
+            quantize_args += " --use_cle_algorithm"
 
         extra_args = f'{quantize_args} --target_backend HTP'
         
@@ -879,12 +1109,13 @@ class OnnxToQNN:
         config_file_path = dlc_model_file.parent / "config_file.json"
 
         architecture_config = self.architecture_dict[self.target_platform]
+        graph_name = Path(dlc_model_path).stem # self.tmp_onnx_path.stem 
 
         # 创建配置字典
         config_backend = {
             "graphs": [
                 {
-                    "graph_names": [self.tmp_onnx_path.stem],  # 获取不带后缀的文件名
+                    "graph_names": [graph_name],
                     "vtcm_mb": 0
                 }
             ],

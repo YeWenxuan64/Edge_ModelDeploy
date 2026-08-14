@@ -8,6 +8,7 @@ fast-histogram>=0.11
 
 numpy<2.0
 scipy
+pandas
 matplotlib
 
 

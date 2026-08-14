@@ -278,9 +278,6 @@ class GenYoloCroppedDataset:
             # 裁剪并保存
             cropped = image[y1:y2, x1:x2]
 
-            cv2.imshow("Cropped Image", cropped)
-            cv2.waitKey(1)
-
             output_path = os.path.join(output_dir, f"{image_name}_crop_{i}.jpg")
             cv2.imwrite(output_path, cropped)
                 
@@ -342,7 +339,8 @@ class GenYoloCroppedDataset:
                 if cropped_paths:
                     for cropped_path in cropped_paths:
                         all_cropped_paths.append([image_path, cropped_path])
-        cv2.destroyAllWindows()
+
+        cv2.destroyWindow("Detection Results")
 
         original_all_cropped_paths = deepcopy(all_cropped_paths)
         new_all_cropped_paths = deepcopy(all_cropped_paths)

@@ -161,12 +161,15 @@ converter = OnnxToQNN(
     target_platform='qcs6490'             # 'qcs6490' / 'qcs8550' / 'qcs9075'
 )
 
-# 可选：量化配置
+# 可选：量化配置（各参数均有默认值，按需修改）
 converter.set_quantization_method(
-    param_quant_method='entropy',    # 'min-max' / 'sqnr' / 'percentile' / 'mse' / 'entropy'
-    act_quant_method='entropy',
-    bitwidth='w8a8',                 # 'w4a8' / 'w4a16' / 'w8a8' / 'w8a16' / 'w16a16'
-    bias_bitwidth=8                  # 8 或 32
+    param_quant_method='percentile', # 权重量化算法: 'min-max' / 'sqnr' / 'percentile' / 'mse' / 'entropy'（默认 percentile）
+    act_quant_method='entropy',      # 激活量化算法: 'min-max' / 'sqnr' / 'percentile' / 'mse' / 'entropy'（默认 entropy）
+    bitwidth='w8a8',                 # 'w4a8' / 'w4a16' / 'w8a8' / 'w8a16' / 'w16a16'（默认 w8a8）
+    bias_bitwidth=8,                 # 偏置位宽: 8 或 32
+    param_quant_schema='asymmetric', # 权重对称性: 'asymmetric' / 'symmetric' / 'unsignedsymmetric'
+    act_quant_schema='asymmetric',   # 激活对称性: 'asymmetric' / 'symmetric' / 'unsignedsymmetric'
+    use_cle_algorithm=False          # 是否启用跨层均衡（CLE）
 )
 
 # 可选：使用自定义校准数据（.raw 格式）
@@ -176,15 +179,14 @@ converter.set_quantization_method(
 
 # 可选：混合精度量化（部分敏感子图使用更高精度，其余仍按全局设置量化为 INT8）
 # 两种模式（二选一）：
-# 1) 整数混合量化：指定区域内权重 / 激活 / 偏置的整数位宽
+# 1) 整数混合量化：指定区域内的位宽 'w<W>a<A>'
 #    e.g. 全局 w8a8、区域内 w8a16（权重 8bit，激活 16bit）
 # converter.do_hybrid_quantization(
 #     custom_hybrid=[['子图输入张量名', '子图输出张量名']],
-#     weights_bitwidth=8,   # 区域内权重位宽: 4 / 8 / 16
-#     act_bitwidth=16,      # 区域内激活位宽: 8 / 16
+#     bitwidth='w8a16',     # 区域内位宽: 'w4a8' / 'w4a16' / 'w8a8' / 'w8a16' / 'w16a16'（默认 w8a16）
 #     bias_bitwidth=8       # 区域内偏置位宽: 8 / 32
 # )
-# 2) 浮点保留：指定区域内保持 FP16 / FP32 浮点精度（此时忽略上述三个整数参数）
+# 2) 浮点保留：指定区域内保持 FP16 / FP32 浮点精度（此时忽略 bitwidth / bias_bitwidth）
 # converter.do_hybrid_quantization(
 #     custom_hybrid=[['子图输入张量名', '子图输出张量名']],
 #     float_bitwidth=16     # 16 = FP16 / 32 = FP32
@@ -213,7 +215,7 @@ QNN 混合量化通过 `do_hybrid_quantization()` 指定一个或多个**子图*
 
 | 模式 | 关键参数 | 区域精度 | 适用场景 |
 |------|---------|---------|---------|
-| **整数混合量化**（默认） | `weights_bitwidth` / `act_bitwidth` / `bias_bitwidth` | 区域内权重 / 激活 / 偏置为整数位宽（如 w8a16） | 精度敏感但无需浮点，HTP 上性能与精度兼顾 |
+| **整数混合量化**（默认） | `bitwidth` / `bias_bitwidth` | 区域内权重 / 激活 / 偏置为整数位宽（如 w8a16） | 精度敏感但无需浮点，HTP 上性能与精度兼顾 |
 | **浮点保留** | `float_bitwidth=16/32` | 区域内保持 FP16 / FP32 浮点 | 精度极度敏感的层，可接受更高计算开销 |
 
 **子图边界的确定：**
@@ -222,17 +224,122 @@ QNN 混合量化通过 `do_hybrid_quantization()` 指定一个或多个**子图*
 - 可同时传入多个子图，例如 `[[in1, out1], [in2, out2]]`
 - 建议先做**精度分析**（见 [量化精度分析指南](./ACCURACY_ANALYSIS_TOOLUSE.md)）定位余弦相似度偏低的层，再对其所在子图做混合量化
 
+### 可选：接入 AIMET 外置量化器
+
+`OnnxToQNN` 也可以用 **AIMET 2.x** 作为外置量化路径（代替 QAIRT 自带的 `qairt-quantizer`），用法见 [3.3 `AimetOnnxQuantizer`](#33-aimetonnxquantizer--onnx-转-量化onnx-兼-qualcomm-qnn-外置量化器) 末尾的「接入 QNN」。
 
 
-> **关于 `mean_rgb` 与 `std_rgb`（输入归一化参数）：**
-> 
-> 这两个参数定义了模型输入的正规化公式：**`normalized_input = (input - mean) / std`**
-> 
-> | 转换工具 | 归一化实现方式 |
-> |---------|--------------|
-> | **OnnxToRKNN** | 通过 `rknn.config(mean_values=..., std_values=...)` 将归一化参数写入 RKNN 模型配置，由 **NPU 硬件在推理时自动完成**，不修改 ONNX 图 |
-> | **OnnxToQNN** | 直接在 ONNX 模型图中插入 **Sub（减均值）和 Div（除标准差）节点**，将归一化烘焙进模型结构后再转换 |
-> 
+
+## 3.3 `AimetOnnxQuantizer` — ONNX 转 QDQ-ONNX 兼 Qualcomm QNN 外置量化器
+
+**AIMET**（Qualcomm AI Model Efficiency Toolkit，`utilities/onnx_aimet_quant.py`）是一个**独立的 ONNX 后训练量化（PTQ）量化器**，不只是 QNN 量化的附属：
+- **独立使用**：直接对任意 ONNX 模型做 PTQ，导出 QDQ ONNX + encodings（可用于 ONNX 部署 / 转其他后端）。
+- **辅助 QNN**：通过 `OnnxToQNN.set_use_aimet()` 作为 QNN 的外置量化器（见 [3.3 接入 QNN](#接入-qnn作为-onnxtoqnn-的外置量化器)）。
+
+支持 TF-Enhanced / Percentile / Sequential MSE 等 PTQ 方案、子图混合精度、CLE（跨层均衡）、精度分析。
+
+### 独立量化 ONNX
+
+```python
+from utilities.onnx_aimet_quant import AimetOnnxQuantizer
+
+quantizer = AimetOnnxQuantizer(
+    model_path='models/yourmodel.onnx',             # 输入 FP32 ONNX
+    quantized_model_path='models/yourmodel_q.onnx', # 输出 QDQ ONNX（None 默认同目录）
+    dataset_path='datasets/datasets.txt',           # 校准图片列表 txt（必须提供）
+    config_file=None,                               # AIMET quantsim_config 路径或别名（'default'/'htp_v68'...）
+    fold_batch_norms=True,                          # 是否先做 BatchNorm 折叠
+)
+
+quantizer.set_quantization_method(
+    quant_method='tf_enhanced',      # 'min_max'/'tf_enhanced'/'percentile'（含别名）；'sequential_mse' 启用 SeqMSE
+    bitwidth='w8a8',                 # 'w4a8'/'w4a16'/'w8a8'/'w8a16'/'w16a16'
+    param_quant_schema='symmetric',  # 权重对称性 'asymmetric'/'symmetric'/'unsignedsymmetric'
+    act_quant_schema='asymmetric',   # 激活对称性 'asymmetric'/'symmetric'/'unsignedsymmetric'
+    use_cle_algorithm=False,         # 是否启用跨层均衡（CLE + HighBiasFold）
+)
+
+# 可选：子图混合精度（子图内更高精度，其余按全局位宽）
+# quantizer.do_hybrid_quantization(
+#     custom_hybrid=[['子图输入张量名', '子图输出张量名']],
+#     bitwidth='w8a16',              # 子图内位宽
+#     float_bitwidth=None,           # 16/32 = 子图保持 FP16/FP32
+# )
+# 可选：精度分析（FP32 vs 量化输出对比）
+# quantizer.set_do_accuracy_analysis(['img1.jpg'])
+
+# 执行：数据集校准 -> AIMET 量化 -> 导出 QDQ ONNX + encodings
+qdq_path, enc_path = quantizer.convert(
+    mean_rgb=[[0, 0, 0]], std_rgb=[[1, 1, 1]],     # 输入归一化 (x-mean)/std，语义同 OnnxToQNN
+    normalize_model=True,            # True：把归一化烘焙进模型；False：在校准/验证输入上应用
+    export_encodings=False,          # True：encodings 输出到 QDQ 同目录；False：临时目录（clean() 删除）
+)
+# quantizer.clean()
+
+# 可选：把 AIMET 编码转成 QAIRT quantization_overrides JSON（供 qairt-quantizer 使用）
+# quantizer.export_qairt_overrides()
+```
+
+### 关键参数
+
+| 接口 / 参数 | 说明 |
+|------------|------|
+| `quant_method` | AIMET 量化方案：`min_max` / `tf_enhanced` / `percentile`（含别名 `min-max`/`minmax`/`tf`/`tf-enhanced`）；`sequential_mse` 启用 Sequential MSE（逐层搜索并冻结最优权重编码，内部用 min_max 方案） |
+| `bitwidth` | 全局位宽 `w<W>a<A>`：`w4a8` / `w4a16` / `w8a8` / `w8a16` / `w16a16` |
+| `param_quant_schema` / `act_quant_schema` | 权重 / 激活对称性：`asymmetric` / `symmetric` / `unsignedsymmetric`（权重/bias 经 quantsim_config 配置表应用，激活可独立设符号） |
+| `use_cle_algorithm` | 是否启用 Cross-Layer Equalization（含 HighBiasFold 偏置修正） |
+| `config_file` | AIMET quantsim_config 路径或别名（`default` / `htp_v66`~`htp_v81`）；`None` 用 `default` |
+| `convert()` 的 `mean_rgb` / `std_rgb` | 输入归一化参数，语义与 `OnnxToQNN` / `OnnxToRKNN` 一致（多输入传多个列表） |
+| `convert()` 的 `normalize_model` | `True`：把归一化烘焙进模型（校准输入为原始像素）；`False`：在校准/验证输入上应用 `(x-mean)/std` |
+| `convert()` 的 `export_encodings` | `False`（默认）：encodings 输出到临时目录（`clean()` 删除）；`True`：输出到 QDQ 同目录 |
+
+### 输出产物
+- **QDQ ONNX**（`{quantized_model_path}`）：带 Q/DQ 节点的量化图，可直接 ONNX 部署或转 RKNN / QNN
+- **encodings JSON**（v2.0.0）：量化编码；`export_qairt_overrides()` 可转为 QAIRT `quantization_overrides` JSON
+
+> 数据集 txt 格式与 `OnnxToQNN` / `OnnxToRKNN` 完全一致：每行一个样本、多输入图片路径空格分隔、相对路径基于 txt 所在目录、letterbox 预处理。
+
+### 接入 QNN：作为 `OnnxToQNN` 的外置量化器
+
+AIMET 也可作为 **Qualcomm QNN 的外置量化器**：`OnnxToQNN.set_use_aimet()` 启用后，AIMET 的量化编码直接决定 QNN DLC 的量化，不再调用 QAIRT 自带的 `qairt-quantizer`。
+
+```python
+# 在 converter.convert() 之前启用 AIMET 量化路径
+converter.set_use_aimet(
+    quant_method='tf_enhanced',      # 'min_max' / 'tf_enhanced' / 'percentile'（含别名）
+    bitwidth='w8a8',                 # AIMET 全局位宽 'w<W>a<A>'
+    param_quant_schema='symmetric',  # 权重对称性 'asymmetric'/'symmetric'/'unsignedsymmetric'
+    act_quant_schema='asymmetric',   # 激活对称性 'asymmetric'/'symmetric'/'unsignedsymmetric'
+    encoding_version='2.0.0',        # encodings 版本 '0.6.1'/'1.0.0'/'2.0.0'
+)
+
+converter.convert(
+    mean_rgb=[[123.675, 116.28, 103.53]],
+    std_rgb=[[58.395, 57.12, 57.375]],
+    set_input_order='nhwc'
+)
+```
+
+启用后转换流程变为：**ONNX（已烘焙归一化）→ AIMET PTQ 量化 → QDQ ONNX + encodings → `qairt-converter` 直接转成量化 DLC → context binary**（不再调用 `qairt-quantizer`，量化编码由 AIMET 决定）。
+
+说明：
+- `set_use_aimet` 会自动按 `target_platform` 的 DSP 架构选用对应的 HTP quantsim config（如 `htp_v68` / `htp_v73`），无需手动指定。
+- 子图混合精度仍通过 `do_hybrid_quantization()` 配置，AIMET 路径会自动读取。
+
+
+
+
+## 4. 模型处理相关
+
+**关于 `mean_rgb` 与 `std_rgb`（输入归一化参数）：**
+ 
+这两个参数定义了模型输入的正规化公式：**`normalized_input = (input - mean) / std`**
+
+| 转换工具 | 归一化实现方式 |
+|---------|--------------|
+| **OnnxToRKNN** | 通过 `rknn.config(mean_values=..., std_values=...)` 将归一化参数写入 RKNN 模型配置，由 **NPU 硬件在推理时自动完成**，不修改 ONNX 图 |
+| **OnnxToQNN** | 直接在 ONNX 模型图中插入 **Sub（减均值）和 Div（除标准差）节点**，将归一化烘焙进模型结构后再转换 |
+
 > - 每个内层列表对应一个模型**输入**的 RGB 三通道值（多输入模型需提供多个列表）
 > - 默认值 `mean=[[0,0,0]]`, `std=[[1,1,1]]` 表示不做归一化
 > - 修改后模型的输入数值范围变化: 
@@ -256,12 +363,7 @@ QNN 混合量化通过 `do_hybrid_quantization()` 指定一个或多个**子图*
 > 注：rknn的量化工具是单线程的，所以什么量化算法都较慢。而qnn的量化工具是多线程的，所以什么量化算法都较快
 
 
-## 4. 量化精度分析
-
-转换完成后，可通过精度分析定位量化损失最大的层，指导混合量化优化。详见 **[📊 量化精度分析指南](./ACCURACY_ANALYSIS_TOOLUSE.md)**。
-
-
-## `GenYoloCroppedDataset` — 基于 YOLO 检测的裁剪数据集生成
+### 4.1 `GenYoloCroppedDataset` — 基于 YOLO 检测的裁剪数据集生成
 
 ### 使用场景
 部分多输入模型（如目标跟踪、人脸/物体识别）的工作场景是：一个输入为**完整原图**，另一个输入为**裁剪后的感兴趣区域（ROI）**。如果用未裁剪的图像做量化校准，校准数据与真实推理场景不匹配，会导致量化精度下降。
@@ -335,4 +437,10 @@ dataset_list_path = generator.generate()
 
 若 `swap_image_pair=True`，顺序反转为 `裁剪图 完整图`；若配置了后处理模型，对应侧的路径会替换为推理输出文件路径。
 
+
+
+
+## 5. 量化精度分析
+
+转换完成后，可通过精度分析定位量化损失最大的层，指导混合量化优化。详见 **[📊 量化精度分析指南](./ACCURACY_ANALYSIS_TOOLUSE.md)**。
 
