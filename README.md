@@ -13,6 +13,7 @@
 [![TensorFlow](https://img.shields.io/badge/TensorFlow-2.0+-FF6F00?logo=tensorflow)](https://www.tensorflow.org/)
 [![RKNN](https://img.shields.io/badge/Rockchip-RKNN-EC6F16)](https://github.com/airockchip/rknn-toolkit2)
 [![QNN](https://img.shields.io/badge/Qualcomm-QNN%20(HTP)-31017D?logo=qualcomm)](https://www.qualcomm.com/developer/software/qualcomm-ai-engine-direct-sdk)
+[![AIMET](https://img.shields.io/badge/Qualcomm-AIMET-2853DC?logo=qualcomm)](https://github.com/quic/aimet)
 [![License](https://img.shields.io/badge/License-MIT-brightgreen)](LICENSE)
 
 ⚠️Pre-release Warning⚠️
