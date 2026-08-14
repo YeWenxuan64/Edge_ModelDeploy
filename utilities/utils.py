@@ -2,6 +2,7 @@ import os
 import re
 import random
 import heapq
+import shutil
 from pathlib import Path
 from collections import defaultdict, deque
 import onnx  # 仅用于类型注解
@@ -16,6 +17,81 @@ from collections import defaultdict, deque
 import numpy as np
 import cv2
 import onnx  # 仅用于类型注解
+
+
+def clean_files_or_dirs(file_or_dir_list:list) -> tuple[int, int]:
+    """
+    清理一组文件/目录（与 OnnxToQNN / OnnxToRKNN / AimetOnnxQuantizer 的 clean() 共用）。
+    逐个尝试删除：
+        - 文件 -> os.remove
+        - 目录 -> 递归统计文件数/子目录数后 shutil.rmtree
+    单项删除失败时打印告警但不中断，全部处理完后打印汇总。
+
+    Args:
+        file_or_dir_list (list): 待清理的文件/目录路径列表（Path 或 str 均可）。
+
+    Returns:
+        tuple[int, int]: (删除的文件数, 删除的目录数)。
+    """
+    file_count = 0
+    dir_count = 0
+
+    for file_or_dir in file_or_dir_list:
+        file_or_dir = str(file_or_dir)
+        try:
+            if os.path.isfile(file_or_dir):
+                os.remove(file_or_dir)
+                file_count += 1
+
+            elif os.path.isdir(file_or_dir):
+                # 统计目录中的文件数量
+                for root, dirs, files in os.walk(file_or_dir):
+                    file_count += len(files)
+                    dir_count += len(dirs)
+
+                shutil.rmtree(file_or_dir)  # 删除目录
+                dir_count += 1  # 加上被删除的目录本身
+
+        except Exception as e:
+            print(f"failed to delete {file_or_dir} due to {e}")
+
+    print(f"cleaned {file_count} files and {dir_count} dirs")
+    return file_count, dir_count
+
+
+# 一个上下文管理器以安全地更改目录
+class temporary_chdir:
+    def __init__(self, new_path:str):
+        self.new_path = str(new_path)
+        self.saved_path = None
+        
+    def __enter__(self):
+        self.saved_path = os.getcwd() # 保存进入前的当前目录
+        os.makedirs(self.new_path, exist_ok=True)  # 确保目录存在
+        os.chdir(self.new_path)       # 切换到新目录
+        
+    def __exit__(self, etype, value, traceback):
+        os.chdir(self.saved_path)     # 无论代码块是否报错，都恢复原来的目录
+
+def sanitize_name(name:str, replace_chars:str=r'()[]{}-\/:*?"<>|,') -> str:
+    """将指定字符替换为 '_',并将连续下划线合并为一个"""
+    trans_table = str.maketrans(replace_chars, '_' * len(replace_chars))
+    name = name.translate(trans_table)
+    name = re.sub(r'_+', '_', name).strip('_')
+    return name
+
+def parse_bitwidth(bitwidth:str) -> tuple[int, int]:
+    """
+    Args:
+        bitwidth (str): Bitwidth config in the format 'w<W>a<A>'.
+
+    Returns:
+        tuple[int, int]: (weights_bitwidth, act_bitwidth).
+    """
+    bw_match = re.match(r'w(\d+)a(\d+)', bitwidth)
+    weights_bitwidth = int(bw_match.group(1))  # 提取w后面的完整数字
+    act_bitwidth = int(bw_match.group(2))
+    return weights_bitwidth, act_bitwidth
 
 
 def letterbox_image(img:np.ndarray, target_shape:tuple[int, int], output_format:str='hwc', output_dtype:str='float32', border_value:tuple[int, int, int]|None=None) -> np.ndarray:
@@ -89,22 +165,6 @@ def letterbox_image(img:np.ndarray, target_shape:tuple[int, int], output_format:
     if output_dtype == 'float32':
         return rgb_image.astype(np.float32)
     return rgb_image.astype(np.uint8)
-
-
-# 一个上下文管理器以安全地更改目录
-class temporary_chdir:
-    def __init__(self, new_path:str):
-        self.new_path = str(new_path)
-        self.saved_path = None
-        
-    def __enter__(self):
-        self.saved_path = os.getcwd() # 保存进入前的当前目录
-        os.makedirs(self.new_path, exist_ok=True)  # 确保目录存在
-        os.chdir(self.new_path)       # 切换到新目录
-        
-    def __exit__(self, etype, value, traceback):
-        os.chdir(self.saved_path)     # 无论代码块是否报错，都恢复原来的目录
-
 
 def collect_image_paths(dir_paths:list[str], max_count:int, random_sample:bool=False) -> str:
     """
@@ -267,10 +327,20 @@ def fmt_model_name_with_shape(model:onnx.ModelProto|str, model_name:str, use_nhw
     return model_name.format(shapes=shape_str)
 
 
-def reorder_onnx_nodes_by_input(model:onnx.ModelProto, max_depth:int=10) -> onnx.ModelProto:
+def reorder_onnx_nodes_by_input(model:onnx.ModelProto, max_depth:int=10, aggressive:bool=False) -> onnx.ModelProto:
     """
     按输入分支顺序重排 ONNX 节点，同时保证严格拓扑序
     核心策略: BFS分配优先级 + Kahn算法拓扑排序 + 最小堆调度
+
+    Args:
+        max_depth (int): BFS 从各输入向下的最大搜索深度。
+        aggressive (bool): 激进模式（默认 False）。True 时会把"仅依赖 initializer 的
+            前驱节点"（如 QDQ 模型的 weight_dq 反量化节点）的优先级按下游消费节点
+            所属输入分支反向回传，使 Kahn 排序中同优先级节点按输入顺序 tie-break。
+            用于 QDQ 模型：AIMET 导出的 QDQ 里各输入的 Q -> DQ -> weight_dq -> 首个
+            真实算子链可能被排乱，导致 qairt-converter 推导的 DLC 输入顺序与
+            graph.input 不一致；aggressive=True 可修复。纯 float 模型无 weight_dq，
+            该模式不影响其结果。
     """
     graph = model.graph
 
@@ -329,6 +399,31 @@ def reorder_onnx_nodes_by_input(model:onnx.ModelProto, max_depth:int=10) -> onnx
                         visited_tensors.add(out)
                         bfs_queue.append((out, node_depth, inp_idx))
 
+    if aggressive:
+        # 激进模式：把优先级沿输入边反向回传（只取更优：更浅深度 / 更靠前的输入分支）。
+        # QDQ 模型中首个真实算子的权重反量化节点(weight_dq)只消费 initializer，正向
+        # BFS 永远访问不到，只能拿默认优先级并按原始插入顺序 tie-break，导致输入分支
+        # 顺序错乱。反向回传让 weight_dq 继承其下游消费节点所属输入分支的序号，
+        # 从而各输入消费链按 graph.input 顺序排列。
+        changed = True
+        while changed:
+            changed = False
+            for node in nodes_list:
+                prio = node_priority.get(id(node))
+                if prio is None:
+                    continue
+                depth, inp_idx = prio
+                for inp in node.input:
+                    producer = tensor_to_producer.get(inp)
+                    if producer is None:
+                        continue
+                    pid = id(producer)
+                    new_prio = (max(depth - 1, 0), inp_idx)
+                    old = node_priority.get(pid)
+                    if old is None or new_prio < old:
+                        node_priority[pid] = new_prio
+                        changed = True
+
     # 未访问到的节点（超过深度或独立分支）赋予最低优先级
     default_prio = (max_depth + 1, len(input_names))
     for node in nodes_list:
@@ -383,11 +478,17 @@ def reorder_onnx_nodes_by_input(model:onnx.ModelProto, max_depth:int=10) -> onnx
 
     return model
 
-def reorder_onnx_nodes_by_output(model:onnx.ModelProto, max_depth:int=10) -> onnx.ModelProto:
+def reorder_onnx_nodes_by_output(model:onnx.ModelProto, max_depth:int=10, aggressive:bool=False) -> onnx.ModelProto:
     """
     按输出分支顺序重排 ONNX 节点 (output1优先 -> output2 -> ...)
     规则: output1 的祖先节点在前, output2 的在后，依此类推
     仅改变 model.graph.node 列表顺序，严格保证拓扑序以通过 full_check=True
+
+    Args:
+        max_depth (int): 反向 BFS 从各输出向上的最大搜索深度。
+        aggressive (bool): 为与 reorder_onnx_nodes_by_input 保持接口一致而保留的
+            开关，此处不改变行为（输入分支顺序由 input 版本决定，输出版本只负责
+            保持深度节点的原始相对顺序）。
     """
 
     graph = model.graph
@@ -496,12 +597,177 @@ def reorder_onnx_nodes_by_output(model:onnx.ModelProto, max_depth:int=10) -> onn
 
     return model
 
-def sanitize_name(name:str, replace_chars:str=r'()[]{}-\/:*?"<>|,') -> str:
-    """将指定字符替换为 '_',并将连续下划线合并为一个"""
-    trans_table = str.maketrans(replace_chars, '_' * len(replace_chars))
-    name = name.translate(trans_table)
-    name = re.sub(r'_+', '_', name).strip('_')
-    return name
+
+def find_hybrid_subgraph_nodes(model:onnx.ModelProto, custom_hybrid:list[list[str]], warn_prefix:str='') -> list[int]:
+    """
+    识别混合量化子图节点：对每个 [输入张量, 输出张量] 对，找出"输入张量下游 ∩ 输出张量
+    上游"的所有节点下标并取并集（按节点下标升序，保证确定性）。
+
+    供 QAIRT quantization_overrides 生成（QnnHybridQuantGen.generate_hybrid_quantization_overrides）
+    与 AIMET 混合精度张量查找（AimetOnnxQuantizer._find_subgraph_tensors）共用，
+    避免两份几乎相同的 producer/consumers/downstream/upstream 搜索逻辑重复维护。
+
+    Args:
+        model (onnx.ModelProto): ONNX 模型（读取 graph.node / graph.input）。
+        custom_hybrid (list[list[str]]): 每个内层列表为 [输入张量, 输出张量]；
+            张量名也可以是节点名（自动取该节点第一个输出张量作为边界）。
+        warn_prefix (str): 某个子图无节点时的警告前缀（如 '[AIMET] '）。
+
+    Returns:
+        list[int]: 子图节点下标列表（升序，保证确定性）。
+
+    Raises:
+        ValueError: pair 格式错误，或张量/节点名在模型中不存在。
+    """
+    nodes = list(model.graph.node)
+
+    # 张量 -> 产生它的节点下标
+    producer: dict[str, int] = {}
+    for idx, n in enumerate(nodes):
+        for out in n.output:
+            producer[out] = idx
+
+    # 张量 -> 消费它的节点下标列表
+    consumers: dict[str, list[int]] = {}
+    for idx, n in enumerate(nodes):
+        for inp in n.input:
+            consumers.setdefault(inp, []).append(idx)
+
+    graph_input_names = {i.name for i in model.graph.input}
+
+    def resolve_tensor(name: str) -> str:
+        """张量名 -> 张量名；若为节点名则取其第一个输出张量作为边界"""
+        if name in producer or name in graph_input_names:
+            return name
+        for n in nodes:
+            if n.name == name:
+                if not n.output:
+                    raise ValueError(f"Node '{name}' has no output tensor")
+                return n.output[0]
+        raise ValueError(f"Tensor or node '{name}' not found in the model")
+
+    def downstream_of(tensor: str) -> set[int]:
+        """消费该张量(直接或间接)的节点集合"""
+        result: set[int] = set()
+        stack = list(consumers.get(tensor, []))
+        while stack:
+            idx = stack.pop()
+            if idx in result:
+                continue
+            result.add(idx)
+            for out in nodes[idx].output:
+                stack.extend(consumers.get(out, []))
+        return result
+
+    def upstream_of(tensor: str) -> set[int]:
+        """产生该张量(直接或间接)的节点集合"""
+        result: set[int] = set()
+        start = producer.get(tensor)
+        if start is None:
+            return result
+        stack = [start]
+        while stack:
+            idx = stack.pop()
+            if idx in result:
+                continue
+            result.add(idx)
+            for inp in nodes[idx].input:
+                p = producer.get(inp)
+                if p is not None:
+                    stack.append(p)
+        return result
+
+    middle: set[int] = set()
+    for pair in custom_hybrid:
+        if len(pair) != 2:
+            raise ValueError(f"Each custom_hybrid pair must be [input_tensor, output_tensor], got {pair}")
+        in_tensor = resolve_tensor(pair[0])
+        out_tensor = resolve_tensor(pair[1])
+        sub_middle = downstream_of(in_tensor) & upstream_of(out_tensor)
+        if not sub_middle:
+            print(f"{warn_prefix}Warning: no nodes found between '{in_tensor}' and '{out_tensor}', skipped")
+        middle |= sub_middle
+
+    return sorted(middle)
+
+
+def normalize_onnx_model(model:onnx.ModelProto, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]) -> onnx.ModelProto:
+    """
+    Args:
+        model (onnx.ModelProto): 待归一化的 ONNX 模型
+        mean_rgb (list[list[int | float]]): RGB 均值
+        std_rgb (list[list[int | float]]): RGB 标准差
+
+    Returns:
+        onnx.ModelProto: 归一化后的 ONNX 模型
+    """
+
+        # 检查是否需要归一化
+    need_mean_normalization = False
+    need_std_normalization = False
+    
+    # 检查均值是否不为0
+    for mean in mean_rgb:
+        if not np.allclose(np.array(mean, np.float32).flatten(), 0.0):
+            need_mean_normalization = True
+            break
+    
+    # 检查标准差是否不为1
+    for std in std_rgb:
+        if not np.allclose(np.array(std, np.float32).flatten(), 1.0):
+            need_std_normalization = True
+    
+
+    if need_mean_normalization or need_std_normalization:
+        nodes_to_add = []
+        initializers_to_add = []
+
+        # 获取原始输入信息
+        for index, input_node in enumerate(model.graph.input):
+            input_name = input_node.name
+
+            input_mean = np.array(mean_rgb[index], np.float32)
+            input_std = np.array(std_rgb[index], np.float32)
+            channel_num = len(input_mean)
+
+            # 用 1x1 卷积实现归一化: y = (x - mean) / std = x * (1/std) - mean/std
+            # 权重为对角矩阵 diag(1/std)，偏置为 -mean/std
+            conv_weight = (np.diag(1.0 / input_std)).astype(np.float32).reshape(channel_num, channel_num, 1, 1)
+            conv_bias = (-input_mean / input_std).astype(np.float32)
+
+            weight_tensor = onnx.numpy_helper.from_array(conv_weight, name=f"{input_name}_norm_weight")
+            bias_tensor = onnx.numpy_helper.from_array(conv_bias, name=f"{input_name}_norm_bias")
+
+            conv_output = f"{input_name}_normalized"
+            conv_node = onnx.helper.make_node(
+                'Conv',
+                inputs=[input_name, weight_tensor.name, bias_tensor.name],
+                outputs=[conv_output],
+                name=f"{input_name}_Normalization_Conv"
+            )
+
+            nodes_to_add.append(conv_node)
+            initializers_to_add.append(weight_tensor)
+            initializers_to_add.append(bias_tensor)
+
+            # 更新所有使用原始输入的节点
+            # (新节点尚未插入 graph，因此这里无需像原来那样跳过自身)
+            for node in model.graph.node:
+                for i, node_input in enumerate(node.input):
+                    if node_input == input_name:
+                        node.input[i] = conv_output
+
+
+        nodes_to_add.reverse()
+        initializers_to_add.reverse()
+
+        for node in nodes_to_add:
+            model.graph.node.insert(0, node)
+        for initializer in initializers_to_add:
+            model.graph.initializer.insert(0, initializer)
+
+
+    return model
 
 
 

@@ -9,7 +9,7 @@ from rknn.api import RKNN
 current_dir = Path(__file__).parent.resolve()
 sys.path.append(str(current_dir))
 
-from utils import temporary_chdir
+from utils import temporary_chdir, clean_files_or_dirs
 
 
 
@@ -168,16 +168,9 @@ class OnnxToRKNN:
             self.plot_accuracy_analysis()
 
     def clean(self):
-        for file_name in self.temp_files_list:
-            file_path = str(self.tmp_dir / file_name)
-            
-            try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                    print(f"deleted tmp file {file_path}")
-
-            except Exception as e:
-                print(f"failed to delete {file_path}: {str(e)}")
+        """清理 RKNN 转换产生的临时文件（temp_files_list 中的文件名，位于 tmp_dir 下）。
+        复用共享的 utils.clean_files_or_dirs。"""
+        clean_files_or_dirs([str(self.tmp_dir / name) for name in self.temp_files_list])
 
 
     def self_convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
@@ -237,6 +230,7 @@ class OnnxToRKNN:
         # Release
         rknn.release()
         print('--> Released rknn')
+
 
     def read_error_analysis(self) -> list[dict]:
         """
@@ -312,15 +306,9 @@ class OnnxToRKNN:
         print(f"Loaded {len(rows)} layers from {error_analysis_path}")
         return rows
 
-    def plot_accuracy_analysis(self, top_k:int=10) -> list[dict]:
+    def plot_accuracy_analysis(self):
         """
         读取并可视化 RKNN 精度分析结果（欧氏距离柱状图 + 余弦相似度折线图）。
-
-        Args:
-            top_k (int): 打印单层余弦相似度最低的前 top_k 个层（便于定位混合量化候选层）。默认 10。
-
-        Returns:
-            list[dict]: 解析出的逐层精度数据（同 read_error_analysis）。
         """
         from matplotlib import axes
         import matplotlib.pyplot as plt
@@ -377,17 +365,6 @@ class OnnxToRKNN:
         # 消除 x 轴两端默认的 5% 空白边距（留半个柱宽避免首尾柱被裁切）
         ax_cos.set_xlim(-0.5, n - 0.5)
 
-        # 打印问题层摘要（按单层余弦相似度升序，数值层优先）
-        valid_idx = [i for i in range(n) if not np.isnan(single_cos[i])]
-        if valid_idx:
-            sorted_idx = sorted(valid_idx, key=lambda i: single_cos[i])
-            print('\n' + '=' * 100)
-            print(f'Top-{min(top_k, len(sorted_idx))} worst layers by single cosine similarity (candidates for hybrid quantization):')
-            print(f"{'rank':<6}{'op_type':<16}{'layer_name':<60}{'single_cos':<12}{'single_euc':<12}{'entire_cos':<12}")
-            print('-' * 100)
-            for rank, i in enumerate(sorted_idx[:top_k], start=1):
-                print(f"{rank:<6}{rows[i]['op_type']:<16}{rows[i]['layer_name']:<60}{single_cos[i]:<12.5f}{single_euc[i]:<12.4f}{entire_cos[i]:<12.5f}")
-            print('=' * 100 + '\n')
 
         plt.tight_layout()
         save_path = self.tmp_dir / 'rknn_accuracy_analysis_summary.png'
@@ -395,6 +372,6 @@ class OnnxToRKNN:
         plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
         print(f"Figure saved to: {save_path}")
         plt.show()
-        return rows
+
 
 

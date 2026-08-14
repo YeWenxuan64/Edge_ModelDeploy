@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 from pathlib import Path
 from typing import Callable
@@ -12,13 +13,26 @@ from matplotlib import axes
 import matplotlib.pyplot as plt
 
 
+current_dir = Path(__file__).parent.resolve()
+sys.path.append(str(current_dir))
+from utils import clean_files_or_dirs
+
+
 
 
 class SnpeAccuracyDebugger:
     def __init__(self, tmp_dir:str, onnx_path:str, debugger_picture_list:list[str], run_subprocess:Callable[[str], int]):
         self.tmp_dir = Path(tmp_dir).resolve()
         self.onnx_path = Path(onnx_path).resolve()
-        self.debugger_picture_list = [Path(p).resolve() for p in debugger_picture_list]
+
+        self.debugger_picture_list:list[str] = []
+        for i in range(len(debugger_picture_list)):
+            p = Path(debugger_picture_list[i]).resolve()
+            if p.exists():
+                self.debugger_picture_list.append(p)
+            else:
+                ValueError("Accuracy analysis data not found")
+
         self.command_runnr = run_subprocess
 
         self.tmp_working_dir = self.tmp_dir / 'accuracy_analysis'
@@ -32,6 +46,10 @@ class SnpeAccuracyDebugger:
 
         self.quant_dir = self.working_dir / 'quant_dir'
         self.quant_dir.mkdir(exist_ok=True)
+
+        self.file_or_dir_to_clean:list[str] = []
+        self.file_or_dir_to_clean.append(self.working_dir)
+        self.file_or_dir_to_clean.append(str(self.tmp_dir / "working_directory"))
 
     def set_model_inof(self, onnx_info:dict, golden_dlc_path:str, quant_dlc_path:str):
         self.onnx_info = onnx_info
@@ -543,3 +561,5 @@ class SnpeAccuracyDebugger:
         return results
 
 
+    def clean(self):
+        clean_files_or_dirs(self.file_or_dir_to_clean)
