@@ -17,6 +17,87 @@ from collections import defaultdict, deque
 import numpy as np
 import cv2
 import onnx  # 仅用于类型注解
+import onnxruntime as ort
+
+
+# 一个上下文管理器以安全地更改目录
+class temporary_chdir:
+    def __init__(self, new_path:str):
+        self.new_path = str(new_path)
+        self.saved_path = None
+        
+    def __enter__(self):
+        self.saved_path = os.getcwd() # 保存进入前的当前目录
+        os.makedirs(self.new_path, exist_ok=True)  # 确保目录存在
+        os.chdir(self.new_path)       # 切换到新目录
+        
+    def __exit__(self, etype, value, traceback):
+        os.chdir(self.saved_path)     # 无论代码块是否报错，都恢复原来的目录
+
+class OnnxExecutor():
+    def __init__(self, model_path:str):
+        self.model_path = model_path
+        self.session = None
+        self.providers = ['CPUExecutionProvider']
+
+        self.input_names:list[str] = []
+        self.output_names:list[str] = []
+        self.float_inputs = False
+
+        self.init_onnx()
+
+    def init_onnx(self):
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.enable_mem_pattern = True
+
+        self.session = ort.InferenceSession(self.model_path, sess_options, providers=self.providers)
+
+        input_details:list = self.session.get_inputs()
+        self.input_names:list[str] = [inp.name for inp in input_details]
+        self.output_names:list[str]  = [out.name for out in self.session.get_outputs()]
+
+        if "float" in input_details[0].type:
+            self.float_inputs = True
+        else:
+            self.float_inputs = False
+
+    def get_input_shapes(self) -> list[tuple[int, int]]:
+        input_details = self.session.get_inputs()
+
+        input_sizes_list:list[tuple[int, int]] = []
+        for input_detail in input_details:
+            input_shape:list[int] = input_detail.shape
+            input_sizes_list.append(tuple(input_shape))
+
+        return input_sizes_list
+        
+    def put(self, input_data:list[np.ndarray], input_format:str='nhwc') -> list[np.ndarray]:
+        if input_format == 'nhwc':
+            input_data = [np.transpose(tensor, (0, 3, 1, 2)) for tensor in input_data]
+        elif input_format == 'nchw':
+            pass
+
+        if self.float_inputs:
+            input_data = [tensor.astype(np.float32) for tensor in input_data]
+
+        input_feed = {} # 构建 feed_dict
+        for i, input_name in enumerate(self.input_names):
+            input_feed[input_name] = input_data[i]
+
+        outputs = self.session.run(None, input_feed) # 执行推理
+        return outputs
+    
+    def release(self):
+        if self.session is not None:
+            del self.session
+            self.session = None
+
+            self.input_names.clear()
+            self.output_names.clear()
+
+            print("ONNX Executor released")
 
 
 def clean_files_or_dirs(file_or_dir_list:list) -> tuple[int, int]:
@@ -58,21 +139,6 @@ def clean_files_or_dirs(file_or_dir_list:list) -> tuple[int, int]:
     print(f"cleaned {file_count} files and {dir_count} dirs")
     return file_count, dir_count
 
-
-# 一个上下文管理器以安全地更改目录
-class temporary_chdir:
-    def __init__(self, new_path:str):
-        self.new_path = str(new_path)
-        self.saved_path = None
-        
-    def __enter__(self):
-        self.saved_path = os.getcwd() # 保存进入前的当前目录
-        os.makedirs(self.new_path, exist_ok=True)  # 确保目录存在
-        os.chdir(self.new_path)       # 切换到新目录
-        
-    def __exit__(self, etype, value, traceback):
-        os.chdir(self.saved_path)     # 无论代码块是否报错，都恢复原来的目录
-
 def sanitize_name(name:str, replace_chars:str=r'()[]{}-\/:*?"<>|,') -> str:
     """将指定字符替换为 '_',并将连续下划线合并为一个"""
     trans_table = str.maketrans(replace_chars, '_' * len(replace_chars))
@@ -92,7 +158,6 @@ def parse_bitwidth(bitwidth:str) -> tuple[int, int]:
     weights_bitwidth = int(bw_match.group(1))  # 提取w后面的完整数字
     act_bitwidth = int(bw_match.group(2))
     return weights_bitwidth, act_bitwidth
-
 
 def letterbox_image(img:np.ndarray, target_shape:tuple[int, int], output_format:str='hwc', output_dtype:str='float32', border_value:tuple[int, int, int]|None=None) -> np.ndarray:
     """
@@ -166,31 +231,30 @@ def letterbox_image(img:np.ndarray, target_shape:tuple[int, int], output_format:
         return rgb_image.astype(np.float32)
     return rgb_image.astype(np.uint8)
 
-def collect_image_paths(dir_paths:list[str], max_count:int, random_sample:bool=False) -> str:
+def collect_image_paths(dir_paths:list[str], max_count:int=0, random_sample:bool=False, step:int=1, use_relative:bool=False) -> str:
     """
-    从多个图片目录中收集图片绝对路径，写入 tmp 目录下的 txt 文件，并返回该 txt 的绝对路径。
+    从多个图片目录中收集图片路径，写入 txt 文件，并返回该 txt 的绝对路径。
     
     :param dir_paths: 图片目录路径列表（支持相对或绝对路径）
-    :param max_count: 总共最大读取图片数量
+    :param max_count: 总共最大读取图片数量。0 表示不限制（收集全部）；负数会抛 ValueError
     :param random_sample: 是否随机取样。若为 True，且文件夹内图片数量大于 max_count 时，随机选取图片
+    :param step: 间隔挑选步长（仅顺序模式生效）。step=1 表示全选；step=2 表示每隔 1 张取 1 张（
+        即取第 0、2、4... 张）；step=N 表示每 N 张取 1 张（取第 0、N、2N... 张）。
+    :param use_relative: 是否以相对于当前工作目录的形式输出图片路径。True 时，位于当前目录下的
+        图片写成 './path/to/image.jpg' 格式；位于当前目录之外的图片写成 '../xxx' 相对形式。
+        默认 False，输出绝对路径。
     :return: 生成的 txt 文件的绝对路径字符串
     """
-    if max_count <= 0:
-        raise ValueError("max_count 必须大于 0")
+    if max_count < 0:
+        raise ValueError("max_count 不能为负数")
+    if step <= 0:
+        raise ValueError("step 必须大于 0")
+
+    # max_count=0 表示不限制数量，收集全部；否则为数量上限
+    limit = max_count if max_count > 0 else None
 
     # 图片扩展名白名单（统一转为小写匹配）
     ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif'}
-
-    # 获取脚本所在目录的绝对路径
-    try:
-        script_dir = Path(__file__).parent.resolve()
-    except NameError:
-        # 兼容 Jupyter / 交互式终端等没有 __file__ 的环境
-        script_dir = Path.cwd().resolve()
-
-    # 处理 tmp 目录
-    tmp_dir = script_dir / 'tmp'
-    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     collected_paths: list[str] = []
 
@@ -204,40 +268,58 @@ def collect_image_paths(dir_paths:list[str], max_count:int, random_sample:bool=F
         if random_sample:
             # 随机取样模式：需要先收集当前目录下的所有图片，以便进行等概率随机抽样
             dir_images = [
-                str(file_path.resolve()) 
-                for file_path in dir_path.iterdir() 
+                file_path.resolve().as_posix()
+                for file_path in dir_path.iterdir()
                 if file_path.is_file() and file_path.suffix.lower() in ALLOWED_EXTENSIONS
             ]
             
-            # 计算当前目录允许抽取的最大数量
-            remaining_count = max_count - len(collected_paths)
-            if remaining_count <= 0:
+            # 计算当前目录允许抽取的最大数量（max_count=0 表示不限制，全部纳入）
+            remaining_count = None if limit is None else limit - len(collected_paths)
+            if remaining_count is not None and remaining_count <= 0:
                 break
                 
             # 如果当前目录图片数大于剩余所需数量，随机抽取；否则全部加入
-            if len(dir_images) > remaining_count:
+            if remaining_count is not None and len(dir_images) > remaining_count:
                 sampled_images = random.sample(dir_images, remaining_count)
                 collected_paths.extend(sampled_images)
             else:
                 collected_paths.extend(dir_images)
         else:
             # 顺序模式：保持原有逻辑，按顺序收集，达到 max_count 立即停止，节省性能
+            img_index = 0  # 当前目录内已扫描的图片计数（用于间隔挑选）
             for file_path in dir_path.iterdir():
                 if file_path.is_file() and file_path.suffix.lower() in ALLOWED_EXTENSIONS:
-                    collected_paths.append(str(file_path.resolve()))
+                    # 间隔挑选：step>1 时，只保留 img_index 为 step 整数倍的图片（第 0、step、2*step... 张）
+                    if step > 1 and img_index % step != 0:
+                        img_index += 1
+                        continue
+                    img_index += 1
+                    collected_paths.append(file_path.resolve().as_posix())
                     
-                    if len(collected_paths) >= max_count:
+                    if limit is not None and len(collected_paths) >= limit:
                         break
 
         # 如果已收集够数量，跳出外层目录循环
-        if len(collected_paths) >= max_count:
+        if limit is not None and len(collected_paths) >= limit:
             break
 
-    # 安全截断（防止随机抽样逻辑中因并发或计算误差多出元素）
-    final_paths = collected_paths[:max_count]
+    # 安全截断（防止随机抽样逻辑中因并发或计算误差多出元素）；max_count=0 时不截断
+    final_paths = collected_paths if limit is None else collected_paths[:limit]
 
-    # 写入 txt 文件
-    output_txt = tmp_dir / 'combind_image_paths.txt'
+    # 若 use_relative=True，将绝对路径转换为相对于当前工作目录的路径（./xxx 或 ../xxx 格式）
+    if use_relative:
+        cwd = Path.cwd()
+        rel_paths = []
+        for p in final_paths:
+            rel = os.path.relpath(p, cwd).replace(os.sep, '/')
+            if not rel.startswith('..'):  # 位于当前目录下时，使用 ./ 前缀
+                rel = './' + rel
+            # 位于当前目录之外时保留 ../ 相对形式（不额外加 ./）
+            rel_paths.append(rel)
+        final_paths = rel_paths
+
+    # 写入 txt 文件（直接写在脚本运行/当前工作目录，不再生成 tmp 文件夹）
+    output_txt = Path.cwd() / 'combind_image_paths.txt'
     with open(output_txt, 'w', encoding='utf-8') as f:
         f.write('\n'.join(final_paths))
         if final_paths:
@@ -245,23 +327,58 @@ def collect_image_paths(dir_paths:list[str], max_count:int, random_sample:bool=F
 
     return str(output_txt.resolve())
 
-def read_txt_first_line(txt_path: str) -> list[str]:
+def read_dataset_txt_to_list(dataset_txt_path: str) -> list[list[str]]:
+    txt_path = Path(dataset_txt_path).resolve()
+
+    # 读取数据集文件
+    dataset_dir = txt_path.parent
+    dataset_path_list:list[list[str]] = []
+
+    with open(str(txt_path), 'r') as f:
+        lines = f.readlines() # 逐行读取文件
+
+        for line in lines: # 如果行不为空，则分割路径
+            line = line.strip() # 去除首尾空白字符
+            if line:
+                one_line_paths_list = [path for path in line.split(' ') if path] # 按空格分割路径，并过滤掉空字符串
+
+                one_line_path_list = []
+                for img_path in one_line_paths_list:
+                    p = Path(img_path)
+                    
+                    if p.is_absolute():
+                        full_path = p # 如果已经是绝对路径，直接使用
+                    else:
+                        full_path = dataset_dir / p # 如果是相对路径，则与 dataset_dir 拼接
+                    
+                    one_line_path_list.append(str(full_path))
+                
+                dataset_path_list.append(one_line_path_list)
+
+    return dataset_path_list
+
+
+def read_txt_line(txt_path: str, line_index: int = 0) -> list[str]:
     """
-    Read the first line of a text file, split it by whitespace, and
+    Read a specified line of a text file, split it by whitespace, and
     convert each token into a full path string.
 
     - Relative paths are resolved against the directory containing the txt file.
     - Absolute paths are kept as-is.
-    - Returns an empty list if the first line is empty.
+    - Returns an empty list if the target line is empty.
 
     Args:
         txt_path (str): Path to the text file (e.g. a quantization dataset list).
+        line_index (int): The 0-based line number to read. Default 0 (first line).
+            Negative values count from the end (-1 = last line), mirroring Python
+            list indexing. Raises IndexError if the index is out of range.
 
     Returns:
-        list[str]: Full path strings parsed from the first line.
+        list[str]: Full path strings parsed from the target line.
 
     Raises:
         FileNotFoundError: If txt_path does not exist.
+        IndexError: If line_index is out of range.
     """
     txt_path:Path = Path(txt_path).resolve()
 
@@ -269,10 +386,17 @@ def read_txt_first_line(txt_path: str) -> list[str]:
         raise FileNotFoundError(f"数据文件不存在: {txt_path}")
 
     with open(txt_path, 'r', encoding='utf-8') as f:
-        first_line = f.readline()
+        lines = f.readlines()
 
-    # 按任意空白字符（空格/Tab/多空格）分割第一行，并过滤掉空字符串
-    one_line_paths = first_line.split()
+    try:
+        target_line = lines[line_index]
+    except IndexError:
+        raise IndexError(
+            f"行索引 {line_index} 超出范围，文件共 {len(lines)} 行: {txt_path}"
+        )
+
+    # 按任意空白字符（空格/Tab/多空格）分割目标行，并过滤掉空字符串
+    one_line_paths = target_line.split()
 
     full_path_list = []
     for img_path in one_line_paths:
@@ -690,6 +814,61 @@ def find_hybrid_subgraph_nodes(model:onnx.ModelProto, custom_hybrid:list[list[st
 
     return sorted(middle)
 
+
+def get_onnx_model_info(tmp_onnx_path:str) -> dict|None:
+    """
+    获取ONNX模型的输入输出信息
+    
+    Args:
+        onnx_path (str): ONNX模型文件路径
+        
+    Returns:
+        Dict: 包含模型输入输出信息的字典，格式如下：
+        {
+            "inputs": [
+                {
+                    "name": str,
+                    "shape": List[int]
+                }
+            ],
+            "outputs": [
+                {
+                    "name": str,
+                    "shape": List[int]
+                }
+            ]
+        }
+    """
+    
+    try:
+        # 加载ONNX模型
+        model = onnx.load_model(tmp_onnx_path)
+    except Exception as e:
+        print(f"Error reading ONNX model: {str(e)}")
+        return None
+    
+    # 获取输入信息
+    inputs = []
+    for input in model.graph.input:
+        input_info = {
+            "name": input.name,
+            "shape": [d.dim_value if d.dim_value != 0 else 'dynamic' for d in input.type.tensor_type.shape.dim]
+        }
+        inputs.append(input_info)
+
+    # 获取输出信息
+    outputs = []
+    for output in model.graph.output:
+        output_info = {
+            "name": output.name,
+            "shape": [d.dim_value if d.dim_value != 0 else 'dynamic' for d in output.type.tensor_type.shape.dim]
+        }
+        outputs.append(output_info)
+
+    model_info = {"inputs": inputs, "outputs": outputs}
+    print(f"Model info: {model_info}")
+
+    return model_info
 
 def normalize_onnx_model(model:onnx.ModelProto, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]) -> onnx.ModelProto:
     """

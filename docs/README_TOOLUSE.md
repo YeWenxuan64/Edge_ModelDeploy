@@ -163,9 +163,9 @@ converter = OnnxToQNN(
 
 # 可选：量化配置（各参数均有默认值，按需修改）
 converter.set_quantization_method(
-    param_quant_method='percentile', # 权重量化算法: 'min-max' / 'sqnr' / 'percentile' / 'mse' / 'entropy'（默认 percentile）
-    act_quant_method='entropy',      # 激活量化算法: 'min-max' / 'sqnr' / 'percentile' / 'mse' / 'entropy'（默认 entropy）
-    bitwidth='w8a8',                 # 'w4a8' / 'w4a16' / 'w8a8' / 'w8a16' / 'w16a16'（默认 w8a8）
+    param_quant_method='percentile', # 权重量化算法: 'min-max' / 'sqnr' / 'percentile' / 'mse' / 'entropy'
+    act_quant_method='entropy',      # 激活量化算法: 'min-max' / 'sqnr' / 'percentile' / 'mse' / 'entropy'
+    bitwidth='w8a8',                 # 'w4a8' / 'w4a16' / 'w8a8' / 'w8a16' / 'w16a16'
     bias_bitwidth=8,                 # 偏置位宽: 8 或 32
     param_quant_schema='asymmetric', # 权重对称性: 'asymmetric' / 'symmetric' / 'unsignedsymmetric'
     act_quant_schema='asymmetric',   # 激活对称性: 'asymmetric' / 'symmetric' / 'unsignedsymmetric'
@@ -183,7 +183,7 @@ converter.set_quantization_method(
 #    e.g. 全局 w8a8、区域内 w8a16（权重 8bit，激活 16bit）
 # converter.do_hybrid_quantization(
 #     custom_hybrid=[['子图输入张量名', '子图输出张量名']],
-#     bitwidth='w8a16',     # 区域内位宽: 'w4a8' / 'w4a16' / 'w8a8' / 'w8a16' / 'w16a16'（默认 w8a16）
+#     bitwidth='w8a16',     # 区域内位宽: 'w4a8' / 'w4a16' / 'w8a8' / 'w8a16' / 'w16a16'
 #     bias_bitwidth=8       # 区域内偏置位宽: 8 / 32
 # )
 # 2) 浮点保留：指定区域内保持 FP16 / FP32 浮点精度（此时忽略 bitwidth / bias_bitwidth）
@@ -338,7 +338,7 @@ converter.convert(
 | 转换工具 | 归一化实现方式 |
 |---------|--------------|
 | **OnnxToRKNN** | 通过 `rknn.config(mean_values=..., std_values=...)` 将归一化参数写入 RKNN 模型配置，由 **NPU 硬件在推理时自动完成**，不修改 ONNX 图 |
-| **OnnxToQNN** | 直接在 ONNX 模型图中插入 **Sub（减均值）和 Div（除标准差）节点**，将归一化烘焙进模型结构后再转换 |
+| **OnnxToQNN** | 直接在 ONNX 模型图中插入 **归一化1x1卷积节点**，将归一化烘焙进模型结构后再转换 |
 
 > - 每个内层列表对应一个模型**输入**的 RGB 三通道值（多输入模型需提供多个列表）
 > - 默认值 `mean=[[0,0,0]]`, `std=[[1,1,1]]` 表示不做归一化
@@ -373,7 +373,7 @@ converter.convert(
 ### 基础用法
 
 ```python
-from utilities.yolo_cropped_dataset_gen import GenYoloCroppedDataset
+from utilities.dataset_preprocess import GenYoloCroppedDataset
 
 generator = GenYoloCroppedDataset(
     dataset_path='datasets/datasets.txt',   # 原始数据集索引文件

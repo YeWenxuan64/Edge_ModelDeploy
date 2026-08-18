@@ -17,9 +17,9 @@ import onnx
 current_dir = Path(__file__).parent.resolve()
 sys.path.append(str(current_dir))
 
-from utils import temporary_chdir, sanitize_name, letterbox_image, clean_files_or_dirs
-from utils import parse_bitwidth
-from utils import normalize_onnx_model, reorder_onnx_nodes_by_input, reorder_onnx_nodes_by_output, find_hybrid_subgraph_nodes
+from utils import temporary_chdir, letterbox_image, clean_files_or_dirs, read_dataset_txt_to_list
+from utils import sanitize_name, parse_bitwidth, find_hybrid_subgraph_nodes
+from utils import get_onnx_model_info, normalize_onnx_model, reorder_onnx_nodes_by_input, reorder_onnx_nodes_by_output
 from qnn_accuracy_debugger import SnpeAccuracyDebugger
 from onnx_aimet_quant import AimetOnnxQuantizer, _resolve_aimet_config_path
 
@@ -448,14 +448,19 @@ class OnnxToQNN:
         self.file_or_dir_to_clean = []
         self.accuracy_analyzer = None
         self.hybrid_quantizer = None
-
-        # AIMET 2.x 量化路径连接器（set_use_aimet 创建，None 表示未启用）
         self.aimet_connector = None
 
-        self.set_quantization_method()
-        self.use_custom_alibration_data()
+        #self.set_quantization_method()
+        self.param_quant_method, self.act_quant_method = 'min-max', 'min-max'
+        self.weights_bitwidth, self.act_bitwidth = 8, 8
+        self.bias_bitwidth = 8
+        self.param_quant_schema, self.act_quant_schema = 'asymmetric', 'asymmetric'
+        self.use_cle_algorithm = False
 
-    def set_quantization_method(self, param_quant_method:str='percentile', act_quant_method:str='entropy', bitwidth:str='w8a8', bias_bitwidth:int=8,
+        #self.use_custom_alibration_data()
+        self.custom_alibration_data_path = None
+
+    def set_quantization_method(self, param_quant_method:str='min-max', act_quant_method:str='min-max', bitwidth:str='w8a8', bias_bitwidth:int=8,
                                 param_quant_schema:str='asymmetric', act_quant_schema:str='asymmetric', use_cle_algorithm:bool=False):
         """
         Configure quantization parameters for the model.
@@ -463,11 +468,11 @@ class OnnxToQNN:
         Args:
             param_quant_method (str): Quantization method for model parameters (weights).
                 - Available options: 'min-max', 'sqnr', 'percentile', 'mse', 'entropy'.
-                - Default: 'percentile'.
+                - Default: 'min-max'.
 
             act_quant_method (str): Quantization method for activations.
                 - Available options: 'min-max', 'sqnr', 'percentile', 'mse', 'entropy'.
-                - Default: 'entropy'.
+                - Default: 'min-max'.
 
             bitwidth (str): Quantization bitwidth configuration in format 'w<W>a<A>', 
                 where W is weight bitwidth and A is activation bitwidth.
@@ -518,8 +523,8 @@ class OnnxToQNN:
         self.act_quant_schema = act_quant_schema
         self.use_cle_algorithm = use_cle_algorithm
         
-        print(f"Quantization method has been set to param_quant_method={self.param_quant_method}, act_quant_method={self.act_quant_method}, bitwidth={self.weights_bitwidth}w{self.act_bitwidth}a"
-              f", schema: act={self.act_quant_schema}, param={self.param_quant_schema}, use_cle_algorithm={self.use_cle_algorithm}")
+        print(f"[QnnxToQNN] Quantization method set to: quant_method: param={self.param_quant_method}, act={self.act_quant_method}; bitwidth={self.weights_bitwidth}w{self.act_bitwidth}a"
+              f", schema: act={self.act_quant_schema}, param={self.param_quant_schema}; use_cle_algorithm={self.use_cle_algorithm}")
 
     def use_custom_alibration_data(self, custom_alibration_data_path:str|None=None):
         """
@@ -545,6 +550,8 @@ class OnnxToQNN:
             self.custom_alibration_data_path = None
         else:
             self.custom_alibration_data_path = Path(custom_alibration_data_path).resolve()
+
+        print(f"[QnnxToQNN] Custom calibration dataset path set to: {self.custom_alibration_data_path}")
 
     def do_hybrid_quantization(self, custom_hybrid:list[list[str, str]], bitwidth:str="w8a16", bias_bitwidth:int=8, float_bitwidth:int|None=None):
         """
@@ -577,6 +584,8 @@ class OnnxToQNN:
 
         weights_bitwidth, act_bitwidth = parse_bitwidth(bitwidth)
         self.hybrid_quantizer = QnnHybridQuantGen(custom_hybrid, weights_bitwidth, act_bitwidth, bias_bitwidth, float_bitwidth)
+
+        print(f"[QnnxToQNN] Hybrid quantization set to: {custom_hybrid}, bitwidth={bitwidth}, bias_bitwidth={bias_bitwidth}, float_bitwidth={float_bitwidth}")
 
     def set_use_aimet(self, quant_method:str='tf_enhanced', bitwidth:str="w8a8", param_quant_schema:str='symmetric', act_quant_schema:str='asymmetric',
                       encoding_version:str='2.0.0'):
@@ -638,6 +647,8 @@ class OnnxToQNN:
 
         self.accuracy_analyzer = SnpeAccuracyDebugger(self.tmp_dir, self.tmp_onnx_path, accuracy_analysis_picture_list, self.run_subprocess)
 
+        print(f"[QnnxToQNN] Accuracy analysis data list set to: {accuracy_analysis_picture_list}")
+
 
     def convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]], set_input_order:str='nhwc'):
         """
@@ -663,7 +674,7 @@ class OnnxToQNN:
         self.modify_onnx_model(mean_rgb, std_rgb)
 
         # 3.
-        onnx_model_info = self.get_onnx_model_info(self.tmp_onnx_path)
+        onnx_model_info = get_onnx_model_info(self.tmp_onnx_path)
         if onnx_model_info is None:
             exit(1)
 
@@ -798,63 +809,6 @@ class OnnxToQNN:
         self.file_or_dir_to_clean.append(self.tmp_onnx_path)
         print(f"Copied ONNX file to {self.tmp_onnx_path}")
 
-
-    @staticmethod
-    def get_onnx_model_info(tmp_onnx_path:str) -> dict|None:
-        """
-        获取ONNX模型的输入输出信息
-        
-        Args:
-            onnx_path (str): ONNX模型文件路径
-            
-        Returns:
-            Dict: 包含模型输入输出信息的字典，格式如下：
-            {
-                "inputs": [
-                    {
-                        "name": str,
-                        "shape": List[int]
-                    }
-                ],
-                "outputs": [
-                    {
-                        "name": str,
-                        "shape": List[int]
-                    }
-                ]
-            }
-        """
-        
-        try:
-            # 加载ONNX模型
-            model = onnx.load_model(tmp_onnx_path)
-        except Exception as e:
-            print(f"Error reading ONNX model: {str(e)}")
-            return None
-        
-        # 获取输入信息
-        inputs = []
-        for input in model.graph.input:
-            input_info = {
-                "name": input.name,
-                "shape": [d.dim_value if d.dim_value != 0 else 'dynamic' for d in input.type.tensor_type.shape.dim]
-            }
-            inputs.append(input_info)
-
-        # 获取输出信息
-        outputs = []
-        for output in model.graph.output:
-            output_info = {
-                "name": output.name,
-                "shape": [d.dim_value if d.dim_value != 0 else 'dynamic' for d in output.type.tensor_type.shape.dim]
-            }
-            outputs.append(output_info)
-
-        model_info = {"inputs": inputs, "outputs": outputs}
-        print(f"Model info: {model_info}")
-
-        return model_info
-
     def convert_onnx_model(self, onnx_model_info:dict, set_input_order:str, quantization_overrides_path:str|None=None, output_dlc_name:str|None=None, input_network_path:str|None=None, is_quantized:bool=False) -> str|None:
         """
         Args:
@@ -930,39 +884,11 @@ class OnnxToQNN:
         Returns:
             list[str] | None: 校准数据文件路径列表，每个输入对应一个文件
         """
+
+        dataset_path_list = read_dataset_txt_to_list(self.dataset_path)
+        
         try:
-            # 读取数据集文件
-            dataset_dir = str(self.dataset_path.parent)
-            dataset_path_list = []
-
-            with open(str(self.dataset_path), 'r') as f:
-                lines = f.readlines() # 逐行读取文件
-
-                for line in lines: # 如果行不为空，则分割路径
-                    line = line.strip() # 去除首尾空白字符
-                    if line:
-                        one_line_paths_list = [path for path in line.split(' ') if path] # 按空格分割路径，并过滤掉空字符串
-
-                        full_path_list = []
-                        for img_path in one_line_paths_list:
-                            # 将字符串转换为 Path 对象
-                            p = Path(img_path)
-                            
-                            # 判断是否为绝对路径
-                            if p.is_absolute():
-                                # 如果已经是绝对路径，直接使用
-                                full_path = p
-                            else:
-                                # 如果是相对路径，则与 dataset_dir 拼接
-                                full_path = dataset_dir / p
-                            
-                            full_path_list.append(str(full_path))
-                        
-                        dataset_path_list.append(full_path_list)
-
-
-            # 为每个输入创建目录和文件列表
-            calibration_files = []
+            calibration_files = [] # 为每个输入创建目录和文件列表
             for idx, input_info in enumerate(onnx_model_info["inputs"]):
                 # 创建输出目录
                 output_dir = self.tmp_dir / f"calibration_data_for_input{idx + 1}"

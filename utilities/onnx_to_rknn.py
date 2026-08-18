@@ -9,7 +9,7 @@ from rknn.api import RKNN
 current_dir = Path(__file__).parent.resolve()
 sys.path.append(str(current_dir))
 
-from utils import temporary_chdir, clean_files_or_dirs
+from utils import temporary_chdir, clean_files_or_dirs, read_dataset_txt_to_list
 
 
 
@@ -49,11 +49,19 @@ class OnnxToRKNN:
         if self.target_platform not in ['rk3588', 'rk3576', 'rk3566']:
             raise ValueError("target_platform must be 'rk3588' or 'rk3576' or 'rk3566'")
 
-        self.extra_optimize()
-        self.do_hybrid_quantization()
-        self.set_do_accuracy_analysis()
+        # self.extra_optimize()
+        self.quantized_algorithm = 'normal'
+        self.compress_weight = False
+        self.model_pruning = False
+        self.flash_attantion = False
 
-        self.temp_files_list = ["check0_base_optimize.onnx", "check1_fold_constant.onnx", "check2_correct_ops.onnx", "check3_fuse_ops.onnx"]
+        # self.do_hybrid_quantization()
+        self.custom_hybrid = None
+        
+        #self.set_do_accuracy_analysis()
+        self.accuracy_analysis_picture_list = None
+
+        self.file_or_dir_to_clean = ["check0_base_optimize.onnx", "check1_fold_constant.onnx", "check2_correct_ops.onnx", "check3_fuse_ops.onnx"]
 
     def extra_optimize(self, quantized_algorithm:str='normal', compress_weight:bool=False, model_pruning:bool=False, flash_attantion:bool=False):
         """
@@ -80,6 +88,8 @@ class OnnxToRKNN:
         self.model_pruning = model_pruning
         self.flash_attantion = flash_attantion
 
+        print(f"[OnnxToRKNN] extra_optimize: quantized_algorithm={self.quantized_algorithm}, compress_weight={self.compress_weight}, model_pruning={self.model_pruning}, flash_attantion={self.flash_attantion}")
+
     def do_hybrid_quantization(self, custom_hybrid:list[list[str]]|None=None):
         """
         Args:
@@ -92,6 +102,8 @@ class OnnxToRKNN:
                 - Defaults to None.
         """
         self.custom_hybrid = custom_hybrid
+
+        print(f"[OnnxToRKNN] do_hybrid_quantization: custom_hybrid={self.custom_hybrid}")
 
     def set_do_accuracy_analysis(self, accuracy_analysis_picture_list:list[str]|None=None):
         """
@@ -106,6 +118,8 @@ class OnnxToRKNN:
             self.accuracy_analysis_picture_list = [str(Path(path).resolve()) for path in accuracy_analysis_picture_list]
         else:
             self.accuracy_analysis_picture_list = None
+
+        print(f"[OnnxToRKNN] set_do_accuracy_analysis: accuracy_analysis_picture_list={self.accuracy_analysis_picture_list}")
 
 
     def convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
@@ -125,33 +139,7 @@ class OnnxToRKNN:
         self.tmp_dir.mkdir(exist_ok=True)
 
         if self.dataset_path is not None: # 读取数据集文件
-            dataset_dir = str(self.dataset_path.parent)
-            dataset_path_list = []
-
-            with open(str(self.dataset_path), 'r') as f:
-                lines = f.readlines() # 逐行读取文件
-
-                for line in lines: # 如果行不为空，则分割路径
-                    line = line.strip() # 去除首尾空白字符
-                    if line:
-                        one_line_paths_list = [path for path in line.split(' ') if path] # 按空格分割路径，并过滤掉空字符串
-
-                        full_path_list = []
-                        for img_path in one_line_paths_list:
-                            # 将字符串转换为 Path 对象
-                            p = Path(img_path)
-                            
-                            # 判断是否为绝对路径
-                            if p.is_absolute():
-                                # 如果已经是绝对路径，直接使用
-                                full_path = p
-                            else:
-                                # 如果是相对路径，则与 dataset_dir 拼接
-                                full_path = dataset_dir / p
-                            
-                            full_path_list.append(str(full_path))
-                        
-                        dataset_path_list.append(full_path_list)
+            dataset_path_list = read_dataset_txt_to_list(self.dataset_path)
 
             tmp_dataset_path = self.tmp_dir / self.dataset_path.name
             with open(tmp_dataset_path, 'w') as f:
@@ -159,7 +147,7 @@ class OnnxToRKNN:
                     f.write(' '.join(paths) + '\n')
 
             self.dataset_path = tmp_dataset_path
-            self.temp_files_list.append(self.dataset_path)
+            self.file_or_dir_to_clean.append(self.dataset_path)
 
         with temporary_chdir(self.tmp_dir):
             self.self_convert(mean_rgb, std_rgb)
@@ -168,9 +156,7 @@ class OnnxToRKNN:
             self.plot_accuracy_analysis()
 
     def clean(self):
-        """清理 RKNN 转换产生的临时文件（temp_files_list 中的文件名，位于 tmp_dir 下）。
-        复用共享的 utils.clean_files_or_dirs。"""
-        clean_files_or_dirs([str(self.tmp_dir / name) for name in self.temp_files_list])
+        clean_files_or_dirs([str(self.tmp_dir / name) for name in self.file_or_dir_to_clean])
 
 
     def self_convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
@@ -200,7 +186,7 @@ class OnnxToRKNN:
                 model_input = model_name + ".model" # 表示第一步生成的模型文件
                 data_input = model_name + ".data" # 表示第一步生成的配置文件
                 model_quantization_cfg = model_name + ".quantization.cfg" # 表示第一步生成的量化配置文件
-                self.temp_files_list.extend([model_input, data_input, model_quantization_cfg])
+                self.file_or_dir_to_clean.extend([model_input, data_input, model_quantization_cfg])
 
                 ret = rknn.hybrid_quantization_step1(dataset=self.dataset_path, proposal=False, custom_hybrid=self.custom_hybrid)
                 ret = rknn.hybrid_quantization_step2(model_input, data_input, model_quantization_cfg)  
@@ -226,6 +212,7 @@ class OnnxToRKNN:
         if self.accuracy_analysis_picture_list is not None:
             print(f'accuracy_analysis_picture_list: {self.accuracy_analysis_picture_list}')
             rknn.accuracy_analysis(inputs=self.accuracy_analysis_picture_list)
+            self.file_or_dir_to_clean.append(str(self.tmp_dir / "snapshot"))
 
         # Release
         rknn.release()
@@ -341,7 +328,7 @@ class OnnxToRKNN:
 
         # 右侧纵轴：累积欧氏距离（entire，与单层欧氏距离量级接近，分离显示便于对比）
         ax_entire = ax_euc.twinx()
-        ax_entire.plot(x, entire_euc, color='orange', marker='.', linestyle='-', linewidth=1, markersize=2, label='Euc (entire)')
+        ax_entire.plot(x, entire_euc, color='orange', marker='.', linestyle='-', linewidth=1.5, markersize=2, label='Euc (entire)')
         ax_entire.set_ylabel('Euc (entire)', fontsize=12)
 
         # 合并两个轴的图例
@@ -352,7 +339,7 @@ class OnnxToRKNN:
         # 图2：余弦相似度（逐层折线）
         ax_cos.set_yscale('linear')
         ax_cos.plot(x, single_cos, color='green', marker='.', linestyle='-', linewidth=1, markersize=2, label='Cosine (single)')
-        ax_cos.plot(x, entire_cos, color='orange', marker='.', linestyle='-', linewidth=1, markersize=2, label='Cosine (entire)')
+        ax_cos.plot(x, entire_cos, color='orange', marker='.', linestyle='-', linewidth=1.5, markersize=2, label='Cosine (entire)')
         ax_cos.set_title('Cosine Similarity (Per Layer)', fontsize=14, fontweight='bold')
         ax_cos.set_ylabel('Cosine Similarity', fontsize=12)
         ax_cos.set_xticks(range(n))
@@ -368,7 +355,8 @@ class OnnxToRKNN:
 
         plt.tight_layout()
         save_path = self.tmp_dir / 'rknn_accuracy_analysis_summary.png'
-        save_path.parent.mkdir(parents=True, exist_ok=True)
+        self.file_or_dir_to_clean.append(save_path)
+
         plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
         print(f"Figure saved to: {save_path}")
         plt.show()

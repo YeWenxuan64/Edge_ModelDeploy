@@ -1,21 +1,234 @@
 import os
 import sys
-import time
-import shutil
-from copy import deepcopy
+import copy
 from pathlib import Path
-import cv2
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
-import onnxruntime as ort
+import cv2
+
 
 current_dir = os.path.dirname(os.path.abspath(__file__))  # 获取当前文件所在目录的绝对路径
 sys.path.append(current_dir)
 
-from utils import letterbox_image
+from utils import letterbox_image, read_dataset_txt_to_list, clean_files_or_dirs, OnnxExecutor
 
 
-def resize_image(image:np.ndarray, input_size:tuple[int, int]) -> tuple[np.ndarray, float, int, int]:
-    # 调整图像大小并保持宽高比 (复用 utils.letterbox_image, BORDER_CONSTANT 灰色填充)
+
+class ProcessDatasetByModel:
+    def __init__(self, model_path:str, dataset_path:str|list[str]|None=None, output_dir_name:str='processed_by_model'):
+        self.model_path = Path(model_path).resolve()
+        self.output_dir_name = output_dir_name
+        self.file_or_dir_to_clean = []
+
+        if dataset_path:
+            if isinstance(dataset_path, list):
+                self.dataset_list_path = dataset_path
+            else:
+                self.dataset_list_path = read_dataset_txt_to_list(dataset_path)
+        else:
+            self.dataset_list_path = None
+
+        current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
+        self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
+        self.output_dir = self.tmp_dir / self.output_dir_name
+
+        self.loop_pair = None
+        self.loop_inited = False
+        self.replace_out_dataset_by_input = False
+
+        # 后台写入线程池（单线程，按序写入磁盘）
+        self.write_executor = ThreadPoolExecutor(max_workers=6)
+
+    def set_ring_loop(self, loop_pair:list[int, int]):
+        """
+        Args:
+            loop_pair: [model_input_n, model_output_n]
+        """
+
+        self.loop_pair = loop_pair
+        self.output_tensor_to_loop = np.zeros((224, 224, 3), dtype=np.float32)
+
+    def set_replace_out_dataset_by_input(self, not_normalize:bool=True):
+        """
+        replace the output dataset by input tensor.
+
+        """
+        self.replace_out_dataset_by_input = True
+        self.replace_not_normalize = not_normalize
+
+    def replace_output_dateset_list(self, output_dateset_list:list[np.ndarray], replace_pair_index:int):
+        self.input_tensor_list_to_out = output_dateset_list[replace_pair_index]
+
+    @staticmethod
+    def _write_files(write_buffer:list[tuple[str, np.ndarray]], output_format:str):
+        """实际执行写入磁盘的工作函数（在后台线程中运行）"""
+        for output_path, output in write_buffer:
+            if output_format == '.npy':
+                np.save(output_path, output)
+            elif output_format == '.raw':
+                output.tofile(output_path)
+
+        print(f"written {len(write_buffer)} {output_format} files.")
+
+    def _flush_writes(self, write_buffer:list[tuple[str, np.ndarray]], output_format:str):
+        """将缓存的 (路径, 数据) 列表提交到后台线程写入磁盘（不阻塞主流程）"""
+        if not write_buffer:
+            return
+        # 拷贝一份，避免主线程随后 clear 影响正在执行的写入任务
+        self.write_executor.submit(self._write_files, copy.deepcopy(write_buffer), output_format)
+
+    def process(self, rgb_mean:list[list[int]]=[[0, 0, 0]], rgb_std:list[list[int]]=[[1, 1, 1]], output_order:str='chw', output_format:str='.npy', output_list:bool=False) -> str|list[list[str]]:
+        if output_order not in ['chw', 'hwc', 'nchw', 'nhwc']:
+            raise ValueError("output_shape must be 'chw' or 'hwc' or 'nchw' or 'nhwc'")
+
+        if output_format not in ['.npy', '.raw']:
+            raise ValueError("output_format must be '.npy' or '.raw'")
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.file_or_dir_to_clean.append(self.output_dir)
+
+        onnx_executor = OnnxExecutor(str(self.model_path))
+        input_shapes = onnx_executor.get_input_shapes()
+
+        output_path_pairs_list:list[list[str]] = []
+        write_buffer:list[tuple[str, np.ndarray]] = []
+
+        for i, dataset_path_pair in enumerate(self.dataset_list_path):
+            input_tensor_list:list[np.ndarray] = []
+            output_path_pair_list:list[str] = []
+
+            if self.replace_out_dataset_by_input:
+                self.input_tensor_list_to_out:list[np.ndarray] = []
+
+            for j in range(len(input_shapes)):
+                if not self.loop_pair or self.loop_pair[0] != j:
+                    image_path = dataset_path_pair[j]
+                    input_size = input_shapes[j][2:4][::-1]
+                    rgb_mean = np.array(rgb_mean[j]).reshape(1, 3, 1, 1)
+                    rgb_std = np.array(rgb_std[j]).reshape(1, 3, 1, 1)
+
+                    # 读取图片
+                    image = cv2.imread(image_path)
+                    cv2.imshow("image", image)
+                    cv2.waitKey(1)
+
+                    if image is None:
+                        print(f"无法读取图片: {image_path}")
+                        continue
+
+                    img_float = letterbox_image(image, input_size, output_format="nchw", output_dtype='float32')
+                    img_norm = (img_float - rgb_mean) / rgb_std
+                    tensor_ori = img_float.copy()
+
+                else:
+                    if not self.loop_inited:
+                        self.loop_inited = True
+                        self.output_tensor_to_loop.resize(input_shapes[self.loop_pair[0]])
+
+                    img_norm = self.output_tensor_to_loop.copy()
+                    tensor_ori = img_norm.copy()
+
+                input_tensor_list.append(img_norm)
+
+                if self.replace_out_dataset_by_input:
+                    if self.replace_not_normalize:
+                        self.input_tensor_list_to_out.append(tensor_ori)
+                    else:
+                        self.input_tensor_list_to_out.append(img_norm.copy())
+
+            output_tensor_list = onnx_executor.put(input_tensor_list, input_format="nchw")
+
+
+            
+            for k, output_tensor in enumerate(output_tensor_list):
+                if self.loop_pair and self.loop_pair[1] == k:
+                    self.output_tensor_to_loop = output_tensor.copy()
+
+                if self.replace_out_dataset_by_input:
+                    output_tensor = self.input_tensor_list_to_out[k]
+
+
+                if output_order == 'chw':
+                    output_tensor = output_tensor.squeeze(0)
+                elif output_order == 'hwc':
+                    output_tensor = output_tensor.squeeze(0).transpose(1, 2, 0)
+                elif output_order == 'nchw':
+                    pass
+                elif output_order == 'nhwc':
+                    output_tensor = output_tensor.transpose(0, 2, 3, 1)
+
+                image_name = Path(image_path).stem
+
+                if self.replace_out_dataset_by_input:
+                    output_path = str(self.output_dir / f"{image_name}_in{k}{output_format}")
+                else:
+                    output_path = str(self.output_dir / f"{image_name}_out{k}{output_format}")
+
+                output_path_pair_list.append(str(output_path))
+                write_buffer.append((output_path, output_tensor))
+
+                if len(write_buffer) >= 16:
+                    self._flush_writes(write_buffer, output_format)
+                    write_buffer.clear()
+
+            output_path_pairs_list.append(output_path_pair_list)
+
+        # 刷新剩余不足 8 个的缓存
+        self._flush_writes(write_buffer, output_format)
+
+        # 等待后台线程把剩余写入任务全部落盘
+        self.write_executor.shutdown(wait=True)
+
+        cv2.destroyAllWindows()
+        onnx_executor.release()
+
+        if output_list:
+            return output_path_pairs_list
+        else:
+            output_txt = self.tmp_dir / "datasets_processed_by_model.txt"
+            self.file_or_dir_to_clean.append(output_txt)
+
+            with open(output_txt, 'w', encoding='utf-8') as f:
+                for pair_path in output_path_pairs_list:
+                    pair_path_full = " ".join(pair_path)
+                    pair_path_full += "\n"
+                    f.write(pair_path_full)
+
+            return str(output_txt)
+
+    def clean(self):
+        clean_files_or_dirs(self.file_or_dir_to_clean)
+
+if __name__ == '__main__':
+    model_path = "utilities/yolo26s_f16([[640,640]],[[1,300,6]]).onnx"
+    model_path = "unisal_ModelDeploy/models_convert/onnx/unisal_[[1,3,160,320][1,256,5,10]].onnx"
+    dataset = "datasets/datasets_short.txt"
+
+    process_dataset = ProcessDatasetByModel(model_path, dataset)
+    process_dataset.set_ring_loop([1,1])
+    process_dataset.set_replace_out_dataset_by_input()
+    process_dataset.process(rgb_mean=[[0, 0, 0]], rgb_std=[[1, 1, 1]], output_order='nchw', output_format='.npy')
+
+    # npy = np.load("utilities/tmp/processed_by_model/000000000785_in1.npy")
+    # print(npy.shape, npy)
+
+
+# ============================================================================
+# yolo_cropped_dataset_gen.py 内容已合并到此文件
+# ============================================================================
+
+import shutil
+from copy import deepcopy
+
+class OnnxExecutor:
+    """占位：实际实现在 utils.py 中"""
+    pass
+
+def preprocess_image(image:np.ndarray, input_size:tuple[int, int], mean_rgb:list[int]=[0, 0, 0], std_rgb:list[int]=[1, 1, 1]) -> tuple[np.ndarray, float, int, int]:
+    """预处理图像：调整大小、归一化、增加批次维度"""
+    padded = letterbox_image(image, (input_size[0], input_size[1]), output_format='hwc', output_dtype='uint8', border_value=(114, 114, 114))
+
     h, w = image.shape[:2]
     r = min(input_size[1] / h, input_size[0] / w)
     new_h, new_w = int(h * r), int(w * r)
@@ -26,12 +239,6 @@ def resize_image(image:np.ndarray, input_size:tuple[int, int]) -> tuple[np.ndarr
     top = pad_h // 2
     left = pad_w // 2
 
-    padded = letterbox_image(image, (input_size[0], input_size[1]), output_format='hwc', output_dtype='uint8', border_value=(114, 114, 114))
-    return padded, r, left, top
-
-def preprocess_image(image:np.ndarray, input_size:tuple[int, int], mean_rgb:list[int]=[0, 0, 0], std_rgb:list[int]=[1, 1, 1]) -> tuple[np.ndarray, float, int, int]:
-    """预处理图像：调整大小、归一化、增加批次维度"""
-    padded, r, left, top = resize_image(image, input_size)
     
     # 归一化并调整维度顺序
     mean_rgb = np.array(mean_rgb, dtype=np.float32).reshape((1, 1, 3))
@@ -144,31 +351,23 @@ class GenYoloCroppedDataset:
 
         if outpur_format not in ['.npy', '.raw']:
             raise ValueError("outpur_format must be '.npy' or '.raw'")
-        
-        self.another_args_list.append((another_model_path, process_target, output_shape, outpur_format, rgb_mean, rgb_std))
+
+        another_model_path = Path(another_model_path).resolve()
+        self.another_args_list.append((str(another_model_path), process_target, output_shape, outpur_format, rgb_mean, rgb_std))
         
     @staticmethod
     def postprocess_by_another_model(another_model_path:str, image_path_list:list[str], output_shape, output_format, mean_rgb, std_rgb) -> list[str]:
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        sess_options.enable_mem_pattern = True
-
-        another_model_ort = ort.InferenceSession(another_model_path, sess_options=sess_options)
-        input_details = another_model_ort.get_inputs()[0]
-
-        another_model_input_shape:list[int] = input_details.shape
-        input_h, input_w = another_model_input_shape[2], another_model_input_shape[3]
-        anorher_ai_input_name:str = input_details.name
+        onnx_executor = OnnxExecutor(another_model_path)
+        input_sizes = onnx_executor.get_input_shapes()[0][2:4][::-1]
 
         output_path_list = []
         for image_path in image_path_list:
             image = cv2.imread(image_path)
             cv2.imshow('image', image)
             cv2.waitKey(1)
-            input_tensor, scale, x_offset, y_offset = preprocess_image(image, (input_w, input_h), mean_rgb=mean_rgb, std_rgb=std_rgb)
-
-            outputs = another_model_ort.run(None, {anorher_ai_input_name: input_tensor})
+            input_tensor, scale, x_offset, y_offset = preprocess_image(image, input_sizes, mean_rgb=mean_rgb, std_rgb=std_rgb)
+            
+            outputs = onnx_executor.put([input_tensor], input_format="nchw")
             output:np.ndarray = outputs[0] # nchw
 
             if output_shape == 'chw':
@@ -190,6 +389,7 @@ class GenYoloCroppedDataset:
 
             output_path_list.append(output_path)
 
+        onnx_executor.release()
         return output_path_list
 
     def prepare_work_dir(self) -> tuple[list[str], str]:
@@ -305,14 +505,8 @@ class GenYoloCroppedDataset:
         full_img_path_list, output_dir = self.prepare_work_dir()
 
         # 初始化ONNX运行时
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        sess_options.enable_mem_pattern = True
-
-        session = ort.InferenceSession(self.yolo_model_path, sess_options=sess_options)
-        input_name = session.get_inputs()[0].name
-
+        onnx_executor = OnnxExecutor(self.yolo_model_path)
+        input_sizes = onnx_executor.get_input_shapes()[0][2:4][::-1]
         all_cropped_paths:list[list[str, str]] = []
         for image_path in full_img_path_list:
             # 读取图片
@@ -322,10 +516,10 @@ class GenYoloCroppedDataset:
                 continue
             
             # 预处理
-            input_tensor, scale, x_offset, y_offset = preprocess_image(image, input_size=(640, 640), std_rgb=[255, 255, 255])
+            input_tensor, scale, x_offset, y_offset = preprocess_image(image, input_size=input_sizes, std_rgb=[255, 255, 255])
             
             # 推理
-            output = session.run(None, {input_name: input_tensor})[0]
+            output = onnx_executor.put([input_tensor], input_format="nchw")[0]
             
             # 处理预测结果
             results = process_predictions(output)
@@ -341,6 +535,7 @@ class GenYoloCroppedDataset:
                         all_cropped_paths.append([image_path, cropped_path])
 
         cv2.destroyWindow("Detection Results")
+        onnx_executor.release()
 
         original_all_cropped_paths = deepcopy(all_cropped_paths)
         new_all_cropped_paths = deepcopy(all_cropped_paths)
@@ -363,9 +558,6 @@ class GenYoloCroppedDataset:
                     pair_path[index] = output_path_list[j] # 替换为处理后的文件的路径
 
         cv2.destroyAllWindows()
-        del session
-
-
     
         # 保存裁剪图片的路径列表
         output_txt = str(self.tmp_dir / str(self.output_dir_name + '_list.txt'))
@@ -399,32 +591,10 @@ class GenYoloCroppedDataset:
 
 
     def clean(self):
-        file_count = 0
-        dir_count = 0
-
-        for file_or_dir in self.file_or_dir_to_clean:
-            try:
-                if os.path.isfile(file_or_dir):
-                    os.remove(file_or_dir)
-                    file_count += 1
-
-                elif os.path.isdir(file_or_dir):
-                    # 统计目录中的文件数量
-                    for root, dirs, files in os.walk(file_or_dir):
-                        file_count += len(files)
-                        dir_count += len(dirs)
-                    
-                    shutil.rmtree(file_or_dir) # 删除目录
-                    dir_count += 1  # 加上被删除的目录本身
-
-            except Exception as e:
-                print(f"failed to delete {file_or_dir} due to {e}")
-
-        print(f"cleaned {file_count} files and {dir_count} dirs")
+        clean_files_or_dirs(self.file_or_dir_to_clean)
 
 
-
-def main():
+if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
     parent_dir = os.path.dirname(current_dir)
 
@@ -432,18 +602,16 @@ def main():
     dataset_path = os.path.join(parent_dir, 'datasets/datasets_face.txt')  # 输入图片索引文本
 
     # 另一个AI模型路径
-    another_model_path_and_target = [('./NanoTrackV3_ModelDeploy/models_convert/onnx/NanoTrackV3_backbone_T_127.onnx', 'output'),
-                                     ('./NanoTrackV3_ModelDeploy/models_convert/onnx/NanoTrackV3_backbone_X_255.onnx', 'input')]  
+    another_model1_path = 'nanotrack_v3_ModelDeploy/models_convert/onnx/NanoTrackV3_backbone_X_255.onnx'
+    another_model2_path = 'nanotrack_v3_ModelDeploy/models_convert/onnx/NanoTrackV3_backbone_T_127.onnx'
 
     # 创建对象并生成数据集
     dataset_generator = GenYoloCroppedDataset(dataset_path, 'cropped_images2')
-    dataset_generator.set_postprocess_by_another_model(another_model_path_and_target, output_shape="nchw", outpur_format='.npy')
+    dataset_generator.set_postprocess_by_another_model(another_model1_path, process_target="input", output_shape="nchw", outpur_format='.npy')
+    dataset_generator.set_postprocess_by_another_model(another_model2_path, process_target="output", output_shape="nchw", outpur_format='.npy')
 
     cropped_list_path = dataset_generator.generate()
 
     print(f"裁剪后的图片路径列表已保存到: {cropped_list_path}")
 
     #dataset_generator.clean()
-
-if __name__ == "__main__":
-    main()
