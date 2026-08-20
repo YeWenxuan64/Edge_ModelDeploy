@@ -31,7 +31,8 @@
 | **PyTorch/TensorFlow → ONNX** | 各子模块独立脚本 | 处理算子兼容、动态图固化、模型优化 |
 | **ONNX → RKNN** | `utilities/onnx_to_rknn.py` | Rockchip NPU（RK3588 / RK3576），支持 INT8 量化、混合精度量化|
 | **ONNX → QNN** | `utilities/onnx_to_qnn.py` | Qualcomm NPU（HTP），支持 INT8/INT4 量化、混合精度量化 |
-| **数据集生成** | `utilities/yolo_croped_dataset_gen.py` | 基于 YOLO 检测自动裁剪量化校准数据集 |
+| **ONNX → QDQ-ONNX（AIMET）** | `utilities/onnx_aimet_quant.py` | 独立 PTQ 量化器（Qualcomm AIMET），导出 QDQ ONNX + encodings，可作为 QNN 外置量化器 |
+| **数据集生成** | `utilities/dataset_preprocess.py` | 基于 YOLO 检测自动裁剪量化校准数据集 |
 
 > **工具链是核心资产** — 每个子模块（AVTrack、NanoTrackV3、RetinaFace 等）都复用同一套 `utilities/` 转换工具，只需编写模型特有的 PyTorch → ONNX 导出脚本即可。
 
@@ -43,7 +44,8 @@ Edge_ModelDeploy/
 ├── utilities/                       # ⭐ 共享转换工具链（核心）
 │   ├── onnx_to_rknn.py              # ONNX → RKNN 转换（Rockchip）
 │   ├── onnx_to_qnn.py               # ONNX → QNN 转换（Qualcomm）
-│   ├── yolo_croped_dataset_gen.py      # YOLO 检测辅助的量化数据集生成
+│   ├── onnx_aimet_quant.py          # AIMET 2.x 后训练量化（PTQ）→ QDQ ONNX + encodings
+│   ├── dataset_preprocess.py        # 量化数据集预处理（含 YOLO 检测自动裁剪）
 │   ├── utils.py                     # 通用工具函数
 │   └── qairt/                       # Qualcomm AI Runtime SDK # 需自行下载并放入
 ├── datasets/                        # 量化校准数据集
@@ -83,6 +85,7 @@ Edge_ModelDeploy/
 | 训练框架 to ONNX | 支持       | 支持 | 3.10+ |
 | ONNX to RKNN    | 支持       | 支持 | 3.10 - 3.12 |
 | ONNX to QNN     | 目前不支持 | 支持 | 3.10 |
+| ONNX to QDQ-ONNX（AIMET） | 目前不支持 | 支持 | 3.10 |
 
 
 ### 1. 克隆项目（含子模块）
@@ -148,7 +151,7 @@ Eedge_ModelDeploy/
 ├── utilities/
 │   ├── onnx_to_rknn.py
 │   ├── onnx_to_qnn.py
-│   ├── yolo_croped_dataset_gen.py
+│   ├── dataset_preprocess.py
 │   ├── utils.py
 │   └── qairt/                       # Qualcomm AI Runtime SDK # 需自行下载并放入
 │       └── 2.38.0.250901/           # SDK 版本                # 可自行挑选
@@ -203,74 +206,73 @@ python yolo26_onnx2qnn.py
 ### 模型转换工作流
 
 ```
-                   ┌─────────────────────────────────┐
-                   │      PyTorch / TensorFlow       │
-                   │    (Training Framework Model)   │
-                   └───────────────┬─────────────────┘
-                                   │  Per-submodule scripts
-                                   ▼
-                   ┌─────────────────────────────────┐
-                   │             ONNX                │
-                   │   (Intermediate Representation) │
-                   └───────────────┬─────────────────┘
-                                   │
-                ┌──────────────────┴─────────────────┐
-                │                                    │
-                ▼                                    ▼
-┌─────────────────────────────────┐  ┌─────────────────────────────────┐
-│           OnnxToRKNN            │  │           OnnxToQNN             │
-│  (utilities/onnx_to_rknn.py)    │  │  (utilities/onnx_to_qnn.py)     │
-│                                 │  │                                 │
-├─────────────────────────────────┤  ├─────────────────────────────────┤
-│                                 │  │                                 │
-│  1. rknn.config()               │  │  1. run_env_script()            │
-│     Config quant algorithm      │  │     Source QAIRT SDK env vars   │
-│                                 │  │                                 │
-│  2. rknn.load_onnx()            │  │  2. modify_onnx_model()         │
-│     Load ONNX model             │  │     Add normalization nodes     │
-│                                 │  │     (Sub/Div)                   │
-│  3. rknn.build()                │  │     Reorder nodes by I/O        │
-│     ├─ With dataset → INT8      │  │     ONNX validate + Shape infer │
-│     ├─ No dataset  → FP16       │  │                                 │
-│     └─ Hybrid quant → step1+2   │  │  3. get_onnx_model_info()       │
-│                                 │  │     Parse input/output dims     │
-│  4. rknn.export_rknn()          │  │                                 │
-│     Export .rknn model file     │  │  3.5 do_hybrid_quantization()   │
-│                                 │  │     Hybrid overrides JSON       │
-│  5. rknn.release()              │  │     16-bit / FP16 subgraph      │
-│     Release resources           │  │                                 │
-│                                 │  │  4. convert_onnx_model()        │
-│  6. clean()                     │  │     qairt-converter             │
-│     Clean temp files            │  │     ONNX ──► DLC (unquantized)  │
-│                                 │  │                                 │
-│                                 │  │  5. generate_calibration_data() │
-│                                 │  │     Read imgs → Preprocess →    │
-│                                 │  │     .raw files                  │
-│                                 │  │                                 │
-│                                 │  │  6. quantize_model()            │
-│                                 │  │     qairt-quantizer             │
-│                                 │  │     DLC ──► Quantized DLC       │
-│                                 │  │                                 │
-│                                 │  │  7. write_config_file()         │
-│                                 │  │     Generate HTP backend config │
-│                                 │  │     JSON                        │
-│                                 │  │                                 │
-│                                 │  │  8. generate_context_binary()   │
-│                                 │  │     qnn-context-binary-generator│
-│                                 │  │     Quantized DLC ──► .bin (HTP)│
-│                                 │  │                                 │
-│                                 │  │  9. clean()                     │
-│                                 │  │     Clean temp files            │
-└───────────────┬─────────────────┘  └───────────────┬─────────────────┘
-                │                                    │
-                ▼                                    ▼
-┌─────────────────────────────────┐  ┌─────────────────────────────────┐
-│         .rknn Model             │  │          .bin Model             │
-│     Rockchip NPU Executable     │  │     Qualcomm HTP Executable     │
-│   (RK3588 / RK3576 / RK3566)    │  │  (QCS6490 / QCS8550 / QCS9075)  │
-└─────────────────────────────────┘  └─────────────────────────────────┘
+                                    ┌─────────────────────────────────┐
+                                    │      PyTorch / TensorFlow       │
+                                    │    (Training Framework Model)   │
+                                    └───────────────┬─────────────────┘
+                                                    │  Per-submodule scripts
+                                                    ▼
+                                    ┌─────────────────────────────────┐
+                                    │             ONNX                │
+                                    │   (Intermediate Representation) │
+                                    └───────────────┬─────────────────┘
+                                                    │
+                            ┌───────────────────────┼─────────────────────┐
+                            │                       │                     │
+                            ▼                       ▼                     ▼
+┌────────────────────────────────┐ ┌────────────────────────────────┐ ┌────────────────────────────────┐
+│           OnnxToRKNN           │ │           OnnxToQNN            │ │        AimetOnnxQuantizer      │
+│  (utilities/onnx_to_rknn.py)   │ │  (utilities/onnx_to_qnn.py)    │ │ (utilities/onnx_aimet_quant.py)│
+│                                │ │                                │ │                                │
+├────────────────────────────────┤ ├────────────────────────────────┤ ├────────────────────────────────┤
+│                                │ │                                │ │                                │
+│ 1. rknn.config()               │ │ 1. run_env_script()            │ │ 1. QuantizationSimModel        │
+│    Config quant algorithm      │ │    Source QAIRT SDK env vars   │ │    param/act qtype + scheme    │
+│                                │ │                                │ │                                │
+│ 2. rknn.load_onnx()            │ │ 2. modify_onnx_model()         │ │ 2. set_tensor_precision()      │
+│    Load ONNX model             │ │    Add normalization nodes     │ │    (optional) mixed precision  │
+│                                │ │    (Conv)                      │ │                                │
+│ 3. rknn.build()                │ │    Reorder nodes by I/O        │ │ 3. compute_encodings()         │
+│    ├─ With dataset ─► INT8     │ │    ONNX validate + Shape infer │ │    Dataset calibration         │
+│    ├─ No dataset  ─► FP16      │ │                                │ │                                │
+│    └─ Hybrid quant ─► step1+2  │ │ 3. get_onnx_model_info()       │ │ 4. to_onnx_qdq()               │
+│                                │ │    Parse input/output dims     │ │    QDQ ONNX + encodings JSON   │
+│ 4. rknn.export_rknn()          │ │                                │ │                                │
+│    Export .rknn model file     │ │ 3.5 do_hybrid_quantization()   │ │ 5. export_qairt_overrides()    │
+│                                │ │     Hybrid overrides JSON      │ │    ─► QAIRT overrides JSON     │
+│ 5. rknn.release()              │ │     16-bit / FP16 subgraph     │ │                                │
+│    Release resources           │ │                                │ │                                │
+│                                │ │ 4. convert_onnx_model()        │ │                                │
+│ 6. clean()                     │ │    qairt-converter             │ │                                │
+│    Clean temp files            │ │    ONNX ─► DLC (unquantized)   │ │                                │
+│                                │ │                                │ │                                │
+│                                │ │ 5. generate_calibration_data() │ │                                │
+└───────────────┬────────────────┘ │    Read imgs → Preprocess →    │ └───────────────┬────────────────┘
+                │                  │    .raw files                  │                 │              
+                ▼                  │                                │                 ▼ 
+┌────────────────────────────────┐ │ 6. quantize_model()            │ ┌─────────────────────────────────┐
+│         .rknn Model            │ │    qairt-quantizer             │ │      QDQ ONNX + encodings       │
+│     Rockchip NPU Executable    │ │    DLC ─► Quantized DLC        │ │   AIMET Quantized (→ QNN/RKNN)  │
+│   (RK3588 / RK3576 / RK3566)   │ │                                │ │   / ONNX Deploy / QNN external  │
+└────────────────────────────────┘ │ 7. write_config_file()         │ └─────────────────────────────────┘
+                                   │    Generate HTP backend config │
+                                   │    JSON                        │
+                                   │                                │
+                                   │ 8. generate_context_binary()   │
+                                   │    qnn-context-binary-generator│
+                                   │    Quantized DLC ─► .bin (HTP) │
+                                   │                                │
+                                   │ 9. clean()                     │
+                                   │    Clean temp files            │
+                                   └───────────────┬────────────────┘  
+                                                   │                 
+                                                   ▼                  
+                                   ┌────────────────────────────────┐
+                                   │          .bin Model            │
+                                   │     Qualcomm HTP Executable    │
+                                   │ (QCS6490 / QCS8550 / QCS9075)  │
+                                   └────────────────────────────────┘
 ```
-
 
 
 
