@@ -866,7 +866,6 @@ def get_onnx_model_info(tmp_onnx_path:str) -> dict|None:
         outputs.append(output_info)
 
     model_info = {"inputs": inputs, "outputs": outputs}
-    print(f"Model info: {model_info}")
 
     return model_info
 

@@ -21,7 +21,7 @@ from utils import temporary_chdir, letterbox_image, clean_files_or_dirs, read_da
 from utils import sanitize_name, parse_bitwidth, find_hybrid_subgraph_nodes
 from utils import get_onnx_model_info, normalize_onnx_model, reorder_onnx_nodes_by_input, reorder_onnx_nodes_by_output
 from qnn_accuracy_debugger import SnpeAccuracyDebugger
-from onnx_aimet_quant import AimetOnnxQuantizer, _resolve_aimet_config_path
+from onnx_aimet_quant import AimetOnnxQuantizer, AimetQuantsimConfig
 
 
 
@@ -128,29 +128,48 @@ class QnnHybridQuantGen:
 
 
 class QnnAimetConnector:
-    """AIMET 2.x 量化路径连接器（OnnxToQNN.set_use_aimet 创建）。
+    """AIMET 量化路径连接器，把 AIMET PTQ 接入 OnnxToQNN 转换流程。
 
-    封装 AIMET 量化路径：AIMET PTQ -> QDQ ONNX + encodings -> qairt-converter
-    转量化 DLC -> context binary（可选精度分析）。OnnxToQNN.convert() 检测到
-    self.aimet_connector 后调用其 convert()。
+    由 OnnxToQNN.set_use_aimet() 创建。量化路径：AIMET 校准量化 ->
+    导出 QDQ ONNX -> qairt-converter 直接转量化 DLC（跳过 qairt-quantizer，
+    编码由 AIMET 决定，与 QNN calibration 解耦）-> context binary，
+    可选精度分析。OnnxToQNN.convert() 检测到 self.aimet_connector 后
+    委托其 convert() 执行。
     """
 
-    def __init__(self, converter:'OnnxToQNN', quant_method:str, bitwidth:str, param_quant_schema:str='symmetric', act_quant_schema:str='asymmetric',
-                 encoding_version:str='2.0.0', config_file:str|None=None):
+    def __init__(self, converter:'OnnxToQNN', config_file:str|None=None):
         """创建连接器并保存 AIMET 量化配置。
 
         Args:
-            converter: 父级 OnnxToQNN；回调 convert_onnx_model / write_config_file /
-                generate_context_binary_model 等，并读取校准数据 / 精度分析器状态。
+            converter: 父级 OnnxToQNN 实例。convert() 通过它回调
+                convert_onnx_model / write_config_file / generate_context_binary_model，
+                并读取校准数据、混合量化与精度分析器状态。
+            config_file: AIMET quantsim_config 路径或别名（'default'/'htp_v68'...）。
+                传 htp 版本时在此解析为对应内置配置的绝对路径；None 时由
+                AimetOnnxQuantizer 按 'default' 处理。
+        """
+
+        self.converter = converter
+
+        # 传入 htp 版本（如 'htp_v68'/'htp_v73'）时，在此加载对应版本的内置
+        # quantsim_config，得到其绝对路径。对称性等后续由 AimetOnnxQuantizer.
+        # _build_sim 基于该内置配置改写（defaults 级）后应用，绝不改动算子级配置。
+        self.config_file = (AimetQuantsimConfig.resolve_path(config_file)
+                            if config_file is not None else None)
+        if self.config_file is not None:
+            print(f"[AIMET] load quantsim_config: {self.config_file}")
+
+    def get_quantization_method(self, quant_method:str, bitwidth:str, param_quant_schema:str='symmetric', act_quant_schema:str='asymmetric', use_cle_algorithm:bool=False):
+        """设置 AIMET 量化方案、位宽与权重/激活对称性（convert() 前调用）。
+
+        Args:
             quant_method: AIMET 方案（'min_max'/'tf_enhanced'/'percentile' 及别名）。
             bitwidth: 全局位宽 'w<W>a<A>'，如 'w8a8'。
             param_quant_schema: 权重对称性（'asymmetric'/'symmetric'/'unsignedsymmetric'）。
                 默认 'symmetric'。
             act_quant_schema: 激活对称性（'asymmetric'/'symmetric'/'unsignedsymmetric'）。
                 默认 'asymmetric'。
-            encoding_version: encodings 版本（'0.6.1'/'1.0.0'/'2.0.0'）。默认 '2.0.0'。
-            config_file: AIMET quantsim_config 路径或别名；传 htp 版本（如 'htp_v68'）
-                会解析为对应内置配置绝对路径；None 用 'default'。
+            use_cle_algorithm: 是否启用 Cross-Layer Equalization（CLE）。默认 False。
         """
         if param_quant_schema not in ['asymmetric', 'symmetric', 'unsignedsymmetric']:
             raise ValueError('param_quant_schema must be one of asymmetric, symmetric, unsignedsymmetric')
@@ -158,20 +177,11 @@ class QnnAimetConnector:
         if act_quant_schema not in ['asymmetric', 'symmetric', 'unsignedsymmetric']:
             raise ValueError('act_quant_schema must be one of asymmetric, symmetric, unsignedsymmetric')
 
-        self.converter = converter
         self.quant_method = quant_method
         self.bitwidth = bitwidth
         self.param_quant_schema = param_quant_schema
         self.act_quant_schema = act_quant_schema
-        self.encoding_version = encoding_version
-
-        # 传入 htp 版本（如 'htp_v68'/'htp_v73'）时，在此加载对应版本的内置
-        # quantsim_config，得到其绝对路径。对称性等后续由 AimetOnnxQuantizer.
-        # _build_sim 基于该内置配置改写（defaults 级）后应用，绝不改动算子级配置。
-        self.config_file = (_resolve_aimet_config_path(config_file)
-                            if config_file is not None else None)
-        if self.config_file is not None:
-            print(f"[AIMET] load quantsim_config: {self.config_file}")
+        self.use_cle_algorithm = use_cle_algorithm
 
         print(f"Enabled AIMET 2.x quantization path (scheme={self.quant_method}, {bitwidth}")
 
@@ -179,8 +189,10 @@ class QnnAimetConnector:
         """实时读取 converter.hybrid_quantizer 的混合量化配置（与调用顺序无关）。
 
         Returns:
-            (hybrid_subgraphs, hybrid_weights_bitwidth, hybrid_act_bitwidth,
-             hybrid_float_bitwidth)；未设置时返回 (None, 8, 16, None)。
+            (hybrid_subgraphs, hybrid_bitwidth, hybrid_float_bitwidth)：
+            子图 [in, out] 对列表、子图位宽 'w<W>a<A>'、浮点保留位宽
+            （16/32 表示子图保持 FP16/FP32，None 表示按 bitwidth 量化）。
+            未设置混合量化时返回 (None, 'w8a16', None)。
         """
         hybrid_quantizer = self.converter.hybrid_quantizer
         if hybrid_quantizer is None:
@@ -196,8 +208,11 @@ class QnnAimetConnector:
         return hybrid_subgraphs, hybrid_bitwidth, None
 
     def convert(self, onnx_model_info:dict, mean_rgb:list, std_rgb:list, set_input_order:str):
-        """执行 AIMET 量化路径：AIMET PTQ -> QDQ ONNX + encodings -> 量化 DLC
-        -> context binary，可选精度分析。由 OnnxToQNN.convert() 调用。
+        """执行 AIMET 量化路径，由 OnnxToQNN.convert() 委托调用。
+
+        流程：AIMET 校准量化 -> 导出 QDQ ONNX（+ encodings）-> 按 graph.input
+        顺序重排 QDQ 输入链 -> qairt-converter 转量化 DLC -> 写 config ->
+        生成 context binary -> 可选精度分析（FP32 golden DLC vs 量化 DLC）。
 
         Args:
             onnx_model_info: ONNX 模型信息（get_onnx_model_info 产出，含 inputs 等）。
@@ -206,55 +221,59 @@ class QnnAimetConnector:
         """
         converter = self.converter
         tmp_onnx_path = converter.tmp_onnx_path
-        tmp_dir = converter.tmp_dir
+        qdq_model_path = converter.tmp_dir / f"{tmp_onnx_path.stem}_qdq.onnx"
+
+        # 1.
+        quantizer = AimetOnnxQuantizer(str(tmp_onnx_path), qdq_model_path, converter.dataset_path, self.config_file)
+
+        # 2.
+        quantizer.set_quantization_method(self.quant_method, self.bitwidth, self.param_quant_schema, self.act_quant_schema, self.use_cle_algorithm)
 
         # 混合量化实时读取 converter.hybrid_quantizer（兼容 do_hybrid_quantization
-        # 在 set_use_aimet 之后调用的顺序），避免 set_use_aimet 快照时 hybrid 尚未设置
-        quantizer = AimetOnnxQuantizer(str(tmp_onnx_path), config_file=self.config_file)
-
-        quantizer.set_quantization_method(self.quant_method, self.bitwidth,
-                                          param_quant_schema=self.param_quant_schema, act_quant_schema=self.act_quant_schema)
-
-
+        # 2.5
         hybrid_subgraphs, hybrid_bitwidth, hybrid_float_bitwidth = self.current_hybrid_config()
         if hybrid_subgraphs:
             quantizer.do_hybrid_quantization(hybrid_subgraphs, hybrid_bitwidth, hybrid_float_bitwidth)
 
-        # AIMET 量化必须有真实校准数据：随机 dummy 无法反映真实激活分布，直接报错
-        if converter.custom_alibration_data_path is None and converter.dataset_path is None:
-            raise ValueError(
-                "AIMET quantization requires calibration data: provide dataset_path or "
-                "call use_custom_alibration_data(path) before convert()."
-            )
+        # 2.75
+        if converter.custom_alibration_data_path is not None:
+            quantizer.use_custom_alibration_data(converter.custom_alibration_data_path)
+        elif converter.dataset_path is None:
+            # AIMET 量化必须有真实校准数据：随机 dummy 无法反映真实激活分布，直接报错
+            raise ValueError("AIMET quantization requires calibration data: provide dataset_path or "
+                "call use_custom_alibration_data(path) before convert().")
 
-        # 生成 AIMET 校准输入（与 QAIRT 校准数据使用同一套预处理）
-        calibration_inputs = self.generate_calibration_inputs(onnx_model_info, set_input_order)
-        quantizer.quantize(calibration_data=calibration_inputs)
+        # 3.
+        model_info = get_onnx_model_info(str(tmp_onnx_path))
+        input_shapes = [tuple(d for d in i['shape']) for i in model_info['inputs']]
+        mean = [[0] * input_shape[1] for input_shape in input_shapes]
+        std = [[1] * input_shape[1] for input_shape in input_shapes]
 
-        # 导出 QDQ ONNX + encodings
-        qdq_path, enc_path = quantizer.export(
-            str(tmp_dir),
-            f"{tmp_onnx_path.stem}_aimet_qdq",
-            encoding_version=self.encoding_version,
-        )
+        qdq_path, enc_path = quantizer.convert(mean, std, normalize_model=False, export_encodings=True)
+
         converter.file_or_dir_to_clean.append(qdq_path)
         converter.file_or_dir_to_clean.append(enc_path)
 
         # AIMET 导出的 QDQ 输入消费链排列顺序可能与 graph.input 不一致（多输入模型常见），
         # 会导致 qairt-converter 推导出的 DLC 输入顺序错位（运行时按 graph.input 顺序
         # 喂数据时 NPU 输入错乱）。按 graph.input 顺序重排 QDQ 输入链后再转换。
+        # 3.5
         self.reorder_qdq_input_chains_by_graph_order(qdq_path)
 
         # 转换 QDQ ONNX -> 量化 DLC（AIMET 编码直接进入 DLC，无需 qairt-quantizer）
         # is_quantized=True 时 convert_onnx_model 自动给 DLC 命名加 _quantized 后缀
-        dlc_model_path = converter.convert_onnx_model(onnx_model_info, set_input_order,
-                                                      input_network_path=qdq_path, is_quantized=True)
+        # 4.
+        dlc_model_path = converter.convert_onnx_model(onnx_model_info, set_input_order, input_network_path=qdq_path, is_quantized=True)
         if dlc_model_path is None:
             exit(1)
 
+        # 5.
         config_path = converter.write_config_file(dlc_model_path)
+
+        # 6.
         converter.generate_context_binary_model(dlc_model_path, config_path)
 
+        # 7. 精度分析（可选）
         if converter.accuracy_analyzer is not None and dlc_model_path is not None:
             # 精度分析 golden：纯浮点 DLC
             golden_dlc_path = converter.convert_onnx_model(onnx_model_info, set_input_order,
@@ -269,111 +288,19 @@ class QnnAimetConnector:
             else:
                 print("Accuracy analysis failed.")
 
-    def generate_calibration_inputs(self, onnx_model_info:dict, set_input_order:str):
-        """生成 AIMET 校准输入（始终为 NCHW）。
-
-        优先级：1) custom_alibration_data_path（.raw，布局由 set_input_order 解释，
-        'nhwc' 先按 NHWC reshape 再转 NCHW）；2) dataset_path（图片 letterbox NCHW）；
-        3) 都没有 -> 报错。
-
-        Args:
-            onnx_model_info: ONNX 模型信息（含 inputs，用于输入名 / shape）。
-            set_input_order: 输入布局，'nhwc'/'nchw'（决定 .raw 的 reshape 与转置）。
-
-        Yields:
-            每个样本为 {输入名: np.ndarray}（NCHW）。
-        """
-        converter = self.converter
-        input_infos = onnx_model_info["inputs"]
-        needs_nhwc_to_nchw = (set_input_order == 'nhwc')
-
-        # 1) 自定义 .raw 校准数据
-        if converter.custom_alibration_data_path is not None:
-            raw_dir = Path(converter.custom_alibration_data_path).parent
-            with open(str(converter.custom_alibration_data_path)) as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-            for line in lines:
-                raws = [p for p in line.split(' ') if p]
-                if len(raws) != len(input_infos):
-                    print(f"Warning: line has {len(raws)} files but model has {len(input_infos)} inputs, skipped")
-                    continue
-                sample = {}
-                for idx, info in enumerate(input_infos):
-                    model_shape = [d if d != 'dynamic' else 1 for d in info['shape']]
-                    p = Path(raws[idx])
-                    if not p.is_absolute():
-                        p = raw_dir / p
-                    arr = np.fromfile(str(p), dtype=np.float32)
-                    # 自定义 .raw 布局由 set_input_order 决定：
-                    #   'nhwc' -> 用户数据为 NHWC [N,H,W,C]，先按 NHWC reshape 再转 NCHW
-                    #   'nchw' -> 用户数据即 NCHW，直接 reshape 为模型输入 shape
-                    if needs_nhwc_to_nchw and len(model_shape) == 4:
-                        target_shape = [model_shape[0], model_shape[2], model_shape[3], model_shape[1]]
-                    else:
-                        target_shape = model_shape
-                    try:
-                        arr = arr.reshape(target_shape)
-                    except ValueError:
-                        print(f"Warning: {p} cannot be reshaped to {target_shape}, skipped")
-                        sample = {}
-                        break
-                    if needs_nhwc_to_nchw and len(model_shape) == 4:
-                        arr = np.transpose(arr, (0, 3, 1, 2))
-                    sample[info['name']] = np.ascontiguousarray(arr)
-                if sample:
-                    yield sample
-            return
-
-        # 2) 图片数据集
-        if converter.dataset_path is not None:
-            dataset_dir = converter.dataset_path.parent
-            with open(str(converter.dataset_path)) as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-            for line in lines:
-                img_paths = [p for p in line.split(' ') if p]
-                if len(img_paths) != len(input_infos):
-                    print(f"Warning: line has {len(img_paths)} images but model has {len(input_infos)} inputs, skipped")
-                    continue
-                sample = {}
-                for idx, info in enumerate(input_infos):
-                    shape = info['shape']
-                    if len(shape) != 4 or shape[0] != 1:
-                        raise ValueError(f"Unsupported input shape {shape} for input {info['name']}")
-                    height, width = shape[2], shape[3]
-                    p = Path(img_paths[idx])
-                    if not p.is_absolute():
-                        p = dataset_dir / p
-                    img = cv2.imread(str(p))
-                    if img is None:
-                        print(f"Warning: could not read {p}")
-                        sample = {}
-                        break
-                    arr = letterbox_image(img, (width, height),
-                                          output_format='nchw',
-                                          output_dtype='float32')
-                    sample[info['name']] = np.ascontiguousarray(arr)
-                if sample:
-                    yield sample
-            return
-
-        # 3) 未提供任何校准数据：直接报错（随机 dummy 无法反映真实分布，量化编码无意义）
-        raise ValueError(
-            "No calibration data provided for AIMET quantization. "
-            "Provide dataset_path or call use_custom_alibration_data(path) "
-            "before convert()."
-        )
-
     @staticmethod
-    def reorder_qdq_input_chains_by_graph_order(qdq_model_path:str, aggressive:bool=True) -> str:
-        """按 graph.input 顺序重排 QDQ 输入消费链，保证 qairt-converter 推导的 DLC
-        输入顺序与运行时一致（多输入模型，如 lightFC）。仅调整节点顺序、不改数值。
+    def reorder_qdq_input_chains_by_graph_order(qdq_model_path:str) -> str:
+        """按 graph.input 顺序重排 QDQ 输入消费链（原地保存，仅调节点顺序、不改数值）。
+
+        AIMET 导出的 QDQ 输入消费链排列顺序可能与 graph.input 不一致（多输入模型
+        常见），会导致 qairt-converter 推导出的 DLC 输入顺序错位（运行时按
+        graph.input 顺序喂数据时 NPU 输入错乱）。单输入模型直接跳过。
 
         Args:
             qdq_model_path: QDQ ONNX 路径（原地重排保存）。
-            aggressive: 是否激进重排（回传 weight_dq 分支优先级）。默认 True。
 
         Returns:
-            str: 重排后的 QDQ ONNX 路径。
+            str: 重排后的 QDQ ONNX 路径（与入参相同）。
         """
         model = onnx.load_model(qdq_model_path)
         graph = model.graph
@@ -383,15 +310,13 @@ class QnnAimetConnector:
         if len(real_inputs) < 2:
             return qdq_model_path
 
-        model = reorder_onnx_nodes_by_input(model, 5, aggressive=aggressive)
-        model = reorder_onnx_nodes_by_output(model, 10, aggressive=aggressive)
+        model = reorder_onnx_nodes_by_input(model, 5, aggressive=True)
+        model = reorder_onnx_nodes_by_output(model, 10, aggressive=True)
 
         onnx.checker.check_model(model, full_check=True)
         onnx.save_model(model, qdq_model_path)
-        print(f"[AIMET] Reordered QDQ input chains to match graph input order: {real_inputs}"
-              f" (aggressive={aggressive})")
+        print(f"[AIMET] Reordered QDQ input chains to match graph input order: {real_inputs} (aggressive)")
         return qdq_model_path
-
 
 
 class OnnxToQNN:
@@ -588,7 +513,7 @@ class OnnxToQNN:
         print(f"[QnnxToQNN] Hybrid quantization set to: {custom_hybrid}, bitwidth={bitwidth}, bias_bitwidth={bias_bitwidth}, float_bitwidth={float_bitwidth}")
 
     def set_use_aimet(self, quant_method:str='tf_enhanced', bitwidth:str="w8a8", param_quant_schema:str='symmetric', act_quant_schema:str='asymmetric',
-                      encoding_version:str='2.0.0'):
+                      use_cle_algorithm:bool=False):
         """启用 AIMET 2.x 量化路径（替代 QAIRT 自带的 qairt-quantizer 校准）。
 
         启用后 convert() 流程变为：
@@ -625,15 +550,8 @@ class OnnxToQNN:
         dsp_arch = self.architecture_dict[self.target_platform]["dsp_arch"]
         config_file = f"htp_{dsp_arch}"
 
-        self.aimet_connector = QnnAimetConnector(
-            self,
-            quant_method=quant_method,
-            bitwidth=bitwidth,
-            param_quant_schema=param_quant_schema,
-            act_quant_schema=act_quant_schema,
-            encoding_version=encoding_version,
-            config_file=config_file,
-        )
+        self.aimet_connector = QnnAimetConnector(self, config_file)
+        self.aimet_connector.get_quantization_method(quant_method, bitwidth, param_quant_schema, act_quant_schema, use_cle_algorithm)
 
     def set_do_accuracy_analysis(self, accuracy_analysis_picture_list:list[str]|None=None):
         """
@@ -682,6 +600,8 @@ class OnnxToQNN:
         if self.aimet_connector is not None:
             self.aimet_connector.convert(onnx_model_info, mean_rgb, std_rgb, set_input_order)
             return
+
+        print(f"Model info: {onnx_model_info}")
 
         # 4.2
         if self.hybrid_quantizer is not None:

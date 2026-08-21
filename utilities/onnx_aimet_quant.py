@@ -1,29 +1,26 @@
 """
-AIMET 2.x 驱动的 ONNX 后训练量化(PTQ)工具。
+基于 AIMET 2.x 的 ONNX 后训练量化（PTQ）工具。
 
-工作流（AIMET 2.x 新 API，非旧版弃用参数）：
-    1. 构建 QuantizationSimModel —— 使用 param_type / activation_type / quant_scheme（qtype 风格）
-    2. 混合精度      —— sim.set_tensor_precision(name, precision)
-    3. 校准          —— with aimet_onnx.compute_encodings(sim): sim.session.run(...)
-    4. 导出          —— sim.to_onnx_qdq() 产出 QDQ ONNX；sim.export() 产出 encodings JSON
-    5. （可选）把 AIMET 编码转换为 QAIRT quantization_overrides JSON
+核心流程：
+    1. 构建 QuantizationSimModel（param_type / activation_type / quant_scheme）
+    2. 混合精度（sim.set_tensor_precision）
+    3. 校准（with aimet_onnx.compute_encodings(sim): session.run(...)）
+    4. 导出 QDQ ONNX（sim.to_onnx_qdq）+ encodings JSON（sim.export）
+    5. （可选）AIMET encodings -> QAIRT quantization_overrides JSON
 
-两种用法：
-    A. 独立量化（单独量化 onnx，API 与 OnnxToQNN / OnnxToRKNN 一致）：
-        quantizer = AimetOnnxQuantizer('model.onnx', 'model_q.onnx', dataset_path='datasets.txt')
-        quantizer.set_quantization_method(param_quant_method='percentile',
-                                          act_quant_method='entropy', bitwidth='w8a8')
-        quantizer.convert(mean_rgb=[[0, 0, 0]], std_rgb=[[1, 1, 1]])
-        quantizer.clean()
-        产出: model_q.onnx (QDQ)；encodings 默认输出到 work_dir 临时目录
-              （clean() 时删除，不污染正式产物）；需要正式保留时
-              convert(..., export_encodings=True) 会额外在 QDQ 同目录产出 model_q.encodings
+用法 A — 独立量化（API 与 OnnxToQNN / OnnxToRKNN 对齐）：
+    quantizer = AimetOnnxQuantizer('model.onnx', 'model_q.onnx', dataset_path='datasets.txt')
+    quantizer.set_quantization_method(quant_method='percentile', bitwidth='w8a8')
+    quantizer.convert(mean_rgb=[[0, 0, 0]], std_rgb=[[1, 1, 1]])
+    quantizer.clean()
+    # 产出: model_q.onnx (QDQ)；encodings 默认写入 work_dir（clean 时删除）
+    #       需正式保留时 convert(..., export_encodings=True)
 
-    B. 接入 onnx_to_qnn（配合 onnx_to_qnn.py 的 OnnxToQNN）：
-        onnx_to_qnn.set_use_aimet(...)
-        onnx_to_qnn.convert(mean_rgb, std_rgb)
-        流程: AIMET 先把 ONNX 量化成 QDQ 模型 -> qairt-converter 直接转成量化 DLC
-              （跳过 qairt-quantizer，编码由 AIMET 决定，与 QNN 的 calibration 解耦）
+用法 B — 接入 onnx_to_qnn：
+    onnx_to_qnn.set_use_aimet(...)
+    onnx_to_qnn.convert(mean_rgb, std_rgb)
+    # AIMET 量化 -> QDQ ONNX -> qairt-converter 直转量化 DLC
+    # （跳过 qairt-quantizer，编码由 AIMET 决定，与 QNN calibration 解耦）
 """
 
 import os
@@ -55,36 +52,105 @@ from utils import get_onnx_model_info, find_hybrid_subgraph_nodes, normalize_onn
 # 辅助函数
 # ---------------------------------------------------------------------------
 
-# 项目量化校准方法 -> AIMET quant_scheme 字符串（AIMET 2.x 支持 min_max / tf_enhanced / percentile）
-_QUANT_SCHEME_ALIASES = {
-    'min-max': 'min_max',
-    'minmax': 'min_max',
-    'min_max': 'min_max',
-    'tf': 'tf_enhanced',
-    'tf-enhanced': 'tf_enhanced',
-    'tf_enhanced': 'tf_enhanced',
-    'percentile': 'percentile',
-    # Sequential MSE：触发 SeqMSE 优化；量化方案内部强制用 min_max（TF quant-scheme）
-    'sequential_mse': 'sequential_mse',
-    'sequential-mse': 'sequential_mse',
-}
+
+# ---------------------------------------------------------------------------
+# AIMET quantsim_config：别名映射 + 路径解析
+# ---------------------------------------------------------------------------
 
 
-def _resolve_quant_scheme(method: str) -> str:
-    """把项目的校准方法名映射为 AIMET 2.x 的 quant_scheme 字符串"""
-    key = str(method).strip().lower()
-    if key not in _QUANT_SCHEME_ALIASES:
-        raise ValueError(
-            f"Unsupported quant method '{method}'. Available: {sorted(_QUANT_SCHEME_ALIASES)}")
-    return _QUANT_SCHEME_ALIASES[key]
+class AimetQuantsimConfig:
+    """AIMET quantsim_config 别名映射与路径解析。
+
+    把项目侧的 config_file（别名 / 文件路径 / 内置文件名）解析为 AIMET
+    内置 quantsim_config 的绝对路径，供 QuantizationSimModel 加载。
+    """
+
+    # 项目 config_file 别名 -> AIMET 内置 quantsim_config 文件名（HTP 各架构 + 默认）
+    HTP_CONFIG: dict[str, str] = {
+        'default': 'default_config_per_channel.json',
+        'htp_v66': 'htp_quantsim_config_v66.json',
+        'htp_v68': 'htp_quantsim_config_v68.json',
+        'htp_v69': 'htp_quantsim_config_v69.json',
+        'htp_v73': 'htp_quantsim_config_v73.json',
+        'htp_v75': 'htp_quantsim_config_v75.json',
+        'htp_v79': 'htp_quantsim_config_v79.json',
+        'htp_v81': 'htp_quantsim_config_v81.json',
+    }
+
+    # AIMET 内置 quantsim_config 所在目录
+    CONFIG_DIR: Path = Path(aimet_onnx.__file__).resolve().parent / 'common' / 'quantsim_config'
+
+    @classmethod
+    def resolve_path(cls, config_file: str | None) -> str:
+        """把 config_file（别名 / 文件路径 / 内置文件名）解析为 quantsim_config 绝对路径。
+
+        解析优先级：
+            1. 已存在的文件路径            -> 直接返回（自定义配置）
+            2. 命中 HTP_CONFIG               -> 对应内置 HTP 配置文件
+            3. 其它                       -> 在内置 quantsim_config 目录下按文件名查找
+            None 按 'default' 处理。
+
+        Args:
+            config_file: 别名（'default'/'htp_v73'...）、JSON 文件路径或内置文件名；
+                None 按 'default' 处理。
+
+        Returns:
+            str: quantsim_config JSON 的绝对路径。
+
+        Raises:
+            FileNotFoundError: 三种方式均未命中。
+        """
+        cfg = str(config_file) if config_file else 'default'
+
+        if os.path.isfile(cfg):
+            return os.path.abspath(cfg)
+        
+        if cfg in cls.HTP_CONFIG:
+            return str(cls.CONFIG_DIR / cls.HTP_CONFIG[cfg])
+        
+        candidate = cls.CONFIG_DIR / cfg
+
+        if candidate.is_file():
+            return str(candidate)
+        
+        raise FileNotFoundError(
+            f"AIMET quantsim_config not found: {config_file}. Expected an alias "
+            f"({sorted(cls.HTP_CONFIG)}) or a path to a quantsim_config JSON.")
+
+class AimetQuantSchemeConfig:
+    # 项目量化校准方法 -> AIMET quant_scheme 字符串（AIMET 2.x 支持 min_max / tf_enhanced / percentile）
+    QUANT_SCHEME_CONFIG = {
+        'min-max': 'min_max',
+        'minmax': 'min_max',
+        'min_max': 'min_max',
+        'tf-enhanced': 'tf_enhanced',
+        'tf_enhanced': 'tf_enhanced',
+        'percentile': 'percentile',
+        'sequential_mse': 'sequential_mse', # Sequential MSE：触发 SeqMSE 优化；量化方案内部强制用 min_max（TF quant-scheme）
+        'sequential-mse': 'sequential_mse',
+    }
+
+    def resolve_quant_scheme(cls, method: str) -> str:
+        """把项目校准方法名映射为 AIMET 2.x quant_scheme 字符串。
+
+        支持 min_max / tf_enhanced / percentile 及别名（'min-max'/'tf' 等），
+        以及 'sequential_mse'（触发 SeqMSE 优化）。未知方法抛 ValueError。
+        """
+        key = str(method).strip().lower()
+        if key not in cls.QUANT_SCHEME_CONFIG:
+            raise ValueError(
+                f"Unsupported quant method '{method}'. Available: {sorted(cls.QUANT_SCHEME_CONFIG)}")
+        return cls.QUANT_SCHEME_CONFIG[key]
 
 
 def _resolve_symmetric(schema: str) -> tuple[bool, bool]:
-    """把项目的量化 schema 映射为 AIMET 的 (use_symmetric_encodings, use_unsigned_symmetric)。
+    """把项目量化 schema 映射为 AIMET 的 (use_symmetric_encodings, use_unsigned_symmetric)。
 
-    'asymmetric'      -> (False, False)：非对称
-    'symmetric'       -> (True,  False)：有符号对称（zero_point=0）
-    'unsignedsymmetric' -> (True,  True)：非负对称（zero_point=0，只量非负范围）
+    - 'asymmetric'        -> (False, False)：非对称
+    - 'symmetric'         -> (True,  False)：有符号对称（zero_point=0）
+    - 'unsignedsymmetric' -> (True,  True)：非负对称（zero_point=0，只量非负范围）
+
+    未知 schema 抛 ValueError。
     """
     key = str(schema).strip().lower()
     if key == 'asymmetric':
@@ -97,66 +163,18 @@ def _resolve_symmetric(schema: str) -> tuple[bool, bool]:
         f"Unsupported quant schema '{schema}'. Available: asymmetric, symmetric, unsignedsymmetric")
 
 
-# ---------------------------------------------------------------------------
-# AIMET quantsim_config：映射表 + 对称性应用（通过配置表，而非逐个量化器改属性）
-# ---------------------------------------------------------------------------
-
-# 项目 config_file 别名 -> AIMET 内置 quantsim_config 文件名（HTP 各架构 + 默认）
-_AIMET_CONFIG_ALIASES = {
-    'default': 'default_config_per_channel.json',
-    'htp_v66': 'htp_quantsim_config_v66.json',
-    'htp_v68': 'htp_quantsim_config_v68.json',
-    'htp_v69': 'htp_quantsim_config_v69.json',
-    'htp_v73': 'htp_quantsim_config_v73.json',
-    'htp_v75': 'htp_quantsim_config_v75.json',
-    'htp_v79': 'htp_quantsim_config_v79.json',
-    'htp_v81': 'htp_quantsim_config_v81.json',
-}
-
-# AIMET 内置 quantsim_config 所在目录
-_AIMET_CONFIG_DIR = Path(aimet_onnx.__file__).resolve().parent / 'common' / 'quantsim_config'
-
-
-def _resolve_aimet_config_path(config_file: str | None) -> str:
-    """把 config_file（别名 / 文件路径 / 内置文件名）解析为可加载的 quantsim_config 绝对路径。
-
-    规则：
-        None / 'default'           -> default_config_per_channel.json
-        存在的文件路径              -> 直接用该路径（自定义配置）
-        命中 _AIMET_CONFIG_ALIASES -> 对应内置 HTP 配置文件
-        其它                        -> 当作 quantsim_config 目录下的文件名查找
-    """
-    cfg = str(config_file) if config_file else 'default'
-    if os.path.isfile(cfg):
-        return os.path.abspath(cfg)
-    if cfg in _AIMET_CONFIG_ALIASES:
-        return str(_AIMET_CONFIG_DIR / _AIMET_CONFIG_ALIASES[cfg])
-    candidate = _AIMET_CONFIG_DIR / cfg
-    if candidate.is_file():
-        return str(candidate)
-    raise FileNotFoundError(
-        f"AIMET quantsim_config not found: {config_file}. Expected an alias "
-        f"({sorted(_AIMET_CONFIG_ALIASES)}) or a path to a quantsim_config JSON.")
-
-
-
-
-
 def _clean_qdq_activation_names(model: onnx.ModelProto) -> onnx.ModelProto:
-    """
-    清洗 AIMET 2.x QDQ 模型的激活张量命名，去除 '_q' / '_updated' 后缀污染。
+    """清洗 AIMET QDQ 模型的激活张量命名，恢复原始名（原地修改并返回 model）。
 
     AIMET to_onnx_qdq() 会把每个量化激活张量拆成三个名字：
-        原始名 X（上游节点输出，QuantizeLinear 输入）
+        X（上游节点输出，QuantizeLinear 输入）
         X_q（QuantizeLinear 输出）
         X_updated / X_qdq（DequantizeLinear 输出，后续节点消费）
-    （body/FPN/SSH 的激活 DQ 输出用 'X_updated'，检测头 Bbox/Class/Landmark Head
-     的激活 DQ 输出用 'X_qdq'，两种都要恢复为原始名）
-    本函数把 DequantizeLinear 的输出恢复为原始名 X（上游节点输出腾位改名 X__src），
-    使转换后的 DLC 中间层张量名与 FP32 模型一致，便于 golden/quant 逐层精度对比。
+    本函数把 DQ 输出恢复为原始名 X（上游节点输出腾位改名 X__src），
+    使 DLC 中间层张量名与 FP32 模型一致，便于 golden/quant 逐层精度对比。
 
-    只改名字，不改 Q/DQ 结构、scale/zero_point，量化语义完全不变。
-    图输入 / 图输出名保持不变（避免破坏外部接口）。
+    只改名字，不改 Q/DQ 结构、scale/zero_point，量化语义不变；
+    图输入 / 图输出名保持不变（外部接口）。
     """
     graph = model.graph
     producer: dict[str, int] = {}
@@ -222,34 +240,34 @@ def _clean_qdq_activation_names(model: onnx.ModelProto) -> onnx.ModelProto:
 # ---------------------------------------------------------------------------
 
 class AimetOnnxQuantizer:
-    """AIMET 2.x 后训练量化器：对 ONNX 做 PTQ，导出 QDQ ONNX + encodings。
+    """基于 AIMET 2.x 的 ONNX 后训练量化器（PTQ），产出 QDQ ONNX + encodings。
 
-    用法：
-        A. 独立量化：set_quantization_method() -> convert()（数据集校准 -> 量化 -> 导出）。
+    两种用法：
+        A. 独立量化：set_quantization_method() -> convert()，
+           数据集校准 -> 量化 -> 导出 QDQ ONNX（+ encodings）。
         B. 接入 onnx_to_qnn：由 QnnAimetConnector 调用 quantize()/export()，
-           QDQ 交给 qairt-converter 转量化 DLC。
+           产出的 QDQ 交给 qairt-converter 直接转量化 DLC。
 
     能力：
-        - 对称性：权重/bias 经 quantsim_config 配置表（defaults 级）应用；激活经
-          _apply_quant_schema 逐量化器应用（可独立设符号）。
+        - 对称性：权重/bias 经 quantsim_config 配置表（defaults 级）应用；
+          激活经 _apply_quant_schema 逐量化器应用（可独立设符号）。
         - 子图混合精度：do_hybrid_quantization()。
         - 精度分析：set_do_accuracy_analysis()，convert() 内做 FP32 vs QDQ 对比。
     """
 
     def __init__(self, model_path:str, quantized_model_path:str|None, dataset_path:str|None = None,
-                 config_file: str | None = None,
-                 fold_batch_norms:bool = True):
-        """创建量化器并保存模型/校准/config 配置。
+                 config_file: str | None = None, fold_batch_norms:bool = True):
+        """创建量化器，保存模型路径、校准数据与 quantsim_config 配置。
 
         Args:
             model_path: 输入 ONNX 路径（FP32）。
-            quantized_model_path: QDQ ONNX 输出路径；None 默认
+            quantized_model_path: QDQ ONNX 输出路径；None 时默认
                 {model_path 同目录}/<stem>_qdq.onnx。
             dataset_path: 校准图片列表 txt（每行一个样本，多输入空格分隔）；
                 None（默认）时改用自定义校准集（use_custom_alibration_data）。
             config_file: AIMET quantsim_config 路径或别名（'default'/'htp_v73'...）；
-                None 用 'default'。
-            fold_batch_norms: 是否先 BatchNorm 折叠。默认 True。
+                None 时用 'default'。
+            fold_batch_norms: 量化前是否先做 BatchNorm 折叠。默认 True。
         """
 
         # 临时工作目录：默认 utilities/tmp onnx_to_qnn 的 utilities/tmp 一致）
@@ -302,23 +320,21 @@ class AimetOnnxQuantizer:
     def set_quantization_method(self, quant_method:str='tf_enhanced', bitwidth:str='w8a8',
                                 param_quant_schema:str='symmetric', act_quant_schema:str='asymmetric',
                                 use_cle_algorithm:bool=False):
-        """设置量化方案、位宽与权重/激活对称性。
+        """设置量化方案、位宽与权重/激活对称性（convert() 前调用）。
 
-        设定 AIMET 量化方案（quant_method）、权重/激活位宽（bitwidth），
-        以及权重/激活的对称量化方式（param_quant_schema / act_quant_schema）；
-        bias 固定以 int32 导出（self.export_int32_bias 恒为 True）。
+        bias 固定以 int32 导出，无需配置。
 
         Args:
             quant_method: AIMET 方案，'min_max'/'tf_enhanced'/'percentile'，
                 也接受别名（'min-max'/'minmax'/'tf'/'tf-enhanced'）。
-                传 'sequential_mse'（或 'sequential-mse'）启用 Sequential MSE
-                （逐层搜索并冻结最优权重编码，候选数默认 20，内部用 min_max 方案）。
+                传 'sequential_mse'（或 'sequential-mse'）启用 Sequential MSE：
+                逐层搜索并冻结最优权重编码（候选数默认 20，内部强制 min_max 方案）。
             bitwidth: 位宽 'w<W>a<A>'，如 'w8a8'/'w8a16'。
             param_quant_schema: 权重对称性，'asymmetric'/'symmetric'/'unsignedsymmetric'。
                 默认 'symmetric'（AIMET/HTP 惯例，权重对称）。
             act_quant_schema: 激活对称性，'asymmetric'/'symmetric'/'unsignedsymmetric'。
                 默认 'asymmetric'。
-            use_cle_algorithm: 是否启用 Cross-Layer Equalization（CLE）；启用即由
+            use_cle_algorithm: 是否启用 Cross-Layer Equalization（CLE）；启用时由
                 equalize_model 一并执行 HighBiasFold 偏置修正，无需单独传参。默认 False。
         """
         if bitwidth not in ['w4a8', 'w4a16', 'w8a8', 'w8a16', 'w16a16']:
@@ -330,7 +346,7 @@ class AimetOnnxQuantizer:
                 raise ValueError(
                     f"{name} must be one of asymmetric, symmetric, unsignedsymmetric")
 
-        self.quant_scheme = _resolve_quant_scheme(quant_method)
+        self.quant_scheme = AimetQuantSchemeConfig.resolve_quant_scheme(quant_method)
 
         self.weights_bitwidth, self.act_bitwidth = parse_bitwidth(bitwidth)
 
@@ -343,24 +359,24 @@ class AimetOnnxQuantizer:
         self.use_seq_mse = self.quant_scheme == "sequential_mse"
 
     def set_do_accuracy_analysis(self, accuracy_analysis_picture_list: list[str] | None = None):
-        """设置精度分析：convert() 后对给定图片做 FP32 vs QDQ 输出对比。
+        """开启精度分析：convert() 末尾对给定图片做 FP32 vs QDQ 输出对比。
 
         Args:
-            accuracy_analysis_picture_list: 图片路径列表；None 不做精度分析。
+            accuracy_analysis_picture_list: 图片路径列表；None 关闭精度分析。
         """
         if accuracy_analysis_picture_list is not None:
             self.accuracy_analysis_picture_list = accuracy_analysis_picture_list
         else:
             self.accuracy_analysis_picture_list = None
 
-    def use_custom_alibration_data(self, custom_alibration_data_path: str | None = None, dataset_tensor_order: str = "nhwc"):
-        """使用自定义校准数据（.raw / .npy 张量，非图片），模仿 OnnxToQNN。
+    def use_custom_alibration_data(self, custom_alibration_data_path:str|None=None, dataset_tensor_order:str="nhwc"):
+        """改用自定义张量校准数据（.raw / .npy，非图片），与 OnnxToQNN 行为一致。
 
         Args:
             custom_alibration_data_path: 校准数据 txt（每行一个样本，多输入文件路径
                 空格分隔；相对路径基于 txt 目录）。每个文件为模型单个输入的张量：
-                .raw —— np.ndarray.tofile() 导出的 float32 裸二进制（无 shape 头）；
-                .npy —— numpy 数组文件。数据需按模型输入 shape 预处理好。
+                .raw —— float32 裸二进制（无 shape 头，按模型输入 shape 解释）；
+                .npy —— numpy 数组文件（自带 shape）。数据需按模型输入 shape 预处理。
                 None 恢复为图片数据集（dataset_path）。
             dataset_tensor_order: 自定义数据的张量布局 'nhwc'/'nchw'。默认 'nhwc'。
         """
@@ -371,12 +387,12 @@ class AimetOnnxQuantizer:
         self.custom_data_tensor_order = dataset_tensor_order
 
     def do_hybrid_quantization(self, custom_hybrid:list[list[str]], bitwidth:str="w8a16", float_bitwidth:int|None=None):
-        """子图混合量化：对 [输入张量, 输出张量] 之间所有节点用指定精度，其余按全局。
+        """注册子图混合量化：[输入张量, 输出张量] 之间的节点用指定精度，其余按全局。
 
         Args:
-            custom_hybrid: 每个内层为 [in_tensor, out_tensor]（张量名或节点名）。
+            custom_hybrid: 子图列表，每项为 [in_tensor, out_tensor]（张量名或节点名）。
             bitwidth: 子图内位宽 'w<W>a<A>'，如 'w8a16'。
-            float_bitwidth: 若设 16/32，子图保持 FP16/FP32（忽略 bitwidth）。
+            float_bitwidth: 设 16/32 时子图保持 FP16/FP32（忽略 bitwidth）；None 按 bitwidth 量化。
         """
         if not isinstance(custom_hybrid, list) or not custom_hybrid:
             raise ValueError('custom_hybrid must be a non-empty list of [input, output] pairs')
@@ -396,15 +412,19 @@ class AimetOnnxQuantizer:
     # 一站式入口（与 OnnxToQNN / OnnxToRKNN 的 convert / clean 对齐）
     def convert(self, mean_rgb: list[list[int|float]]=[[0, 0, 0]], std_rgb:list[list[int|float]]=[[1, 1, 1]], 
                 normalize_model:bool=True, export_encodings:bool=False) -> tuple[str, str | None]:
-        """一站式量化：数据集校准 -> AIMET 量化 -> 导出 QDQ ONNX + encodings（可选精度分析）。
+        """一站式量化：校准 -> AIMET 量化 -> 导出 QDQ ONNX + encodings（可选精度分析）。
+
+        归一化策略二选一（与 OnnxToQNN 一致）：
+            normalize_model=True（默认）：把归一化烘焙进模型（1x1 Conv），
+                校准输入保持原始 0-255 像素；
+            normalize_model=False：不烘焙模型，(x-mean)/std 在校准/验证输入上应用。
 
         Args:
             mean_rgb: 每个输入的 RGB 均值。默认 [[0,0,0]]（不归一化）。
             std_rgb: 每个输入的 RGB 标准差。默认 [[1,1,1]]（不归一化）。
-            normalize_model: True（默认）把归一化烘焙进模型，校准输入为原始像素；
-                False 则在校准/验证输入上应用 (x-mean)/std。
-            export_encodings: True 输出 encodings 到 QDQ 同目录；False（默认）输出到
-                work_dir 临时目录（clean() 删除）。
+            normalize_model: 见上。默认 True。
+            export_encodings: True 输出 encodings 到 QDQ 同目录（正式保留）；
+                False（默认）输出到 work_dir 临时目录（clean() 删除）。
 
         Returns:
             (qdq_onnx_path, encodings_path)。
@@ -419,6 +439,8 @@ class AimetOnnxQuantizer:
         self.model_info = get_onnx_model_info(str(self.model_path))
         if self.model_info is None:
             raise ValueError(f"Failed to read ONNX model info: {self.model_path}")
+        
+        print(f"Model info: {self.model_info}")
         input_names = [i['name'] for i in self.model_info['inputs']]
         input_shapes = [tuple(d for d in i['shape']) for i in self.model_info['inputs']]
 
@@ -493,21 +515,25 @@ class AimetOnnxQuantizer:
     # ------------------------------------------------------------------
 
     def _build_quantsim_config(self, out_path: str | Path) -> str:
-        """读取 AIMET 内置 quantsim_config，仅改写 defaults 级对称性后写入 out_path。
+        """基于 AIMET 内置 quantsim_config 生成对称性改写后的配置，写入 out_path。
 
-        通过配置表应用 param/act 的对称/非对称量化，而不是逐个量化器改
-        use_symmetric_encodings / use_unsigned_symmetric。只动 defaults 级 / 顶层
-        params（weight/bias 分类型，全局）字段：
-            defaults.params.is_symmetric        —— 权重对称
-            defaults.ops.is_symmetric           —— 激活对称（作用于全部激活）
-            顶层 params.weight.is_symmetric     —— 全局权重对称（显式）
-            顶层 params.bias.is_symmetric=True  —— bias 恒对称（避免 int32->uint32 导出错误）
-            defaults.unsigned_symmetric         —— 仅当 param/act 都非负对称时才置 True
-                                                （config 的 unsigned_symmetric 为全局限制）
-        绝不修改 op_type / supergroups / supergroup_pass_list / model_input /
-        model_output 等针对算子的优化配置。
+        通过配置表（而非逐个量化器改属性）应用权重对称性，只动 defaults 级字段：
+            defaults.params.is_symmetric  —— 权重对称（param_quant_schema）
+            defaults.unsigned_symmetric   —— 仅当 param/act 都非负对称时置 True
+                                            （config 的 unsigned_symmetric 是全局限制，
+                                             避免把有符号权重误置为 unsigned）
+        激活对称性不走配置表（全局 unsigned_symmetric 会误伤有符号权重），
+        由 _apply_quant_schema 逐量化器设置。
+        不修改 op_type / supergroups / supergroup_pass_list / model_input /
+        model_output 等算子级优化配置。
+
+        Args:
+            out_path: 输出配置路径（父目录自动创建）。
+
+        Returns:
+            str: 写入的配置路径。
         """
-        base_path = _resolve_aimet_config_path(self.config_file)
+        base_path = AimetQuantsimConfig.resolve_path(self.config_file)
         with open(base_path) as f:
             config:dict[str, dict] = json.load(f)
 
@@ -537,15 +563,17 @@ class AimetOnnxQuantizer:
         return str(out)
 
     def _build_sim(self, model: onnx.ModelProto, dummy_input: dict | None = None) -> QuantizationSimModel:
-        """创建 AIMET 2.x QuantizationSimModel。
+        """创建 AIMET 2.x QuantizationSimModel（未校准）。
+
+        位宽经 qtype.int 传入 param_type / activation_type；SeqMSE 模式下
+        强制 quant_scheme='min_max'（AIMET 要求 TF 方案）。
 
         Args:
             model: 待量化的 ONNX 模型（已预处理）。
             dummy_input: 模型输入 dummy（{输入名: ndarray}）；None 由 AIMET 自动生成。
 
         Returns:
-            QuantizationSimModel: 未校准的量化模拟模型（含 param_type/activation_type/
-                quant_scheme/config_file 配置）。
+            QuantizationSimModel: 未校准的量化模拟模型。
         """
         # SeqMSE 在 aimet-onnx 2.36 中要求 TF quant-scheme；该版本无独立 post_training_tf，
         # 实际由 'min_max' 承担（post_training_tf 是 min_max 的别名），tf_enhanced 不满足。
@@ -575,15 +603,20 @@ class AimetOnnxQuantizer:
     def _find_subgraph_tensors(
         model: onnx.ModelProto, custom_hybrid: list[list[str]]
     ) -> tuple[list[str], list[str]]:
-        """识别子图 [输入张量, 输出张量] 之间所有节点，返回其张量名（复用
-        utils.find_hybrid_subgraph_nodes）。
+        """识别子图 [输入张量, 输出张量] 之间的所有节点，返回其张量名。
+
+        子图节点 = 每个 [in, out] 对的「输入下游 ∩ 输出上游」的并集
+        （复用 utils.find_hybrid_subgraph_nodes）。
 
         Args:
             model: 待分析模型。
-            custom_hybrid: 每个内层为 [in_tensor, out_tensor]（张量名或节点名）。
+            custom_hybrid: 子图列表，每项为 [in_tensor, out_tensor]（张量名或节点名）。
 
         Returns:
-            (子图内激活张量名, 子图内权重参数张量名)；两者均去重保序，且权重不含 bias。
+            (子图内激活张量名, 子图内权重参数张量名)；均去重保序，权重不含 bias。
+
+        Raises:
+            ValueError: 未选中任何节点。
         """
         nodes = list(model.graph.node)
 
@@ -610,7 +643,10 @@ class AimetOnnxQuantizer:
         return act_tensors, param_tensors
 
     def _apply_mixed_precision(self, model: onnx.ModelProto):
-        """对 do_hybrid_quantization 注册的子图张量应用混合精度。
+        """对 do_hybrid_quantization 注册的子图张量应用混合精度（sim.set_tensor_precision）。
+
+        float_bitwidth 设定时子图用 qtype.float（FP16=(5,10) / FP32=(8,23)），
+        否则用 qtype.int（子图位宽）。未注册子图时直接返回。
 
         Args:
             model: 已由 _build_sim 量化的模型（用于查找子图张量）。
@@ -654,13 +690,12 @@ class AimetOnnxQuantizer:
 
 
     def _apply_quant_schema(self, sim: QuantizationSimModel):
-        """对激活量化器按 act_quant_schema 应用对称性与符号（unsigned）。
+        """对激活量化器按 act_quant_schema 设置对称性与符号（unsigned）。
 
-        参数（权重/bias）的对称性已由 _build_quantsim_config 通过改写 quantsim_config
-        defaults 级配置应用。这里只对激活（act）量化器按 act_quant_schema 设置
-        use_symmetric_encodings / use_unsigned_symmetric —— 因为 config 的
-        unsigned_symmetric 是全局的（会误伤有符号权重），激活的非负对称（符号）
-        仍需逐量化器设置。
+        权重/bias 的对称性已由 _build_quantsim_config 经配置表应用；
+        激活的非负对称（unsigned）因 config 的 unsigned_symmetric 是全局限制
+        （会误伤有符号权重），只能逐量化器设置 use_symmetric_encodings /
+        use_unsigned_symmetric。
 
         Args:
             sim: 已构建的 QuantizationSimModel（compute_encodings 前调用）。
@@ -680,16 +715,21 @@ class AimetOnnxQuantizer:
 
     def quantize(self, model:onnx.ModelProto, calibration_data:Iterable[dict[str, np.ndarray]],
                  forward_pass_callback: Callable | None = None, forward_pass_callback_args: Any = None) -> QuantizationSimModel:
-        """AIMET 2.x 校准主流程：构建 QuantizationSimModel 并计算编码。
+        """AIMET 校准主流程：模型预处理 -> 构建 QuantizationSimModel -> 计算编码。
+
+        预处理（原地）：BatchNorm 折叠（fold_batch_norms）、CLE + HighBiasFold
+        （use_cle_algorithm）。随后构建 sim、应用混合精度与激活对称性，
+        最后 compute_encodings 校准（SeqMSE 模式先逐层搜索并冻结最优权重编码）。
 
         Args:
             model: 已加载/已烘焙归一化的 ONNX 模型（会被 BN 折叠 / CLE 原地预处理）。
-            calibration_data: 校准样本（{输入名: ndarray} 的迭代）。
-            forward_pass_callback: 自定义校准回调，签名 (session, args)。
+            calibration_data: 校准样本迭代（每项 {输入名: ndarray}）。
+            forward_pass_callback: 自定义校准回调，签名 (session, args)；
+                None 时用内置上下文管理器逐样本 session.run。
             forward_pass_callback_args: 传给回调的第二个参数。
 
         Returns:
-            QuantizationSimModel: 计算完编码的量化模拟模型。
+            QuantizationSimModel: 计算完编码的量化模拟模型（存于 self.sim）。
         """
 
         # 记录预处理后的 FP32 模型（精度分析 / 混合精度查找子图使用）
@@ -781,13 +821,15 @@ class AimetOnnxQuantizer:
     ) -> tuple[str, str | None]:
         """导出 QDQ ONNX +（可选）encodings JSON（bias 固定以 int32 导出）。
 
+        QDQ 模型由 sim.to_onnx_qdq() 产出（权重以量化整数常量 + DQ 存储），
+        并清洗激活张量命名（恢复原始名，去掉 '_q'/'_updated'/'_qdq' 后缀）。
+
         Args:
-            output_dir: 输出目录。
-            filename_prefix: 输出文件前缀。
+            output_dir: QDQ ONNX 输出目录。
+            filename_prefix: 输出文件前缀（QDQ 与 encodings 共用）。
             encoding_version: encodings 版本 '0.6.1'/'1.0.0'/'2.0.0'。
-            prequantize_constants: 权重以量化整数常量（+DQ）存储。
             export_encodings: 是否输出 encodings；False 时 encodings_path 为 None。
-            encodings_dir: encodings 输出目录；None 与 output_dir 相同。
+            encodings_dir: encodings 输出目录；None 时与 output_dir 相同。
 
         Returns:
             (qdq_onnx_path, encodings_path)。
@@ -851,12 +893,16 @@ class AimetOnnxQuantizer:
     ) -> str:
         """把 AIMET 1.0.0 encodings 转为 QAIRT quantization_overrides JSON。
 
+        转换规则：activation 默认非对称、param 默认对称；per-channel 权重按
+        name 分组为多个编码条目；scale/offset/min/max 原样透传。
+
         Args:
-            encoding_1_0_path: AIMET 1.0.0 encodings 路径；None 时从当前 sim 导出。
+            encoding_1_0_path: AIMET 1.0.0 encodings 路径；None 时从当前 sim 导出
+                （需先调用 quantize()）。
             output_path: 输出 JSON 路径；默认 {encoding 同目录}/qairt_quantization_overrides.json。
 
         Returns:
-            QAIRT overrides JSON 路径。
+            str: QAIRT overrides JSON 路径。
         """
         if encoding_1_0_path is None:
             if self.sim is None:
@@ -913,15 +959,18 @@ class AimetOnnxQuantizer:
         output_names: list[str] | None = None,
         num_samples: int = 8,
     ) -> tuple[float, float]:
-        """对比 FP32 与量化(QDQ)模型输出，返回 (最大绝对误差, 余弦相似度)。
+        """用 onnxruntime 对比 FP32 与量化(QDQ)模型输出，返回 (最大绝对误差, 余弦相似度)。
+
+        两个模型分别导出到 work_dir 临时文件后逐样本推理；QDQ 模型无法被
+        onnxruntime 加载时（如混合 FP16/FP32 语义）返回 (nan, nan) 并提示。
 
         Args:
-            inputs: 验证样本（{输入名: ndarray} 的迭代）。
-            output_names: 对比的输出张量名；None 用全部。
+            inputs: 验证样本迭代（每项 {输入名: ndarray}）。
+            output_names: 对比的输出张量名；None 用全部输出。
             num_samples: 最多对比样本数。
 
         Returns:
-            (max_abs_error, cosine_similarity)。
+            (max_abs_error, cosine_similarity)：跨样本取最大绝对误差、最小余弦相似度。
         """
         if self.sim is None:
             raise RuntimeError("Call quantize() first")
@@ -970,7 +1019,7 @@ class AimetOnnxQuantizer:
 # ---------------------------------------------------------------------------
 
 def _chain(first, it):
-    """把首元素与迭代器串起来（避免重复迭代生成器）"""
+    """把首元素与迭代器串起来（取首样本构造 dummy_input 后恢复被消费的元素）。"""
     yield first
     yield from it
 
@@ -981,22 +1030,21 @@ def _chain(first, it):
 
 def image_calibration_inputs(dataset_path:str, input_names:list[str], input_shapes:list[tuple[int]], 
                              mean_rgb: list[list[int]], std_rgb: list[list[int]]) -> Iterator[dict[str, np.ndarray]]:
-    """从图片列表 txt 生成 AIMET 校准输入（每个样本一个 {输入名: np.ndarray}）。
+    """从图片列表 txt 生成校准输入迭代器（每样本 {输入名: np.ndarray}）。
 
-    数据集格式与 onnx_to_qnn / onnx_to_rknn 完全一致：
-        - 每行一个样本；多输入时各图片路径用空格分隔
-        - 相对路径基于 txt 所在目录（由 utils.read_dataset_txt_to_list 解析为绝对路径）
-    图片预处理：letterbox 等比缩放居中填充 + BGR->RGB + NCHW + float32。
+    数据集格式与 onnx_to_qnn / onnx_to_rknn 一致：每行一个样本，多输入时各图片
+    路径空格分隔，相对路径基于 txt 所在目录。
+    图片预处理：letterbox 等比缩放居中填充 + BGR->RGB + NCHW + float32，
+    再按 (x - mean) / std 归一化。
 
     Args:
         dataset_path: 图片路径 txt 文件。
         input_names: 模型输入张量名列表，长度与每行图片数一致。
         input_shapes: 每个输入的 4 维形状 (1, C, H, W)（取后两维为 HxW）。
-        mean_rgb / std_rgb: 每个输入一组的 RGB 归一化参数，长度与 input_names 一致；
-            每个样本应用 (x - mean) / std 归一化。
+        mean_rgb / std_rgb: 每个输入一组的 RGB 归一化参数，长度与 input_names 一致。
 
     Yields:
-        每个样本为 {输入名: np.ndarray}（NCHW, float32）；某张图片读取失败时跳过该样本。
+        每样本 {输入名: np.ndarray}（NCHW, float32）；某张图片读取失败时跳过该样本。
     """
 
     # 复用 utils.read_dataset_txt_to_list：逐行读取，按空格拆分，相对路径基于 txt
@@ -1029,11 +1077,10 @@ def image_calibration_inputs(dataset_path:str, input_names:list[str], input_shap
             yield sample
 
 def custom_dataset_to_iterator(dataset_path:str, input_names:list[str], input_shapes:list[tuple[int]], dataset_tensor_order:str="nhwc"):
-    """从自定义张量数据集 txt 生成校准输入（支持 .raw / .npy）。
+    """从自定义张量数据集 txt 生成校准输入迭代器（支持 .raw / .npy）。
 
-    数据集格式与 image_calibration_inputs 一致：每行一个样本；多输入时各文件路径用
-    空格分隔；相对路径基于 txt 目录（由 utils.read_dataset_txt_to_list 解析为绝对路径）。
-    每个文件为模型单个输入的张量数据：
+    数据集格式与 image_calibration_inputs 一致：每行一个样本，多输入时各文件路径
+    空格分隔，相对路径基于 txt 目录。每个文件为模型单个输入的张量：
         .raw —— 裸 float32 二进制（无 shape 头），按模型输入 shape 重新解释；
         .npy —— numpy 数组文件（自带 shape）。
     张量布局由 dataset_tensor_order 指定，统一转成模型 NCHW 布局输出。
@@ -1042,10 +1089,10 @@ def custom_dataset_to_iterator(dataset_path:str, input_names:list[str], input_sh
         dataset_path: 张量路径 txt 文件。
         input_names: 模型输入张量名列表。
         input_shapes: 每个输入的 4 维形状 (1, C, H, W)。
-        dataset_tensor_order: 自定义数据的张量布局 'nhwc'/'nchw'；默认 'nhwc'。
+        dataset_tensor_order: 自定义数据的张量布局 'nhwc'/'nchw'。默认 'nhwc'。
 
     Yields:
-        每个样本为 {输入名: np.ndarray}（NCHW, float32）；文件读取失败时跳过该样本。
+        每样本 {输入名: np.ndarray}（NCHW, float32）；文件读取失败时跳过该样本。
     """
     lines = read_dataset_txt_to_list(dataset_path)
     to_nchw = dataset_tensor_order == 'nhwc'
@@ -1084,9 +1131,10 @@ def custom_dataset_to_iterator(dataset_path:str, input_names:list[str], input_sh
 # ---------------------------------------------------------------------------
 
 def test_standalone_quant() -> tuple[str, str]:
-    """
-    独立使用测试：AimetOnnxQuantizer 单独量化 RetinaFace_mobile。
-    产出 QDQ ONNX + encodings 到 retinaface_mobile_ModelDeploy/models_convert/aimet/。
+    """独立使用测试：AimetOnnxQuantizer 单独量化 RetinaFace_mobile。
+
+    输入 retinaface_mobile_ModelDeploy/models_convert/onnx/ 下的 ONNX +
+    datasets/datasets_face.txt 校准集，产出 QDQ ONNX 到 utilities/tmp/。
 
     Returns:
         (qdq_onnx_path, encodings_path)
