@@ -11,8 +11,8 @@ import cv2
 current_dir = os.path.dirname(os.path.abspath(__file__))  # 获取当前文件所在目录的绝对路径
 sys.path.append(current_dir)
 
-from utils import letterbox_image, read_dataset_txt_to_list, clean_files_or_dirs, OnnxExecutor
-
+from utils import letterbox_image, read_dataset_txt_to_list, clean_files_or_dirs
+from utils import OnnxExecutor, NumpySaver
 
 
 class ProcessDatasetByModel:
@@ -37,9 +37,6 @@ class ProcessDatasetByModel:
         self.loop_inited = False
         self.replace_out_dataset_by_input = False
 
-        # 后台写入线程池（单线程，按序写入磁盘）
-        self.write_executor = ThreadPoolExecutor(max_workers=6)
-
     def set_ring_loop(self, loop_pair:list[int, int]):
         """
         Args:
@@ -60,23 +57,6 @@ class ProcessDatasetByModel:
     def replace_output_dateset_list(self, output_dateset_list:list[np.ndarray], replace_pair_index:int):
         self.input_tensor_list_to_out = output_dateset_list[replace_pair_index]
 
-    @staticmethod
-    def _write_files(write_buffer:list[tuple[str, np.ndarray]], output_format:str):
-        """实际执行写入磁盘的工作函数（在后台线程中运行）"""
-        for output_path, output in write_buffer:
-            if output_format == '.npy':
-                np.save(output_path, output)
-            elif output_format == '.raw':
-                output.tofile(output_path)
-
-        print(f"written {len(write_buffer)} {output_format} files.")
-
-    def _flush_writes(self, write_buffer:list[tuple[str, np.ndarray]], output_format:str):
-        """将缓存的 (路径, 数据) 列表提交到后台线程写入磁盘（不阻塞主流程）"""
-        if not write_buffer:
-            return
-        # 拷贝一份，避免主线程随后 clear 影响正在执行的写入任务
-        self.write_executor.submit(self._write_files, copy.deepcopy(write_buffer), output_format)
 
     def process(self, rgb_mean:list[list[int]]=[[0, 0, 0]], rgb_std:list[list[int]]=[[1, 1, 1]], output_order:str='chw', output_format:str='.npy', output_list:bool=False) -> str|list[list[str]]:
         if output_order not in ['chw', 'hwc', 'nchw', 'nhwc']:
@@ -92,7 +72,7 @@ class ProcessDatasetByModel:
         input_shapes = onnx_executor.get_input_shapes()
 
         output_path_pairs_list:list[list[str]] = []
-        write_buffer:list[tuple[str, np.ndarray]] = []
+        write_buffer:list[tuple[np.ndarray, str]] = []
 
         for i, dataset_path_pair in enumerate(self.dataset_list_path):
             input_tensor_list:list[np.ndarray] = []
@@ -166,19 +146,19 @@ class ProcessDatasetByModel:
                     output_path = str(self.output_dir / f"{image_name}_out{k}{output_format}")
 
                 output_path_pair_list.append(str(output_path))
-                write_buffer.append((output_path, output_tensor))
+                write_buffer.append((output_tensor, output_path))
 
                 if len(write_buffer) >= 16:
-                    self._flush_writes(write_buffer, output_format)
+                    NumpySaver.save_numpy_array(write_buffer, output_format)
                     write_buffer.clear()
 
             output_path_pairs_list.append(output_path_pair_list)
 
-        # 刷新剩余不足 8 个的缓存
-        self._flush_writes(write_buffer, output_format)
+        # 刷新剩余的缓存
+        NumpySaver.save_numpy_array(write_buffer, output_format)
 
         # 等待后台线程把剩余写入任务全部落盘
-        self.write_executor.shutdown(wait=True)
+        NumpySaver.flush_writes_and_close()
 
         cv2.destroyAllWindows()
         onnx_executor.release()
@@ -200,15 +180,15 @@ class ProcessDatasetByModel:
     def clean(self):
         clean_files_or_dirs(self.file_or_dir_to_clean)
 
-if __name__ == '__main__':
-    model_path = "utilities/yolo26s_f16([[640,640]],[[1,300,6]]).onnx"
-    model_path = "unisal_ModelDeploy/models_convert/onnx/unisal_[[1,3,160,320][1,256,5,10]].onnx"
-    dataset = "datasets/datasets_short.txt"
+# if __name__ == '__main__':
+#     model_path = "utilities/yolo26s_f16([[640,640]],[[1,300,6]]).onnx"
+#     model_path = "unisal_ModelDeploy/models_convert/onnx/unisal_[[1,3,160,320][1,256,5,10]].onnx"
+#     dataset = "datasets/datasets_saliency.txt"
 
-    process_dataset = ProcessDatasetByModel(model_path, dataset)
-    process_dataset.set_ring_loop([1,1])
-    process_dataset.set_replace_out_dataset_by_input()
-    process_dataset.process(rgb_mean=[[0, 0, 0]], rgb_std=[[1, 1, 1]], output_order='nchw', output_format='.npy')
+#     process_dataset = ProcessDatasetByModel(model_path, dataset)
+#     process_dataset.set_ring_loop([1,1])
+#     process_dataset.set_replace_out_dataset_by_input()
+#     process_dataset.process(rgb_mean=[[0, 0, 0]], rgb_std=[[1, 1, 1]], output_order='nchw', output_format='.npy')
 
     # npy = np.load("utilities/tmp/processed_by_model/000000000785_in1.npy")
     # print(npy.shape, npy)
@@ -221,9 +201,7 @@ if __name__ == '__main__':
 import shutil
 from copy import deepcopy
 
-class OnnxExecutor:
-    """占位：实际实现在 utils.py 中"""
-    pass
+
 
 def preprocess_image(image:np.ndarray, input_size:tuple[int, int], mean_rgb:list[int]=[0, 0, 0], std_rgb:list[int]=[1, 1, 1]) -> tuple[np.ndarray, float, int, int]:
     """预处理图像：调整大小、归一化、增加批次维度"""
@@ -361,6 +339,7 @@ class GenYoloCroppedDataset:
         input_sizes = onnx_executor.get_input_shapes()[0][2:4][::-1]
 
         output_path_list = []
+        write_buffer:list[tuple[np.ndarray, str]] = []
         for image_path in image_path_list:
             image = cv2.imread(image_path)
             cv2.imshow('image', image)
@@ -381,13 +360,16 @@ class GenYoloCroppedDataset:
 
             output_path = str(Path(image_path).with_suffix(output_format))
 
-            if output_format == '.npy':
-                np.save(output_path, output)
-
-            elif output_format == '.raw':
-                output.tofile(output_path)
-
+            write_buffer.append((output, output_path))
             output_path_list.append(output_path)
+
+            if len(write_buffer) >= 16:
+                NumpySaver.save_numpy_array(write_buffer, output_format)
+                write_buffer.clear()
+
+        # 刷新剩余的缓存
+        NumpySaver.save_numpy_array(write_buffer, output_format)
+        NumpySaver.flush_writes_and_close()
 
         onnx_executor.release()
         return output_path_list
@@ -440,12 +422,13 @@ class GenYoloCroppedDataset:
         return full_img_path_list, output_dir
 
     def crop_and_save(self, image: np.ndarray, boxes: list[list[int, int, int, int, int, float]],
-                        scale: float, x_offset: int, y_offset: int, output_dir: str, image_name: str) -> list[str]:
+                        scale: float, x_offset: int, y_offset: int, output_dir: str, image_name: str) -> tuple[list[np.ndarray], list[str]]:
         
         """裁剪并保存检测结果"""
         saved_paths = []
         display_image = image.copy()  # 创建显示用的图像副本
-        
+        cropped_images:list[np.ndarray] = []
+
         for i, (x1, y1, x2, y2, class_id, conf) in enumerate(boxes):
             # 将坐标转换回原始图像尺寸
             x1 = int((x1 - x_offset) / scale)
@@ -477,17 +460,57 @@ class GenYoloCroppedDataset:
             
             # 裁剪并保存
             cropped = image[y1:y2, x1:x2]
-
             output_path = os.path.join(output_dir, f"{image_name}_crop_{i}.jpg")
-            cv2.imwrite(output_path, cropped)
-                
+
+            cropped_images.append(cropped)
             saved_paths.append(os.path.abspath(output_path))
-        
+
         # 显示带有边界框的图像
         cv2.imshow('Detection Results', display_image)
         cv2.waitKey(1)
         
-        return saved_paths
+        return cropped_images, saved_paths
+
+    def yolo_crop(self, full_img_path_list:list[str], output_dir:str) -> list[list[str, str]]:
+        onnx_executor = OnnxExecutor(self.yolo_model_path)
+        input_sizes = onnx_executor.get_input_shapes()[0][2:4][::-1]
+        all_cropped_paths:list[list[str, str]] = []
+
+        write_buffer:list[tuple[np.ndarray, str]] = []
+        for image_path in full_img_path_list:
+            image = cv2.imread(image_path) # 读取图片
+            if image is None:
+                print(f"无法读取图片: {image_path}")
+                continue
+            
+            # 预处理
+            input_tensor, scale, x_offset, y_offset = preprocess_image(image, input_size=input_sizes, std_rgb=[255, 255, 255])
+            output = onnx_executor.put([input_tensor], input_format="nchw")[0] # 推理
+            results = process_predictions(output) # 处理预测结果
+
+            if results:
+                # 裁剪并保存
+                image_name = Path(image_path).stem
+
+                cropped_images, cropped_paths = self.crop_and_save(image, results, scale, x_offset, y_offset, output_dir, image_name)
+
+                if cropped_paths:
+                    write_buffer.extend(list(zip(cropped_images, cropped_paths)))
+
+                    if len(write_buffer) >= 8:
+                        NumpySaver.save_numpy_array(write_buffer, output_format="image")
+                        write_buffer.clear()
+
+                    for cropped_path in cropped_paths:
+                        all_cropped_paths.append([image_path, cropped_path])
+
+        NumpySaver.save_numpy_array(write_buffer, output_format="image")
+        NumpySaver.flush_writes_and_close()
+
+        cv2.destroyWindow("Detection Results")
+        onnx_executor.release()
+
+        return all_cropped_paths
 
     def generate(self, swap_image_pair:bool=False, save_original_path_pair:bool=False) -> str|tuple[str, str]:
         """
@@ -504,38 +527,8 @@ class GenYoloCroppedDataset:
 
         full_img_path_list, output_dir = self.prepare_work_dir()
 
-        # 初始化ONNX运行时
-        onnx_executor = OnnxExecutor(self.yolo_model_path)
-        input_sizes = onnx_executor.get_input_shapes()[0][2:4][::-1]
-        all_cropped_paths:list[list[str, str]] = []
-        for image_path in full_img_path_list:
-            # 读取图片
-            image = cv2.imread(image_path)
-            if image is None:
-                print(f"无法读取图片: {image_path}")
-                continue
-            
-            # 预处理
-            input_tensor, scale, x_offset, y_offset = preprocess_image(image, input_size=input_sizes, std_rgb=[255, 255, 255])
-            
-            # 推理
-            output = onnx_executor.put([input_tensor], input_format="nchw")[0]
-            
-            # 处理预测结果
-            results = process_predictions(output)
+        all_cropped_paths = self.yolo_crop(full_img_path_list, output_dir)
 
-            if results:
-                # 裁剪并保存
-                image_name = Path(image_path).stem
-
-                cropped_paths = self.crop_and_save(image, results, scale, x_offset, y_offset, output_dir, image_name)
-
-                if cropped_paths:
-                    for cropped_path in cropped_paths:
-                        all_cropped_paths.append([image_path, cropped_path])
-
-        cv2.destroyWindow("Detection Results")
-        onnx_executor.release()
 
         original_all_cropped_paths = deepcopy(all_cropped_paths)
         new_all_cropped_paths = deepcopy(all_cropped_paths)

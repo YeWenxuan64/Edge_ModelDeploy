@@ -563,3 +563,4 @@ class SnpeAccuracyDebugger:
 
     def clean(self):
         clean_files_or_dirs(self.file_or_dir_to_clean)
+

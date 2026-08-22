@@ -1,10 +1,12 @@
 import os
 import re
+import copy
 import random
 import heapq
 import shutil
 from pathlib import Path
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 import onnx  # 仅用于类型注解
 
 
@@ -949,3 +951,38 @@ def normalize_onnx_model(model:onnx.ModelProto, mean_rgb:list[list[int|float,]]=
 
 
 
+class NumpySaver:
+    write_threadpool = None
+
+    @staticmethod
+    def write_files(write_buffer:list[tuple[np.ndarray, str, str]], output_format:str):
+        """实际执行写入磁盘的工作函数（在后台线程中运行）"""
+        for data, output_path in write_buffer:
+            try:
+                if output_format == '.npy':
+                    np.save(output_path, data)
+
+                elif output_format == '.raw':
+                    data.tofile(output_path)
+
+                elif output_format == "image":
+                    cv2.imwrite(output_path, data)
+                    
+            except Exception as e:
+                pass
+
+        print(f"written {len(write_buffer)} {output_format} files.")
+
+    @classmethod
+    def save_numpy_array(cls, data_and_path:list[tuple[np.ndarray, str]], output_format:str):
+        if cls.write_threadpool is None:
+            cls.write_threadpool = ThreadPoolExecutor(max_workers=6)
+
+        # 拷贝一份，避免主线程随后 clear 影响正在执行的写入任务
+        cls.write_threadpool.submit(cls.write_files, copy.deepcopy(data_and_path), output_format)
+
+    @classmethod
+    def flush_writes_and_close(cls,):
+        if cls.write_threadpool is not None:
+            cls.write_threadpool.shutdown(wait=True)
+        cls.write_threadpool = None
