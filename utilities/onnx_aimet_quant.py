@@ -130,6 +130,7 @@ class AimetQuantSchemeConfig:
         'sequential-mse': 'sequential_mse',
     }
 
+    @classmethod
     def resolve_quant_scheme(cls, method: str) -> str:
         """把项目校准方法名映射为 AIMET 2.x quant_scheme 字符串。
 

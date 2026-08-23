@@ -1,8 +1,8 @@
-import re
 import sys
 import os
+import shutil
 from pathlib import Path
-import numpy as np
+
 from rknn.api import RKNN
 
 
@@ -10,7 +10,7 @@ current_dir = Path(__file__).parent.resolve()
 sys.path.append(str(current_dir))
 
 from utils import temporary_chdir, clean_files_or_dirs, read_dataset_txt_to_list
-
+from accuracy_debugger import RknnAccuracyDebugger
 
 
 
@@ -39,6 +39,7 @@ class OnnxToRKNN:
 
         self.model_path = Path(model_path).resolve()
         self.rknn_model_path = Path(rknn_model_path).resolve()
+        self.tmp_model_path = None
 		
         if dataset_path is not None:
             self.dataset_path = Path(dataset_path).resolve()
@@ -149,11 +150,19 @@ class OnnxToRKNN:
             self.dataset_path = tmp_dataset_path
             self.file_or_dir_to_clean.append(self.dataset_path)
 
+        # 复制 onnx 模型到 tmp 目录，转换在 tmp 目录内进行，避免污染原模型
+        self.tmp_model_path = self.tmp_dir / self.model_path.name
+        shutil.copy2(self.model_path, self.tmp_model_path)
+        self.file_or_dir_to_clean.append(self.tmp_model_path)
+
         with temporary_chdir(self.tmp_dir):
             self.self_convert(mean_rgb, std_rgb)
 
         if self.accuracy_analysis_picture_list is not None:
-            self.plot_accuracy_analysis()
+            debugger = RknnAccuracyDebugger(self.tmp_dir, self.tmp_model_path)
+            debugger.plot_accuracy_analysis()
+            # 带路径追踪的精度分析（Netron 风格网络图）
+            debugger.plot_network_analysis(show=True)
 
     def clean(self):
         clean_files_or_dirs([str(self.tmp_dir / name) for name in self.file_or_dir_to_clean])
@@ -170,7 +179,7 @@ class OnnxToRKNN:
 
         # Load model
         print('--> Loading model')
-        ret = rknn.load_onnx(model=str(self.model_path))
+        ret = rknn.load_onnx(model=str(self.tmp_model_path))
         if ret != 0:
             print('Load model failed!')
             exit(ret)
@@ -219,147 +228,33 @@ class OnnxToRKNN:
         print('--> Released rknn')
 
 
-    def read_error_analysis(self) -> list[dict]:
-        """
-        读取 RKNN 精度分析结果文件 (snapshot/error_analysis.txt)。
-
-        Args:
-            error_analysis_path (str | None): 精度分析结果文件路径。
-                - None (默认): 使用 self.tmp_dir/snapshot/error_analysis.txt。
-
-        Returns:
-            list[dict]: 逐层精度数据列表，每个元素包含:
-                - op_type (str): 算子类型，如 'Conv'、'LeakyRelu'
-                - layer_name (str): 层名称
-                - entire_cos (float | None): 累积余弦相似度（从输入累计到该层）
-                - entire_euc (float | None): 累积欧氏距离
-                - single_cos (float | None): 单层余弦相似度（反映该层自身量化误差）
-                - single_euc (float | None): 单层欧氏距离
-                - 少数层（如部分 Concat）无数值，对应字段为 None。
-
-        Raises:
-            FileNotFoundError: 当结果文件不存在时。
-        """
-
-        error_analysis_path = self.tmp_dir / 'snapshot' / 'error_analysis.txt'
-
-        if not error_analysis_path.exists():
-            raise FileNotFoundError(
-                f"error_analysis.txt not found: {error_analysis_path}\n"
-                "请先通过 set_do_accuracy_analysis() 启用精度分析并运行 convert() 生成结果。"
-            )
-
-        rows: list[dict] = []
-        with open(error_analysis_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.rstrip()
-                if not line:
-                    continue
-                # 跳过注释行、表头行和分隔线
-                if line.startswith('#') or line.startswith('layer_name') or line.startswith('---'):
-                    continue
-
-                # 数据行格式: [OpType] layer_name   entire_cos | entire_euc   single_cos | single_euc
-                if not line.startswith('['):
-                    continue
-                end_bracket = line.find(']')
-                if end_bracket == -1:
-                    continue
-                op_type = line[1:end_bracket]
-                rest = line[end_bracket + 1:].strip()
-
-                # 匹配末尾的 4 个数值: cos | euc   cos | euc
-                m = re.match(r'^(.*?)\s+([\d.]+)\s*\|\s*([\d.]+)\s+([\d.]+)\s*\|\s*([\d.]+)\s*$', rest)
-                if m:
-                    layer_name = m.group(1).strip()
-                    entire_cos = float(m.group(2))
-                    entire_euc = float(m.group(3))
-                    single_cos = float(m.group(4))
-                    single_euc = float(m.group(5))
-                else:
-                    # 无数值的层（如部分 Concat 层）
-                    layer_name = rest
-                    entire_cos = entire_euc = single_cos = single_euc = None
-
-                rows.append({
-                    'op_type': op_type,
-                    'layer_name': layer_name,
-                    'entire_cos': entire_cos,
-                    'entire_euc': entire_euc,
-                    'single_cos': single_cos,
-                    'single_euc': single_euc,
-                })
-
-        print(f"Loaded {len(rows)} layers from {error_analysis_path}")
-        return rows
-
-    def plot_accuracy_analysis(self):
-        """
-        读取并可视化 RKNN 精度分析结果（欧氏距离柱状图 + 余弦相似度折线图）。
-        """
-        from matplotlib import axes
-        import matplotlib.pyplot as plt
-
-        rows = self.read_error_analysis()
-        if not rows:
-            print("No data to plot.")
-            return rows
-
-        layer_names = [r['layer_name'] for r in rows]
-        n = len(rows)
-        x = np.arange(n)
-
-        entire_cos = np.array([r['entire_cos'] for r in rows], dtype=float)
-        entire_euc = np.array([r['entire_euc'] for r in rows], dtype=float)
-        single_cos = np.array([r['single_cos'] for r in rows], dtype=float)
-        single_euc = np.array([r['single_euc'] for r in rows], dtype=float)
-
-        # 图例颜色/样式与 QNN 精度分析保持一致
-        fig, (ax_euc, ax_cos) = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
-        ax_euc:axes.Axes
-        ax_cos:axes.Axes
-
-        # 图1：欧氏距离（逐层柱状）+ 累积欧氏距离（右侧纵轴折线）
-        ax_euc.set_yscale('linear')
-        ax_euc.bar(x, single_euc, color='skyblue', edgecolor='black', linewidth=0.5, alpha=0.7, label='Euc Dist Per Layer')
-        ax_euc.set_title('Euclidean Distance & Euc(entire) (Per Layer)', fontsize=14, fontweight='bold')
-        ax_euc.set_ylabel('Euclidean Distance', fontsize=12)
-        ax_euc.grid(True, which='both', ls='--', alpha=0.5)
-
-        # 右侧纵轴：累积欧氏距离（entire，与单层欧氏距离量级接近，分离显示便于对比）
-        ax_entire = ax_euc.twinx()
-        ax_entire.plot(x, entire_euc, color='orange', marker='.', linestyle='-', linewidth=1.5, markersize=2, label='Euc (entire)')
-        ax_entire.set_ylabel('Euc (entire)', fontsize=12)
-
-        # 合并两个轴的图例
-        lines_euc, labels_euc = ax_euc.get_legend_handles_labels()
-        lines_entire, labels_entire = ax_entire.get_legend_handles_labels()
-        ax_euc.legend(lines_euc + lines_entire, labels_euc + labels_entire, loc='upper left')
-
-        # 图2：余弦相似度（逐层折线）
-        ax_cos.set_yscale('linear')
-        ax_cos.plot(x, single_cos, color='green', marker='.', linestyle='-', linewidth=1, markersize=2, label='Cosine (single)')
-        ax_cos.plot(x, entire_cos, color='orange', marker='.', linestyle='-', linewidth=1.5, markersize=2, label='Cosine (entire)')
-        ax_cos.set_title('Cosine Similarity (Per Layer)', fontsize=14, fontweight='bold')
-        ax_cos.set_ylabel('Cosine Similarity', fontsize=12)
-        ax_cos.set_xticks(range(n))
-        ax_cos.set_xticklabels(layer_names, rotation=-45, ha='left', fontsize=10)
-
-        ax_cos.axhline(0.99, color='red', linestyle='--', linewidth=1, alpha=0.6, label='Warning Threshold (0.99)')
-        ax_cos.legend(loc='lower left')
-        ax_cos.grid(True, which='both', ls='--', alpha=0.5)
-
-        # 消除 x 轴两端默认的 5% 空白边距（留半个柱宽避免首尾柱被裁切）
-        ax_cos.set_xlim(-0.5, n - 0.5)
-
-
-        plt.tight_layout()
-        save_path = self.tmp_dir / 'rknn_accuracy_analysis_summary.png'
-        self.file_or_dir_to_clean.append(save_path)
-
-        plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {save_path}")
-        plt.show()
 
 
 
+
+if __name__ == '__main__':
+    # accuracy_analysis test
+    parent_dir = current_dir.parent
+
+    # MODEL_PATH = 'avtrack_ModelDeploy/models_convert/onnx/avtrack_[[1,3,112,112][1,3,224,224]].onnx'
+    # RKNN_MODEL = 'avtrack_ModelDeploy/models_convert/rknn/avtrack_i8[[1,112,112,3][1,224,224,3]].rknn'
+    MODEL_PATH = 'retinaface_mobile_ModelDeploy/models_convert/onnx/RetinaFace_mobile_[1,3,320,320].onnx'
+    RKNN_MODEL = 'retinaface_mobile_ModelDeploy/models_convert/rknn/RetinaFace_mobile_i8[1,320,320,3].rknn'
+    DATASET_PATH = str(parent_dir / 'datasets/datasets.txt')
+
+
+    TARGET_PLATFORM = 'rk3588'
+    converter = OnnxToRKNN(MODEL_PATH, RKNN_MODEL, DATASET_PATH, TARGET_PLATFORM)
+
+    # 测试文件已存在，不做转换
+    # 图结构分析使用 tmp 目录下的 ONNX 模型副本（convert() 会复制到此）
+    tmp_model_path = converter.tmp_dir / converter.model_path.name
+
+    # 精度分析调试器：读取精度分析文件、plt 显示、解析图结构
+    debugger = RknnAccuracyDebugger(converter.tmp_dir, tmp_model_path)
+
+    # 直接读取精度分析数据并绘制
+    # debugger.plot_accuracy_analysis()
+
+    # 带路径追踪的精度分析（Netron 风格网络图，多输入 -> 多输出 排列组合路径）
+    debugger.plot_network_analysis()

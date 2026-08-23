@@ -1,6 +1,5 @@
 import os
 import sys
-import re
 import json
 import subprocess
 from pathlib import Path
@@ -20,7 +19,7 @@ sys.path.append(str(current_dir))
 from utils import temporary_chdir, letterbox_image, clean_files_or_dirs, read_dataset_txt_to_list
 from utils import sanitize_name, parse_bitwidth, find_hybrid_subgraph_nodes
 from utils import get_onnx_model_info, normalize_onnx_model, reorder_onnx_nodes_by_input, reorder_onnx_nodes_by_output
-from qnn_accuracy_debugger import SnpeAccuracyDebugger
+from accuracy_debugger import SnpeAccuracyDebugger
 from onnx_aimet_quant import AimetOnnxQuantizer, AimetQuantsimConfig
 
 
