@@ -235,12 +235,12 @@ class QnnAimetConnector:
             quantizer.do_hybrid_quantization(hybrid_subgraphs, hybrid_bitwidth, hybrid_float_bitwidth)
 
         # 2.75
-        if converter.custom_alibration_data_path is not None:
-            quantizer.use_custom_alibration_data(converter.custom_alibration_data_path)
+        if converter.custom_calibration_data_path is not None:
+            quantizer.use_custom_calibration_data(converter.custom_calibration_data_path)
         elif converter.dataset_path is None:
             # AIMET 量化必须有真实校准数据：随机 dummy 无法反映真实激活分布，直接报错
             raise ValueError("AIMET quantization requires calibration data: provide dataset_path or "
-                "call use_custom_alibration_data(path) before convert().")
+                "call use_custom_calibration_data(path) before convert().")
 
         # 3.
         model_info = get_onnx_model_info(str(tmp_onnx_path))
@@ -381,8 +381,8 @@ class OnnxToQNN:
         self.param_quant_schema, self.act_quant_schema = 'asymmetric', 'asymmetric'
         self.use_cle_algorithm = False
 
-        #self.use_custom_alibration_data()
-        self.custom_alibration_data_path = None
+        #self.use_custom_calibration_data()
+        self.custom_calibration_data_path = None
 
     def set_quantization_method(self, param_quant_method:str='min-max', act_quant_method:str='min-max', bitwidth:str='w8a8', bias_bitwidth:int=8,
                                 param_quant_schema:str='asymmetric', act_quant_schema:str='asymmetric', use_cle_algorithm:bool=False):
@@ -450,10 +450,10 @@ class OnnxToQNN:
         print(f"[QnnxToQNN] Quantization method set to: quant_method: param={self.param_quant_method}, act={self.act_quant_method}; bitwidth={self.weights_bitwidth}w{self.act_bitwidth}a"
               f", schema: act={self.act_quant_schema}, param={self.param_quant_schema}; use_cle_algorithm={self.use_cle_algorithm}")
 
-    def use_custom_alibration_data(self, custom_alibration_data_path:str|None=None):
+    def use_custom_calibration_data(self, custom_calibration_data_path:str|None=None):
         """
         Args:
-            custom_alibration_data_path (str | None): Path to a text file containing the custom calibration dataset.
+            custom_calibration_data_path (str | None): Path to a text file containing the custom calibration dataset.
                 - Each line in the text file should represent a path to image data.
                 - If the model has multiple inputs, the paths should be separated by spaces.
                 
@@ -470,12 +470,12 @@ class OnnxToQNN:
                 ```
         """
 
-        if custom_alibration_data_path is None:
-            self.custom_alibration_data_path = None
+        if custom_calibration_data_path is None:
+            self.custom_calibration_data_path = None
         else:
-            self.custom_alibration_data_path = Path(custom_alibration_data_path).resolve()
+            self.custom_calibration_data_path = Path(custom_calibration_data_path).resolve()
 
-        print(f"[QnnxToQNN] Custom calibration dataset path set to: {self.custom_alibration_data_path}")
+        print(f"[QnnxToQNN] Custom calibration dataset path set to: {self.custom_calibration_data_path}")
 
     def do_hybrid_quantization(self, custom_hybrid:list[list[str, str]], bitwidth:str="w8a16", bias_bitwidth:int=8, float_bitwidth:int|None=None):
         """
@@ -614,10 +614,10 @@ class OnnxToQNN:
             exit(1)
 
         # 6.
-        if self.dataset_path is not None and self.custom_alibration_data_path is None:
+        if self.dataset_path is not None and self.custom_calibration_data_path is None:
             calibration_data_index_path = self.generate_calibration_data(onnx_model_info, set_input_order)
         else:
-            calibration_data_index_path = self.custom_alibration_data_path
+            calibration_data_index_path = self.custom_calibration_data_path
 
         # 7.
         if calibration_data_index_path is not None:
@@ -754,7 +754,7 @@ class OnnxToQNN:
 
         extra_args = "--target_backend HTP --onnx_skip_simplification " # --onnx_summary' # --preserve_onnx_output_order
 
-        if not is_quantized and not self.dataset_path and not self.custom_alibration_data_path:
+        if not is_quantized and not self.dataset_path and not self.custom_calibration_data_path:
             extra_args += " --float_bitwidth 16"
 
         if quantization_overrides_path:

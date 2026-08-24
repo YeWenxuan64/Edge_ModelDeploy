@@ -313,13 +313,13 @@ class GenYoloCroppedDataset:
         self.animal_list = [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 77]
         self.vehicle_list = [2, 3, 4, 5, 6, 7, 8, 30, 31, 33, 36, 37]
 
-    def set_postprocess_by_another_model(self, another_model_path:str, process_target:str, output_shape:str='chw',outpur_format:str='.npy', rgb_mean:list[int]=[0, 0, 0], rgb_std:list[int]=[1, 1, 1]):
+    def set_postprocess_by_another_model(self, another_model_path:str, process_target:str, output_shape:str='chw', output_format:str='.npy', rgb_mean:list[int]=[0, 0, 0], rgb_std:list[int]=[1, 1, 1]):
         """
         Args:
             another_model_path_and_target_list (list[tuple[str, str]]): [(another_model_path, process_target), ...]
                 - process_target (str): 'output' or 'input'
             output_shape (str): 'chw' or 'hwc' or 'nchw' or 'nhwc'
-            outpur_format (str): '.npy' or '.raw'
+            output_format (str): '.npy' or '.raw'
         """
         if process_target not in ['output', 'input']:
             raise ValueError("process_target must be 'output' or 'input'")
@@ -327,11 +327,11 @@ class GenYoloCroppedDataset:
         if output_shape not in ['chw', 'hwc', 'nchw', 'nhwc']:
             raise ValueError("output_shape must be 'chw' or 'hwc' or 'nchw' or 'nhwc'")
 
-        if outpur_format not in ['.npy', '.raw']:
-            raise ValueError("outpur_format must be '.npy' or '.raw'")
+        if output_format not in ['.npy', '.raw']:
+            raise ValueError("output_format must be '.npy' or '.raw'")
 
         another_model_path = Path(another_model_path).resolve()
-        self.another_args_list.append((str(another_model_path), process_target, output_shape, outpur_format, rgb_mean, rgb_std))
+        self.another_args_list.append((str(another_model_path), process_target, output_shape, output_format, rgb_mean, rgb_std))
         
     @staticmethod
     def postprocess_by_another_model(another_model_path:str, image_path_list:list[str], output_shape, output_format, mean_rgb, std_rgb) -> list[str]:
@@ -600,8 +600,8 @@ if __name__ == "__main__":
 
     # 创建对象并生成数据集
     dataset_generator = GenYoloCroppedDataset(dataset_path, 'cropped_images2')
-    dataset_generator.set_postprocess_by_another_model(another_model1_path, process_target="input", output_shape="nchw", outpur_format='.npy')
-    dataset_generator.set_postprocess_by_another_model(another_model2_path, process_target="output", output_shape="nchw", outpur_format='.npy')
+    dataset_generator.set_postprocess_by_another_model(another_model1_path, process_target="input", output_shape="nchw", output_format='.npy')
+    dataset_generator.set_postprocess_by_another_model(another_model2_path, process_target="output", output_shape="nchw", output_format='.npy')
 
     cropped_list_path = dataset_generator.generate()
 

@@ -104,7 +104,7 @@ converter = OnnxToRKNN(
 # 可选：高级优化配置
 converter.extra_optimize(
     quantized_algorithm='kl_divergence',   # 'normal' / 'kl_divergence' / 'mmse'
-    flash_attantion=True,
+    flash_attention=True,
     compress_weight=False,
     model_pruning=False
 )
@@ -173,8 +173,8 @@ converter.set_quantization_method(
 )
 
 # 可选：使用自定义校准数据（.raw 格式）
-# converter.use_custom_alibration_data(
-#     custom_alibration_data_path='path/to/calibration_data.txt'
+# converter.use_custom_calibration_data(
+#     custom_calibration_data_path='path/to/calibration_data.txt'
 # )
 
 # 可选：混合精度量化（部分敏感子图使用更高精度，其余仍按全局设置量化为 INT8）
@@ -209,24 +209,9 @@ converter.convert(
 converter.clean()
 ```
 
-### QNN 混合精度量化说明
-
-QNN 混合量化通过 `do_hybrid_quantization()` 指定一个或多个**子图**（用子图的输入张量与输出张量界定），子图内的节点使用更高精度，子图外的节点仍按 `set_quantization_method()` 的全局设置（默认 w8a8）量化为 INT8：
-
-| 模式 | 关键参数 | 区域精度 | 适用场景 |
-|------|---------|---------|---------|
-| **整数混合量化**（默认） | `bitwidth` / `bias_bitwidth` | 区域内权重 / 激活 / 偏置为整数位宽（如 w8a16） | 精度敏感但无需浮点，HTP 上性能与精度兼顾 |
-| **浮点保留** | `float_bitwidth=16/32` | 区域内保持 FP16 / FP32 浮点 | 精度极度敏感的层，可接受更高计算开销 |
-
-**子图边界的确定：**
-- 边界可以是**张量名**，也可以是**节点名**（自动取该节点的输出张量作为边界）
-- 子图 = 「输入张量与输出张量」之间的所有节点
-- 可同时传入多个子图，例如 `[[in1, out1], [in2, out2]]`
-- 建议先做**精度分析**（见 [量化精度分析指南](./ACCURACY_ANALYSIS_TOOLUSE.md)）定位余弦相似度偏低的层，再对其所在子图做混合量化
-
 ### 可选：接入 AIMET 外置量化器
 
-`OnnxToQNN` 也可以用 **AIMET 2.x** 作为外置量化路径（代替 QAIRT 自带的 `qairt-quantizer`），用法见 [3.3 `AimetOnnxQuantizer`](#33-aimetonnxquantizer--onnx-转-量化onnx-兼-qualcomm-qnn-外置量化器) 末尾的「接入 QNN」。
+`OnnxToQNN` 也可以用 **AIMET 2.x** 作为外置量化路径（代替 QAIRT 自带的 `qairt-quantizer`），用法见 [3.3 `AimetOnnxQuantizer`](#33-aimetonnxquantizer) 末尾的「接入 QNN」。
 
 
 
@@ -326,8 +311,53 @@ converter.convert(
 - `set_use_aimet` 会自动按 `target_platform` 的 DSP 架构选用对应的 HTP quantsim config（如 `htp_v68` / `htp_v73`），无需手动指定。
 - 子图混合精度仍通过 `do_hybrid_quantization()` 配置，AIMET 路径会自动读取。
 
+## 3.4 混合量化
 
+`OnnxToQNN` 与 `OnnxToRKNN` 都提供 `do_hybrid_quantization()`，用于对网络中的**指定子图**使用更高精度，其余节点仍按全局设置量化为 INT8。两者接口相似，核心都是传入一组 `[输入张量, 输出张量]` 对来圈定子图。
 
+**通用概念：**
+- **子图指定**：`custom_hybrid` 是 `list[list[str]]`，每个内层列表为 `[输入张量名, 输出张量名]`，两者之间的所有节点被选中。可传多个子图：`[[in1, out1], [in2, out2]]`。张量名也可用节点名（自动取该节点输出张量作边界）。
+- **子图外**：按全局量化设置（QNN 默认 `w8a8`）量化为 INT8。
+- **调用时机**：在 `convert()` 之前调用即可，与 `set_quantization_method` 等无强顺序依赖。
+
+**QNN（`OnnxToQNN`）：**
+
+```python
+converter.do_hybrid_quantization(
+    custom_hybrid=[[in1, out1]],   # 子图边界
+    bitwidth="w8a16",              # 区域内 w/a 位宽
+    bias_bitwidth=8,               # 区域内 bias 位宽（8/32）
+    float_bitwidth=None,           # 16/32 表示区域保持 FP16/FP32
+)
+```
+
+两种模式（二选一）：
+1. **整数混合量化**（默认）：`bitwidth` + `bias_bitwidth` 指定区域内权重/激活/偏置位宽。例：全局 `w8a8`、区域 `w8a16`。
+2. **浮点保留**：设置 `float_bitwidth`（16=FP16 / 32=FP32），区域保持浮点，忽略整数位宽参数。
+
+内部由 `QnnHybridQuantGen` 生成 `quantization_overrides.json` 交给 `qairt-quantizer`，子图边界会自动插入 Convert 节点。
+
+**RKNN（`OnnxToRKNN`）：**
+
+```python
+converter.do_hybrid_quantization(
+    custom_hybrid=[[in1, out1]],   # 子图边界
+)
+```
+
+- 区域内节点使用 **FP16**，子图外保持 8-bit 量化（位宽固定，无额外参数）。
+- 内部走 `rknn.hybrid_quantization_step1/step2` 两步流程。
+
+**对比：**
+
+| 项目 | QNN | RKNN |
+|------|-----|------|
+| 区域精度 | 可配整数位宽或 FP16/FP32 | 固定 FP16 |
+| 额外参数 | `bitwidth` / `bias_bitwidth` / `float_bitwidth` | 无 |
+| 子图外 | 全局设置（默认 w8a8） | 8-bit |
+| 底层机制 | quantization_overrides.json | hybrid_quantization_step1/2 |
+
+---
 
 ## 4. 模型处理相关
 
@@ -389,7 +419,7 @@ dataset_list_path = generator.generate()
 
 ### 进阶用法：配合另一个 AI 模型做后处理
 
-如果目标模型需要先经过另一个 AI（如跟踪模型的 backbone）再输入，可以用 `set_postprocess_by_another_model()` 让裁剪后的图片自动通过该模型推理，输出 `.npy` 或 `.raw` 格式的 Tensor 数据：
+如果目标模型需要先经过另一个 AI（如跟踪模型的 backbone）再输入，可以用 `set_postprocess_by_another_model()` 让图片自动通过该模型推理，输出 `.npy` 或 `.raw` 格式的 Tensor 数据。可多次调用以配置多个模型：
 
 ```python
 generator = GenYoloCroppedDataset(
@@ -397,15 +427,23 @@ generator = GenYoloCroppedDataset(
     output_dir_name='cropped_images'
 )
 
-# 指定一个或多个模型，对裁剪后的图片做推理，替换为推理输出
+# 对完整图（input 侧）做推理，替换为推理输出
 generator.set_postprocess_by_another_model(
-    another_model_path_and_target_list=[
-        ('path/to/model_T.onnx', 'input'),   # 对完整图（input 侧）推理
-        ('path/to/model_S.onnx', 'output'),  # 对裁剪图（output 侧）推理
-    ],
-    output_shape='nchw',       # 输出张量布局
-    outpur_format='.npy'       # 输出文件格式
+    another_model_path='path/to/model_T.onnx',
+    process_target='input',      # 'input'（完整图）/ 'output'（裁剪图）
+    output_shape='nchw',         # 输出张量布局
+    output_format='.npy',        # 输出文件格式
+    rgb_mean=[0, 0, 0],          # 该模型输入的归一化参数
+    rgb_std=[1, 1, 1]
 )
+
+# 可再调用一次，对裁剪图（output 侧）做推理
+# generator.set_postprocess_by_another_model(
+#     another_model_path='path/to/model_S.onnx',
+#     process_target='output',
+#     output_shape='nchw',
+#     output_format='.npy'
+# )
 
 dataset_list_path = generator.generate()
 
@@ -418,29 +456,112 @@ dataset_list_path = generator.generate()
 
 ### 参数说明
 
+**`GenYoloCroppedDataset.__init__`：**
+
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `dataset_path` | `str` | — | 原始数据集索引文件路径（每行一个图片路径） |
 | `output_dir_name` | `str` | `'cropped_images'` | 裁剪图片存放目录名（在 `utilities/tmp/` 下创建） |
-| `swap_image_pair` | `bool` | `False` | 输出文件中是否交换配对顺序（`True` → `裁剪图 完整图`） |
-| `another_model_path_and_target_list` | `list[tuple[str, str]]` | `None` | 后处理模型列表，每项为 `(模型路径, 'input'\|'output')` |
+
+**`set_postprocess_by_another_model`：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `another_model_path` | `str` | — | 后处理 ONNX 模型路径 |
+| `process_target` | `str` | — | 作用侧：`'input'`（完整图）/ `'output'`（裁剪图） |
 | `output_shape` | `str` | `'chw'` | 推理输出张量布局：`'chw'` / `'hwc'` / `'nchw'` / `'nhwc'` |
-| `outpur_format` | `str` | `'.npy'` | 推理输出文件格式：`'.npy'` / `'.raw'` |
+| `output_format` | `str` | `'.npy'` | 推理输出文件格式：`'.npy'` / `'.raw'` |
+| `rgb_mean` / `rgb_std` | `list[int\|float]` | `[0,0,0]` / `[1,1,1]` | 该模型输入的 RGB 归一化参数 |
+
+**`generate()`：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `swap_image_pair` | `bool` | `False` | 是否交换配对顺序（`True` → `裁剪图 完整图`） |
+| `save_original_path_pair` | `bool` | `False` | 是否额外保存未经后处理替换的原始路径对 |
 
 ### `generate()` 返回值
 
-返回配对数据集索引文件的路径字符串（`.txt`），每行格式：
+- 默认返回配对数据集索引文件的路径字符串（`.txt`），每行格式：
 
 ```
 /path/to/full_image.jpg   /path/to/cropped_image.jpg
 ```
 
-若 `swap_image_pair=True`，顺序反转为 `裁剪图 完整图`；若配置了后处理模型，对应侧的路径会替换为推理输出文件路径。
+- 若 `swap_image_pair=True`，顺序反转为 `裁剪图 完整图`；若配置了后处理模型，对应侧的路径会替换为推理输出文件路径。
+- 若 `save_original_path_pair=True`，返回 `(处理后索引路径, 原始索引路径)` 元组。
+
+
+### 4.2 `ProcessDatasetByModel` — 用指定模型批量处理数据集
+
+`ProcessDatasetByModel`（`utilities/dataset_preprocess.py`）用**任意 ONNX 模型**对数据集做批量推理，把每个样本的**模型输出**（或输入）保存为 `.npy` / `.raw` Tensor 文件，生成新的数据集索引。常用于：把校准数据集预先通过某个 backbone 推理，得到中间特征作为下游模型的校准输入。
+
+### 基础用法
+
+```python
+from utilities.dataset_preprocess import ProcessDatasetByModel
+
+processor = ProcessDatasetByModel(
+    model_path='path/to/model.onnx',        # 用于推理的 ONNX 模型
+    dataset_path='datasets/datasets.txt',   # 数据集索引（str 或 list[str]）
+    output_dir_name='processed_by_model'    # 输出目录名（utilities/tmp/ 下）
+)
+
+# 执行：逐样本推理 -> 保存输出 Tensor -> 生成索引文件
+dataset_list_path = processor.process(
+    rgb_mean=[[0, 0, 0]],        # 每个输入的 RGB 归一化（多输入传多个列表）
+    rgb_std=[[1, 1, 1]],
+    output_order='nchw',         # 输出张量布局 'chw'/'hwc'/'nchw'/'nhwc'
+    output_format='.npy',        # 输出格式 '.npy' / '.raw'
+    output_list=False            # True：返回 list[list[str]]；False：返回索引 txt 路径
+)
+
+# 可选：清理临时文件（输出目录、索引文件）
+# processor.clean()
+```
+
+### 进阶用法：环形回路与输入替换
+
+- **`set_ring_loop(loop_pair)`**：`[model_input_n, model_output_n]`，把第 `n` 个输出回灌为下一次迭代的第 `n` 个输入（用于自回归/迭代式模型，如逐帧跟踪）。
+- **`set_replace_out_dataset_by_input(not_normalize=True)`**：用**输入 Tensor** 替换输出数据集（`not_normalize=True` 用未归一化的原始输入，`False` 用归一化后的输入）。
+
+```python
+processor = ProcessDatasetByModel(model_path, dataset_path)
+processor.set_ring_loop([1, 1])                 # 输出1 回灌为 输入1
+processor.set_replace_out_dataset_by_input()    # 用输入替换输出
+dataset_list_path = processor.process(output_order='nchw', output_format='.npy')
+```
+
+### 参数说明
+
+**`ProcessDatasetByModel.__init__`：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `model_path` | `str` | — | 用于推理的 ONNX 模型路径 |
+| `dataset_path` | `str \| list[str] \| None` | `None` | 数据集索引 txt 路径，或每行样本路径的列表 |
+| `output_dir_name` | `str` | `'processed_by_model'` | 输出目录名（在 `utilities/tmp/` 下创建） |
+
+**`process()`：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `rgb_mean` / `rgb_std` | `list[list[int\|float]]` | `[[0,0,0]]` / `[[1,1,1]]` | 每个输入的 RGB 归一化参数 |
+| `output_order` | `str` | `'chw'` | 输出张量布局：`'chw'` / `'hwc'` / `'nchw'` / `'nhwc'` |
+| `output_format` | `str` | `'.npy'` | 输出文件格式：`'.npy'` / `'.raw'` |
+| `output_list` | `bool` | `False` | `True` 返回 `list[list[str]]`；`False` 返回索引 txt 路径 |
+
+### `process()` 返回值
+
+- `output_list=False`（默认）：返回索引 txt 文件路径（`utilities/tmp/datasets_processed_by_model.txt`），每行一个样本、多输出路径空格分隔。
+- `output_list=True`：返回 `list[list[str]]`，每个样本对应其各输出文件路径列表。
+
+> **注意：** 生成的临时文件位于 `utilities/tmp/` 目录下，使用完毕后再调用 `processor.clean()` 清理。
 
 
 
 
 ## 5. 量化精度分析
 
-转换完成后，可通过精度分析定位量化损失最大的层，指导混合量化优化。详见 **[📊 量化精度分析指南](./ACCURACY_ANALYSIS_TOOLUSE.md)**。
+转换完成后，可通过精度分析定位量化损失最大的层，指导混合量化优化。详见 **[📊 量化精度分析指南](./ACCURACY_ANALYSIS.md)**。
 

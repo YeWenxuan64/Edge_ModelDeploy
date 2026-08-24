@@ -22,19 +22,20 @@
 
 ## 📖 概述
 
-本项目提供一套**可复用的模型转换工具链**，覆盖从训练框架（PyTroch, TensorFlow）的cv模型统一转换为 ONNX，再量化部署到边缘端 NPU（Rockchip RKNN / Qualcomm QNN）
+本项目提供一套**可复用的模型转换工具链**与**精度分析工具**，覆盖从训练框架（PyTroch, TensorFlow）的cv模型统一转换为 ONNX，再量化部署到边缘端 NPU（Rockchip RKNN / Qualcomm QNN）
 > 同时本项目也是本小姐🍃的项目[Focus-Finder](https://github.com/YeWenxuan64/Focus-Finder)的模型部署部分喵~
 
 
 | 转换阶段 | 工具 | 说明 |
 |---------|------|------|
-| **PyTorch/TensorFlow → ONNX** | 各子模块独立脚本 | 处理算子兼容、动态图固化、模型优化 |
-| **ONNX → RKNN** | `utilities/onnx_to_rknn.py` | Rockchip NPU（RK3588 / RK3576），支持 INT8 量化、混合精度量化|
-| **ONNX → QNN** | `utilities/onnx_to_qnn.py` | Qualcomm NPU（HTP），支持 INT8/INT4 量化、混合精度量化 |
-| **ONNX → QDQ-ONNX（AIMET）** | `utilities/onnx_aimet_quant.py` | 独立 PTQ 量化器（Qualcomm AIMET），导出 QDQ ONNX + encodings，可作为 QNN 外置量化器 |
+| **PyTorch/TensorFlow -> ONNX** | 各子模块独立脚本 | 处理算子兼容、动态图固化、模型优化 |
+| **ONNX -> RKNN** | `utilities/onnx_to_rknn.py` | Rockchip NPU（RK3588 / RK3576），支持 INT8 量化、混合精度量化|
+| **ONNX -> QNN** | `utilities/onnx_to_qnn.py` | Qualcomm NPU（HTP），支持 INT8/INT4 量化、混合精度量化 |
+| **ONNX -> QDQ-ONNX（AIMET）** | `utilities/onnx_aimet_quant.py` | 独立 PTQ 量化器（Qualcomm AIMET），导出 QDQ ONNX + encodings，可作为 QNN 外置量化器 |
 | **数据集生成** | `utilities/dataset_preprocess.py` | 基于 YOLO 检测自动裁剪量化校准数据集 |
+| **量化精度分析** | `utilities/accuracy_debugger.py` | 逐层对比浮点/量化模型中间张量，定位精度损失层；含统计图表与 **Netron 风格可视化计算图**（RKNN / QNN 共用） |
 
-> **工具链是核心资产** — 每个子模块（AVTrack、NanoTrackV3、RetinaFace 等）都复用同一套 `utilities/` 转换工具，只需编写模型特有的 PyTorch → ONNX 导出脚本即可。
+> **工具链是核心资产** — 每个子模块（AVTrack、NanoTrackV3、RetinaFace 等）都复用同一套 `utilities/` 转换工具，只需编写模型特有的 PyTorch -> ONNX 导出脚本即可。
 
 
 ## 🏗️ 项目结构
@@ -42,10 +43,11 @@
 ```
 Edge_ModelDeploy/
 ├── utilities/                       # ⭐ 共享转换工具链（核心）
-│   ├── onnx_to_rknn.py              # ONNX → RKNN 转换（Rockchip）
-│   ├── onnx_to_qnn.py               # ONNX → QNN 转换（Qualcomm）
-│   ├── onnx_aimet_quant.py          # AIMET 2.x 后训练量化（PTQ）→ QDQ ONNX + encodings
+│   ├── onnx_to_rknn.py              # ONNX -> RKNN 转换（Rockchip）
+│   ├── onnx_to_qnn.py               # ONNX -> QNN 转换（Qualcomm）
+│   ├── onnx_aimet_quant.py          # AIMET 2.x 后训练量化（PTQ）-> QDQ ONNX + encodings
 │   ├── dataset_preprocess.py        # 量化数据集预处理（含 YOLO 检测自动裁剪）
+│   ├── accuracy_debugger.py         # 量化精度分析（逐层对比 + 可视化计算图，RKNN/QNN 共用）
 │   ├── utils.py                     # 通用工具函数
 │   └── qairt/                       # Qualcomm AI Runtime SDK # 需自行下载并放入
 ├── datasets/                        # 量化校准数据集
@@ -53,12 +55,12 @@ Edge_ModelDeploy/
 │   ├── datasets_face.txt            # 人脸数据集索引           # 可自行挑选和编写
 │   └── ...                          # 数据集图片文件夹         # 需自行下载和挑选
 ├── requirements.txt                 # Python 依赖
-├── avtrack_ModelDeploy/             # git submodule → AVTrack 跟踪模型
-├── retinaface_mobile_ModelDeploy/   # git submodule → RetinaFace 人脸检测
-├── nanotrack_v3_ModelDeploy/        # git submodule → NanoTrackV3 跟踪模型
-├── msi_net_ModelDeploy/             # git submodule → MSI-Net 图像融合
-├── yolo11_ModelDeploy/              # git submodule → YOLO11 检测
-└── yolo26_ModelDeploy/              # git submodule → YOLO26 检测
+├── avtrack_ModelDeploy/             # AVTrack 跟踪模型
+├── retinaface_mobile_ModelDeploy/   # RetinaFace 人脸检测
+├── nanotrack_v3_ModelDeploy/        # NanoTrackV3 跟踪模型
+├── msi_net_ModelDeploy/             # MSI-Net 图像融合
+├── yolo11_ModelDeploy/              # YOLO11 检测
+└── yolo26_ModelDeploy/              # YOLO26 检测
 ```
 
 ## 🧠 示例模型
@@ -83,9 +85,9 @@ Edge_ModelDeploy/
 | 工作流           | Windows   | Linux | Python 版本 |
 |-----------------|------------|------|-------------|
 | 训练框架 to ONNX | 支持       | 支持 | 3.10+ |
-| ONNX to RKNN    | 支持       | 支持 | 3.10 - 3.12 |
+| ONNX to RKNN    | 不支持     | 支持 | 3.10 - 3.12 |
 | ONNX to QNN     | 目前不支持 | 支持 | 3.10 |
-| ONNX to QDQ-ONNX（AIMET） | 目前不支持 | 支持 | 3.10 |
+| ONNX to QDQ-ONNX（AIMET） | 支持 | 支持 | 3.10 |
 
 
 ### 1. 克隆项目（含子模块）
@@ -147,7 +149,7 @@ pip install rknn-toolkit2 --no-deps
 > 转换模型所使用的SDK版本建议**低于等于**推理时所用的SDK版本
 
 ```
-Eedge_ModelDeploy/
+Edge_ModelDeploy/
 ├── utilities/
 │   ├── onnx_to_rknn.py
 │   ├── onnx_to_qnn.py
@@ -163,7 +165,19 @@ Eedge_ModelDeploy/
 ### 2.5 下载量化校准数据集
 
 量化转换需要校准数据集，用于量化过程中根据模型对于输入数据的反应来计算量化参数<br>
-如果项目中没有预置数据集，可以从以下官方来源下载：
+
+> ✅ **仓库已预置部分常用数据集**，位于 `datasets/` 下，可直接使用、**无需下载**：
+>
+> | 数据集文件夹 | 对应索引文件 | 适用场景 |
+> |------------|------------|---------|
+> | `datasets/COCO2017_subset/` | `datasets.txt` / `datasets_full.txt` / `datasets_short.txt` | 通用目标检测/跟踪 |
+> | `datasets/WIDER_val_subset/` | `datasets_face.txt` | 人脸检测 |
+> | `datasets/saliency/` | `datasets_saliency.txt` | 显著性检测 |
+> | `datasets/ILSVRC2012_img_val_samples/` | （无索引，可自建） | 通用分类 |
+>
+> ⚠️ **自训练模型请自行准备校准数据集** — 预置数据集面向通用场景，若你的模型是针对特定领域/场景训练的，校准数据应**贴近模型的实际应用场景**，否则量化精度可能不理想。
+
+如果项目中没有预置数据集（或需要扩充），可以从以下官方来源下载：
 
 | 数据集 | 用途 | 官方下载链接 |
 |--------|------|------------|
@@ -185,14 +199,14 @@ Eedge_ModelDeploy/
 git clone --recurse-submodules https://github.com/YeWenxuan64/yolo26_ModelDeploy.git
 cd yolo26_ModelDeploy
 
-# 1.PyTorch → ONNX（各模型独立实现）
+# 1.PyTorch -> ONNX（各模型独立实现）
 python Yolo26_pytorch2onnx.py
 
-# 2.1.ONNX → RKNN（复用 utilities）
+# 2.1.ONNX -> RKNN（复用 utilities）
 python yolo26_onnx2rknn.py
 # 输出到: yolo26_ModelDeploy/models_convert/rknn
 
-# 2.2.ONNX → QNN（复用 utilities）
+# 2.2.ONNX -> QNN（复用 utilities）
 python yolo26_onnx2qnn.py
 # 输出到: yolo26_ModelDeploy/models_convert/qnn
 ```
@@ -200,67 +214,62 @@ python yolo26_onnx2qnn.py
 
 ## 📚 工具链使用指南
 
-[工具链使用指南](./docs/README_TOOLUSE.md)
-[量化精度分析指南](./docs/ACCURACY_ANALYSIS_TOOLUSE.md)
+[工具链使用指南](./docs/TOOLUSE.md)
+[量化精度分析指南](./docs/ACCURACY_ANALYSIS.md)
 
 ### 模型转换工作流
 
 ```
-                                    ┌─────────────────────────────────┐
-                                    │      PyTorch / TensorFlow       │
-                                    │    (Training Framework Model)   │
-                                    └───────────────┬─────────────────┘
-                                                    │  Per-submodule scripts
-                                                    ▼
-                                    ┌─────────────────────────────────┐
-                                    │             ONNX                │
-                                    │   (Intermediate Representation) │
-                                    └───────────────┬─────────────────┘
-                                                    │
-                            ┌───────────────────────┼─────────────────────┐
-                            │                       │                     │
-                            ▼                       ▼                     ▼
-┌────────────────────────────────┐ ┌────────────────────────────────┐ ┌────────────────────────────────┐
-│           OnnxToRKNN           │ │           OnnxToQNN            │ │        AimetOnnxQuantizer      │
+                                   ┌────────────────────────────────┐
+                                   │      PyTorch / TensorFlow      │
+                                   │   (Training Framework Model)   │
+                                   └───────────────┬────────────────┘
+                                                   │  Per-submodule scripts
+                                   ┌───────────────▼────────────────┐
+                                   │             ONNX               │
+                                   │ (Intermediate Representation)  │
+                                   └───────────────┬────────────────┘
+                                                   │
+                ┌──────────────────────────────────┼──────────────────────────────────┐
+                │                                  │                                  │
+┌───────────────▼────────────────┐ ┌───────────────▼────────────────┐ ┌───────────────▼────────────────┐
+│           OnnxToRKNN           │ │           OnnxToQNN            │ │       AimetOnnxQuantizer       │
 │  (utilities/onnx_to_rknn.py)   │ │  (utilities/onnx_to_qnn.py)    │ │ (utilities/onnx_aimet_quant.py)│
-│                                │ │                                │ │                                │
 ├────────────────────────────────┤ ├────────────────────────────────┤ ├────────────────────────────────┤
-│                                │ │                                │ │                                │
 │ 1. rknn.config()               │ │ 1. run_env_script()            │ │ 1. QuantizationSimModel        │
 │    Config quant algorithm      │ │    Source QAIRT SDK env vars   │ │    param/act qtype + scheme    │
 │                                │ │                                │ │                                │
 │ 2. rknn.load_onnx()            │ │ 2. modify_onnx_model()         │ │ 2. set_tensor_precision()      │
-│    Load ONNX model             │ │    Add normalization nodes     │ │    (optional) mixed precision  │
-│                                │ │    (Conv)                      │ │                                │
-│ 3. rknn.build()                │ │    Reorder nodes by I/O        │ │ 3. compute_encodings()         │
-│    ├─ With dataset ─► INT8     │ │    ONNX validate + Shape infer │ │    Dataset calibration         │
-│    ├─ No dataset  ─► FP16      │ │                                │ │                                │
-│    └─ Hybrid quant ─► step1+2  │ │ 3. get_onnx_model_info()       │ │ 4. to_onnx_qdq()               │
-│                                │ │    Parse input/output dims     │ │    QDQ ONNX + encodings JSON   │
-│ 4. rknn.export_rknn()          │ │                                │ │                                │
-│    Export .rknn model file     │ │ 3.5 do_hybrid_quantization()   │ │ 5. export_qairt_overrides()    │
-│                                │ │     Hybrid overrides JSON      │ │    ─► QAIRT overrides JSON     │
-│ 5. rknn.release()              │ │     16-bit / FP16 subgraph     │ │                                │
-│    Release resources           │ │                                │ │                                │
-│                                │ │ 4. convert_onnx_model()        │ │                                │
-│ 6. clean()                     │ │    qairt-converter             │ │                                │
-│    Clean temp files            │ │    ONNX ─► DLC (unquantized)   │ │                                │
-│                                │ │                                │ │                                │
+│    Load ONNX model             │ │    Add normalization Conv node │ │    (optional) mixed precision  │
+│                                │ │    Reorder nodes by I/O        │ │                                │
+│ 3. rknn.build()                │ │                                │ │ 3. compute_encodings()         │
+│    ├─ With dataset -> INT8     │ │ 3. get_onnx_model_info()       │ │    Dataset calibration         │
+│    ├─ No dataset  -> FP16      │ │                                │ │                                │
+│    └─ Hybrid quant -> step1+2  │ │    Parse input/output dims     │ │ 4. to_onnx_qdq()               │
+│                                │ │                                │ │    QDQ ONNX + encodings JSON   │
+│ 4. rknn.export_rknn()          │ │ 3.5 do_hybrid_quantization()   │ │        │             │         │
+│    Export .rknn model file     │ │     Hybrid overrides JSON      │ │        │             │         │
+│                                │ │     16-bit / FP16 subgraph     │ │        │             │         │
+│ 5. rknn.release()              │ │                                │ │        │             │         │
+│    Release resources           │ │ 4. convert_onnx_model() <──────┼─┼────────┴─────────────┘         │
+│                                │ │    qairt-converter             │ │                                │
+│ 6. clean()                     │ │    ONNX -> DLC                 │ │                                │
+│    Clean temp files            │ │                                │ │                                │
 │                                │ │ 5. generate_calibration_data() │ │                                │
-└───────────────┬────────────────┘ │    Read imgs → Preprocess →    │ └───────────────┬────────────────┘
-                │                  │    .raw files                  │                 │              
+└───────────────┬────────────────┘ │    Read imgs -> Preprocess     │ └───────────────┬────────────────┘
+                │                  │    -> .raw files               │                 │              
                 ▼                  │                                │                 ▼ 
 ┌────────────────────────────────┐ │ 6. quantize_model()            │ ┌─────────────────────────────────┐
 │         .rknn Model            │ │    qairt-quantizer             │ │      QDQ ONNX + encodings       │
-│     Rockchip NPU Executable    │ │    DLC ─► Quantized DLC        │ │   AIMET Quantized (→ QNN/RKNN)  │
-│   (RK3588 / RK3576 / RK3566)   │ │                                │ │   / ONNX Deploy / QNN external  │
+│     Rockchip NPU Executable    │ │    DLC -> Quantized DLC        │ │         AIMET Quantized         │
+│   (RK3588 / RK3576 / RK3566)   │ │                                │ │  -> ONNX Deploy / QNN external  │
 └────────────────────────────────┘ │ 7. write_config_file()         │ └─────────────────────────────────┘
                                    │    Generate HTP backend config │
                                    │    JSON                        │
                                    │                                │
                                    │ 8. generate_context_binary()   │
                                    │    qnn-context-binary-generator│
-                                   │    Quantized DLC ─► .bin (HTP) │
+                                   │    Quantized DLC -> .bin (HTP) │
                                    │                                │
                                    │ 9. clean()                     │
                                    │    Clean temp files            │
@@ -282,8 +291,8 @@ python yolo26_onnx2qnn.py
 
 | 目标平台        | AI处理器    | 芯片     | 转换工具 | 量化格式 |
 |----------------|-------------|---------|---------|---------|
-| Rockchip       | NPU         | RK3588 RK3576 RK3566 | `onnx_to_rknn.py` | INT8 / FP16 / 混合量化 |
-| Qualcomm (HTP) | Hexagon DSP | QCS6490 QCS8550 QCS9075 | `onnx_to_qnn.py` | INT8 / INT4 / FP16 / 混合量化 |
+| Rockchip       | NPU         | RK3588 RK3576 RK3566 ... | `onnx_to_rknn.py` | INT8 / FP16 / 混合量化 |
+| Qualcomm (HTP) | Hexagon DSP | QCS6490 QCS8550 QCS9075 ... | `onnx_to_qnn.py` | INT8 / INT4 / FP16 / 混合量化 |
 
 > 提issues时请附上想要硬件信息，小女子可以适配喵~ 🐾
 
@@ -292,7 +301,7 @@ python yolo26_onnx2qnn.py
 
 > TODO — 小女子笨笨的，未来慢慢填坑喵~ 🐾
 
-- [ ] **更多模型类型** — 目前仅支持 **计算机视觉（CV）** 类的模型部署，NLP / 语音等领域的模型暂不支持
+- [ ] **更多模型类型** — 目前仅支持 **计算机视觉（CV）** 类的模型部署，NLP / VLA / 语音等领域的模型暂不支持
 
 - [ ] **动态尺寸** — 仅支持**固定输入、输出尺寸**的模型，动态 shape 的模型需要手动固定后再走转换流程
 

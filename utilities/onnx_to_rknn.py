@@ -54,7 +54,7 @@ class OnnxToRKNN:
         self.quantized_algorithm = 'normal'
         self.compress_weight = False
         self.model_pruning = False
-        self.flash_attantion = False
+        self.flash_attention = False
 
         # self.do_hybrid_quantization()
         self.custom_hybrid = None
@@ -64,7 +64,7 @@ class OnnxToRKNN:
 
         self.file_or_dir_to_clean = ["check0_base_optimize.onnx", "check1_fold_constant.onnx", "check2_correct_ops.onnx", "check3_fuse_ops.onnx"]
 
-    def extra_optimize(self, quantized_algorithm:str='normal', compress_weight:bool=False, model_pruning:bool=False, flash_attantion:bool=False):
+    def extra_optimize(self, quantized_algorithm:str='normal', compress_weight:bool=False, model_pruning:bool=False, flash_attention:bool=False):
         """
         Args:
             quantized_algorithm (str): The quantization algorithm to use. 
@@ -77,7 +77,7 @@ class OnnxToRKNN:
             model_pruning (bool): Whether to apply model pruning to remove less important parameters. 
                 - Default is False.
 
-            flash_attantion (bool): Whether to use flash attention mechanism for faster attention computation. 
+            flash_attention (bool): Whether to use flash attention mechanism for faster attention computation. 
                 - Default is False.
         """
 
@@ -87,9 +87,9 @@ class OnnxToRKNN:
         self.quantized_algorithm = quantized_algorithm
         self.compress_weight = compress_weight
         self.model_pruning = model_pruning
-        self.flash_attantion = flash_attantion
+        self.flash_attention = flash_attention
 
-        print(f"[OnnxToRKNN] extra_optimize: quantized_algorithm={self.quantized_algorithm}, compress_weight={self.compress_weight}, model_pruning={self.model_pruning}, flash_attantion={self.flash_attantion}")
+        print(f"[OnnxToRKNN] extra_optimize: quantized_algorithm={self.quantized_algorithm}, compress_weight={self.compress_weight}, model_pruning={self.model_pruning}, flash_attention={self.flash_attention}")
 
     def do_hybrid_quantization(self, custom_hybrid:list[list[str]]|None=None):
         """
@@ -161,11 +161,12 @@ class OnnxToRKNN:
         if self.accuracy_analysis_picture_list is not None:
             debugger = RknnAccuracyDebugger(self.tmp_dir, self.tmp_model_path)
             debugger.plot_accuracy_analysis()
-            # 带路径追踪的精度分析（Netron 风格网络图）
-            debugger.plot_network_analysis(show=True)
+            debugger.plot_network_analysis(show=True) # 带路径追踪的精度分析（Netron 风格网络图）
 
     def clean(self):
         clean_files_or_dirs([str(self.tmp_dir / name) for name in self.file_or_dir_to_clean])
+        if debugger is not None:
+            debugger.clean()
 
 
     def self_convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
@@ -174,7 +175,7 @@ class OnnxToRKNN:
         # Pre-process config
         print('--> Config model')
         rknn.config(mean_values=mean_rgb, std_values=std_rgb, quantized_algorithm=self.quantized_algorithm, target_platform=self.target_platform, 
-                    compress_weight=self.compress_weight, model_pruning=self.model_pruning, enable_flash_attention=self.flash_attantion)
+                    compress_weight=self.compress_weight, model_pruning=self.model_pruning, enable_flash_attention=self.flash_attention)
         print('done')
 
         # Load model

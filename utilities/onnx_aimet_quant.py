@@ -265,7 +265,7 @@ class AimetOnnxQuantizer:
             quantized_model_path: QDQ ONNX 输出路径；None 时默认
                 {model_path 同目录}/<stem>_qdq.onnx。
             dataset_path: 校准图片列表 txt（每行一个样本，多输入空格分隔）；
-                None（默认）时改用自定义校准集（use_custom_alibration_data）。
+                None（默认）时改用自定义校准集（use_custom_calibration_data）。
             config_file: AIMET quantsim_config 路径或别名（'default'/'htp_v73'...）；
                 None 时用 'default'。
             fold_batch_norms: 量化前是否先做 BatchNorm 折叠。默认 True。
@@ -282,7 +282,7 @@ class AimetOnnxQuantizer:
         else:
             self.quantized_model_path = self.work_dir / f"{self.model_path.stem}_qdq.onnx"
 
-        # dataset_path 可为 None：此时默认走自定义校准集（use_custom_alibration_data）
+        # dataset_path 可为 None：此时默认走自定义校准集（use_custom_calibration_data）
         self.dataset_path = Path(dataset_path).resolve() if dataset_path is not None else None
 
         # 位宽 / 偏置位宽由 set_quantization_method 设置（默认 w8a8）
@@ -304,8 +304,8 @@ class AimetOnnxQuantizer:
         self.hybrid_act_bitwidth = 16
         self.hybrid_float_bitwidth: int | None = None
 
-        # 自定义校准数据（.raw/.npy 张量数据集 txt；use_custom_alibration_data 设置）
-        self.custom_alibration_data_path: Path | None = None
+        # 自定义校准数据（.raw/.npy 张量数据集 txt；use_custom_calibration_data 设置）
+        self.custom_calibration_data_path: Path | None = None
         self.custom_data_tensor_order = "nhwc"
 
         # 模型输入/输出信息（get_onnx_model_info 结果；convert() 开始即加载，
@@ -370,21 +370,21 @@ class AimetOnnxQuantizer:
         else:
             self.accuracy_analysis_picture_list = None
 
-    def use_custom_alibration_data(self, custom_alibration_data_path:str|None=None, dataset_tensor_order:str="nhwc"):
+    def use_custom_calibration_data(self, custom_calibration_data_path:str|None=None, dataset_tensor_order:str="nhwc"):
         """改用自定义张量校准数据（.raw / .npy，非图片），与 OnnxToQNN 行为一致。
 
         Args:
-            custom_alibration_data_path: 校准数据 txt（每行一个样本，多输入文件路径
+            custom_calibration_data_path: 校准数据 txt（每行一个样本，多输入文件路径
                 空格分隔；相对路径基于 txt 目录）。每个文件为模型单个输入的张量：
                 .raw —— float32 裸二进制（无 shape 头，按模型输入 shape 解释）；
                 .npy —— numpy 数组文件（自带 shape）。数据需按模型输入 shape 预处理。
                 None 恢复为图片数据集（dataset_path）。
             dataset_tensor_order: 自定义数据的张量布局 'nhwc'/'nchw'。默认 'nhwc'。
         """
-        if custom_alibration_data_path is None:
-            self.custom_alibration_data_path = None
+        if custom_calibration_data_path is None:
+            self.custom_calibration_data_path = None
         else:
-            self.custom_alibration_data_path = Path(custom_alibration_data_path).resolve()
+            self.custom_calibration_data_path = Path(custom_calibration_data_path).resolve()
         self.custom_data_tensor_order = dataset_tensor_order
 
     def do_hybrid_quantization(self, custom_hybrid:list[list[str]], bitwidth:str="w8a16", float_bitwidth:int|None=None):
@@ -460,9 +460,9 @@ class AimetOnnxQuantizer:
             calibration_std = std_rgb
 
         # 4. prepare calibration dataset（自定义 .raw/.npy 张量，或图片数据集）
-        if self.custom_alibration_data_path is not None:
+        if self.custom_calibration_data_path is not None:
             calib_iterator = custom_dataset_to_iterator(
-                str(self.custom_alibration_data_path), input_names, input_shapes,
+                str(self.custom_calibration_data_path), input_names, input_shapes,
                 dataset_tensor_order=self.custom_data_tensor_order)
         elif self.dataset_path is not None:
             calib_iterator = image_calibration_inputs(
@@ -471,7 +471,7 @@ class AimetOnnxQuantizer:
         else:
             raise ValueError(
                 "No calibration data provided: set dataset_path or call "
-                "use_custom_alibration_data(...) before convert().")
+                "use_custom_calibration_data(...) before convert().")
 
         # 5. AIMET 2.x 量化（使用 normalize_model 处理后的模型）
         self.quantize(model=model, calibration_data=calib_iterator)
@@ -494,7 +494,7 @@ class AimetOnnxQuantizer:
                 for line in self.accuracy_analysis_picture_list:
                     f.write(line + '\n')
             # 与校准输入一致：自定义数据用张量迭代器，图片数据用图片迭代器
-            if self.custom_alibration_data_path is not None:
+            if self.custom_calibration_data_path is not None:
                 acc_inputs = custom_dataset_to_iterator(
                     str(acc_txt), input_names, input_shapes,
                     dataset_tensor_order=self.custom_data_tensor_order)
@@ -886,69 +886,6 @@ class AimetOnnxQuantizer:
         else:
             print("[AIMET] encodings export skipped (export_encodings=False)")
         return str(qdq_path), str(enc_path)
-
-    def export_qairt_overrides(
-        self,
-        encoding_1_0_path: str | None = None,
-        output_path: str | None = None,
-    ) -> str:
-        """把 AIMET 1.0.0 encodings 转为 QAIRT quantization_overrides JSON。
-
-        转换规则：activation 默认非对称、param 默认对称；per-channel 权重按
-        name 分组为多个编码条目；scale/offset/min/max 原样透传。
-
-        Args:
-            encoding_1_0_path: AIMET 1.0.0 encodings 路径；None 时从当前 sim 导出
-                （需先调用 quantize()）。
-            output_path: 输出 JSON 路径；默认 {encoding 同目录}/qairt_quantization_overrides.json。
-
-        Returns:
-            str: QAIRT overrides JSON 路径。
-        """
-        if encoding_1_0_path is None:
-            if self.sim is None:
-                raise RuntimeError("Call quantize() first, or pass encoding_1_0_path")
-            encoding_1_0_path = str(self.work_dir / 'encodings_1_0_0.encodings')
-            self.sim.export(str(self.work_dir), 'encodings_1_0_0',
-                            export_model=False, encoding_version='1.0.0')
-
-        with open(encoding_1_0_path) as f:
-            data = json.load(f)
-
-        def to_override_item(e: dict, default_sym: str) -> dict:
-            item = {
-                'bitwidth': e.get('bw', e.get('bitwidth')),
-                'is_symmetric': str(e.get('is_sym', e.get('is_symmetric', default_sym))),
-            }
-            scale = e.get('scale')
-            offset = e.get('offset')
-            if scale is not None:
-                item['scale'] = scale[0] if isinstance(scale, list) else scale
-            if offset is not None:
-                item['offset'] = offset[0] if isinstance(offset, list) else offset
-            if 'min' in e and e['min'] is not None:
-                item['min'] = e['min']
-                item['max'] = e['max']
-            return item
-
-        overrides = {
-            'activation_encodings': {
-                e['name']: [to_override_item(e, 'False')]
-                for e in data.get('activation_encodings', [])
-            },
-            'param_encodings': {},
-        }
-        # param 按 name 分组（per-channel 同名字典多个编码条目）
-        for e in data.get('param_encodings', []):
-            overrides['param_encodings'].setdefault(e['name'], []).append(
-                to_override_item(e, 'True'))
-
-        if output_path is None:
-            output_path = str(Path(encoding_1_0_path).with_name('qairt_quantization_overrides.json'))
-        with open(output_path, 'w') as f:
-            json.dump(overrides, f, indent=4)
-        print(f"[AIMET] QAIRT quantization overrides written to {output_path}")
-        return output_path
 
     # ------------------------------------------------------------------
     # 验证

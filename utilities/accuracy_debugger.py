@@ -30,15 +30,17 @@ class RknnAccuracyDebugger:
         snapshot_dir (Path): RKNN 精度分析快照目录（snapshot/）。
     """
 
-    def __init__(
-        self,
-        tmp_dir: str | Path,
-        tmp_model_path: str | Path,
-        snapshot_dir: str | Path | None = None,
-    ):
+    def __init__(self, tmp_dir:str, tmp_model_path:str, snapshot_dir:str|None=None):
         self.tmp_dir = Path(tmp_dir).resolve()
         self.tmp_model_path = Path(tmp_model_path).resolve()
-        self.snapshot_dir = Path(snapshot_dir).resolve() if snapshot_dir is not None else self.tmp_dir / 'snapshot'
+
+        if snapshot_dir is not None:
+            self.snapshot_dir = Path(snapshot_dir).resolve()
+        else:
+            self.snapshot_dir = self.tmp_dir / 'snapshot'
+
+        self.file_or_dir_to_clean:list[str] = []
+        self.file_or_dir_to_clean.append(self.snapshot_dir)
 
     def read_error_analysis(self) -> list[dict]:
         """
@@ -176,6 +178,7 @@ class RknnAccuracyDebugger:
 
         plt.tight_layout()
         save_path = self.tmp_dir / 'rknn_accuracy_analysis_summary.png'
+        self.file_or_dir_to_clean.append(save_path)
 
         plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
         print(f"Figure saved to: {save_path}")
@@ -467,7 +470,7 @@ class RknnAccuracyDebugger:
         }
         return result
 
-    def plot_network_analysis(self, show: bool = True) -> dict:
+    def plot_network_analysis(self, show:bool=True):
         """
         带路径追踪的精度分析（Netron 风格网络图）。
 
@@ -494,17 +497,21 @@ class RknnAccuracyDebugger:
         data['rows'] = data['rows'] + output_rows
         data['outputs'] = output_layers
 
-        output_path = self.tmp_dir / 'rknn_network_analysis.html'
+        output_path = self.tmp_dir / 'rknn_graph_accuracy_analysis.html'
+        self.file_or_dir_to_clean.append(output_path)
 
         viz = AccuracyGraph(
             data=data,
             children=children,
             parents=parents,
             output_path=output_path,
-            title='RKNN Accuracy Analysis (input -> output)',
+            title='RKNN Graph Accuracy Analysis',
         )
         viz.render(show=show)
-        return data
+        return
+
+    def clean(self):
+        clean_files_or_dirs(self.file_or_dir_to_clean)
 
 
 class SnpeAccuracyDebugger:
@@ -695,7 +702,9 @@ class SnpeAccuracyDebugger:
         # 调整布局、保存并显示
         plt.tight_layout()
         if save_path is not None:
-            save_path = Path(save_path)
+            save_path = Path(save_path).resolve()
+            self.file_or_dir_to_clean.append(save_path)
+
             plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
             print(f"Figure saved to: {save_path}")
         plt.show()
@@ -775,7 +784,7 @@ class SnpeAccuracyDebugger:
             cossim=cossim,
             names=names,
             mse_vals=mses,
-            save_path=self.tmp_dir / 'accuracy_analysis_summary.png',
+            save_path=self.tmp_dir / 'qnn_accuracy_analysis_summary.png',
         )
 
 
@@ -1051,6 +1060,7 @@ class SnpeAccuracyDebugger:
                 cossim=cos_sim_vals,
                 names=plot_names,
                 mse_vals=mse_vals,
+                save_path=self.tmp_dir / 'qnn_accuracy_analysis_summary.png',
                 title_suffix=f' (ordered by ONNX graph, {n} valid / {len(lost_pairs)} lost)',
             )
 
@@ -1524,13 +1534,15 @@ class SnpeAccuracyDebugger:
             'paths': {},
         }
 
-        output_path = self.tmp_dir / 'qnn_network_analysis.html'
+        output_path = self.tmp_dir / 'qnn_graph_accuracy_analysis.html'
+        self.file_or_dir_to_clean.append(output_path)
+
         viz = AccuracyGraph(
             data=data,
             children=aug_children,
             parents=aug_parents,
             output_path=output_path,
-            title='QNN Accuracy Analysis (ONNX Graph Structure)',
+            title='QNN Graph Accuracy Analysis',
         )
         viz.render(show=show)
         return data
@@ -1598,18 +1610,15 @@ class AccuracyGraph:
         parents: dict[str, list[str]],
         output_path: str | Path,
         title: str = 'Accuracy Analysis',
-        node_sep: float = 50.0,
-        edge_sep: float = 20.0,
-        rank_sep: float = 50.0,
     ):
         self.data = data
         self.children = children
         self.parents = parents
         self.output_path = Path(output_path)
         self.title = title
-        self.node_sep = node_sep # 横向：真实节点之间的间距
-        self.edge_sep = edge_sep # 横向：长边虚拟节点占用的间距
-        self.rank_sep = rank_sep # 纵向：层与层之间的间距
+        self.node_sep = 50.0 # 横向：真实节点之间的间距
+        self.edge_sep = 20.0 # 横向：长边虚拟节点占用的间距
+        self.rank_sep = 50.0 # 纵向：层与层之间的间距
         self.pan_speed:float = 15
 
         self.rows = data.get('rows', [])
