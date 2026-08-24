@@ -16,7 +16,7 @@
 [![AIMET](https://img.shields.io/badge/Qualcomm-AIMET-2853DC?logo=qualcomm)](https://github.com/quic/aimet)
 [![License](https://img.shields.io/badge/License-MIT-brightgreen)](LICENSE)
 
-⚠️Pre-release Warning⚠️
+⚠️Pre-Release Warning⚠️
 
 </div>
 
@@ -69,14 +69,10 @@ Edge_ModelDeploy/
 
 | 子模块 | 模型类型 | 来源 |
 |--------|---------|------------|
-| [avtrack_ModelDeploy](https://github.com/YeWenxuan64/avtrack_ModelDeploy/)                     | 视觉目标跟踪 | ICML 2024 — *Learning Adaptive and View-Invariant Vision Transformer for Real-Time UAV Tracking* |
-| [retinaface_mobile_ModelDeploy](https://github.com/YeWenxuan64/retinaface_mobile_ModelDeploy/) | 人脸检测     | RetinaFace 轻量化版本 |
-| [nanotrack_v3_ModelDeploy](https://github.com/YeWenxuan64/nanotrack_v3_ModelDeploy/)           | 视觉目标跟踪 | NanoTrack 系列 |
-| [msi_net_ModelDeploy](https://github.com/YeWenxuan64/msi_net_ModelDeploy/)                     | 显著性检测   | MSI-Net<br>Neural Networks — *Contextual encoder-decoder network for visual saliency prediction* |
-| [yolo11_ModelDeploy](https://github.com/YeWenxuan64/yolo11_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO11(RKNN custom-made) |
 | [yolo26_ModelDeploy](https://github.com/YeWenxuan64/yolo26_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO26 |
 
-每个子模块独立维护，包含该模型的预训练权重获取方式与完整转换流程
+每个模块独立维护，包含该模型的预训练权重获取方式与完整转换流程
+> 目前 (Pre-Release) 仅开源 `yolo26_ModelDeploy` 作为示例
 
 
 ## 📦 工具链部署

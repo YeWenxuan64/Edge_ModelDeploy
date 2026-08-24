@@ -242,7 +242,7 @@ QNN 精度分析自动执行以下三步（**Step 1 与 Step 2 并行执行**，
 
 > ⚠️ **关于 "lost" 层：** QNN 通过文件名相似度匹配 Golden 与 Quantized 的逐层输出，**无法匹配（名称相似度 < 0.8 或张量尺寸不一致）的层会被标记为 "lost" 并排除在统计之外**，绘图时会在终端打印 `LOST PAIRS` 清单。这类层通常是图优化中被融合/消除的节点，一般可忽略；若数量异常多则需检查模型转换是否异常。
 
-![qnn_accuracy_analysis_summary.png](./QNN_accuracy_analysis_summary.png)
+![qnn_accuracy_analysis_summary.png](./qnn_accuracy_analysis_summary.png)
 
 ### 2.5 计算图精度可视化
 
