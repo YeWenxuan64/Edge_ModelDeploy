@@ -22,7 +22,7 @@
 
 ## 📖 概述
 
-本项目提供一套**可复用的模型转换工具链**与**精度分析工具**，覆盖从训练框架（PyTroch, TensorFlow）的cv模型统一转换为 ONNX，再量化部署到边缘端 NPU（Rockchip RKNN / Qualcomm QNN）
+本项目提供一套**可复用的模型转换工具链**与**精度分析工具**，覆盖从训练框架（PyTorch, TensorFlow）的cv模型统一转换为 ONNX，再量化部署到边缘端 NPU（Rockchip RKNN / Qualcomm QNN）
 > 同时本项目也是本小姐🍃的项目[Focus-Finder](https://github.com/YeWenxuan64/Focus-Finder)的模型部署部分喵~
 
 
@@ -54,7 +54,10 @@ Edge_ModelDeploy/
 │   ├── datasets.txt                 # 通用数据集索引           # 可自行挑选和编写
 │   ├── datasets_face.txt            # 人脸数据集索引           # 可自行挑选和编写
 │   └── ...                          # 数据集图片文件夹         # 需自行下载和挑选
-├── requirements.txt                 # Python 依赖
+├── requirements_base.txt            # 基础依赖（numpy, opencv-python 等）
+├── requirements_torch_cpu.txt       # PyTorch CPU 版
+├── requirements_tensorflow.txt      # TensorFlow
+├── requirements_overwrite.txt       # 包版本覆盖（须最后安装）
 ├── avtrack_ModelDeploy/             # AVTrack 跟踪模型
 ├── retinaface_mobile_ModelDeploy/   # RetinaFace 人脸检测
 ├── nanotrack_v3_ModelDeploy/        # NanoTrackV3 跟踪模型

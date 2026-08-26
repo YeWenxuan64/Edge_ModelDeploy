@@ -59,6 +59,29 @@ class ProcessDatasetByModel:
 
 
     def process(self, rgb_mean:list[list[int]]=[[0, 0, 0]], rgb_std:list[list[int]]=[[1, 1, 1]], output_order:str='chw', output_format:str='.npy', output_list:bool=False) -> str|list[list[str]]:
+        """
+        用指定 ONNX 模型对数据集做批量推理，把每个样本的输出（或输入）Tensor 保存为
+        .npy / .raw 文件，并生成新的数据集索引。
+
+        三层循环结构：
+          - i 循环：遍历数据集中的每个样本（dataset_path_pair = 该样本各输入对应的图片路径）。
+          - j 循环：遍历模型的每个输入，读取图片 -> letterbox -> 归一化，构造输入张量。
+          - k 循环：遍历模型的每个输出，做布局转换后保存，并记录输出文件路径。
+
+        特殊模式：
+          - 环形回路（set_ring_loop）：把某个输出回灌为下一次迭代的输入（自回归/逐帧跟踪）。
+          - 输入替换输出（set_replace_out_dataset_by_input）：把输入张量本身作为输出保存。
+
+        Args:
+            rgb_mean (list[list[int]]): 每个输入的 RGB 均值（归一化公式 (x-mean)/std），多输入传多个列表。
+            rgb_std (list[list[int]]): 每个输入的 RGB 标准差。
+            output_order (str): 输出张量布局，'chw' / 'hwc' / 'nchw' / 'nhwc'。
+            output_format (str): 输出文件格式，'.npy' 或 '.raw'。
+            output_list (bool): True 返回 list[list[str]]；False 返回索引 txt 文件路径。
+
+        Returns:
+            str | list[list[str]]: 索引 txt 路径，或各样本输出文件路径的列表的列表。
+        """
         if output_order not in ['chw', 'hwc', 'nchw', 'nhwc']:
             raise ValueError("output_shape must be 'chw' or 'hwc' or 'nchw' or 'nhwc'")
 
@@ -74,32 +97,41 @@ class ProcessDatasetByModel:
         output_path_pairs_list:list[list[str]] = []
         write_buffer:list[tuple[np.ndarray, str]] = []
 
+        # i 循环：遍历每个样本。dataset_path_pair 是该样本各输入对应的图片路径列表
         for i, dataset_path_pair in enumerate(self.dataset_list_path):
             input_tensor_list:list[np.ndarray] = []
             output_path_pair_list:list[str] = []
+            # 记录每个输入 j 对应的图片名，供 k 循环命名使用（避免误用“最后一个输入”的残留值）
+            input_image_names:list[str] = []
+            # 图片读取失败时置为 True，跳出 j 循环并跳过整个样本
+            skip_sample = False
 
             if self.replace_out_dataset_by_input:
                 self.input_tensor_list_to_out:list[np.ndarray] = []
 
+            # j 循环：遍历模型每个输入，构造该样本的输入张量列表
             for j in range(len(input_shapes)):
+                # 普通图片输入（非环输入）：读取图片并归一化
                 if not self.loop_pair or self.loop_pair[0] != j:
                     image_path = dataset_path_pair[j]
                     input_size = input_shapes[j][2:4][::-1]
                     rgb_mean = np.array(rgb_mean[j]).reshape(1, 3, 1, 1)
                     rgb_std = np.array(rgb_std[j]).reshape(1, 3, 1, 1)
 
-                    # 读取图片
+                    # 读取图片（先判空再显示，避免 imshow(None) 崩溃）
                     image = cv2.imread(image_path)
-                    cv2.imshow("image", image)
-                    cv2.waitKey(1)
-
                     if image is None:
                         print(f"无法读取图片: {image_path}")
-                        continue
+                        skip_sample = True
+                        break
+
+                    cv2.imshow("image", image)
+                    cv2.waitKey(1)
 
                     img_float = letterbox_image(image, input_size, output_format="nchw", output_dtype='float32')
                     img_norm = (img_float - rgb_mean) / rgb_std
                     tensor_ori = img_float.copy()
+                    input_image_names.append(Path(image_path).stem)
 
                 else:
                     if not self.loop_inited:
@@ -108,6 +140,8 @@ class ProcessDatasetByModel:
 
                     img_norm = self.output_tensor_to_loop.copy()
                     tensor_ori = img_norm.copy()
+                    # 环输入没有对应图片，回退用已记录的第一个图片名（或按输入序号）
+                    input_image_names.append(input_image_names[0] if input_image_names else f"input{j}")
 
                 input_tensor_list.append(img_norm)
 
@@ -117,17 +151,27 @@ class ProcessDatasetByModel:
                     else:
                         self.input_tensor_list_to_out.append(img_norm.copy())
 
+            # 图片读取失败：跳过整个样本，避免输入张量数量与模型输入不匹配
+            if skip_sample:
+                continue
+
             output_tensor_list = onnx_executor.put(input_tensor_list, input_format="nchw")
 
 
             
+            # k 循环：遍历模型每个输出，布局转换 -> 保存 -> 记录路径
             for k, output_tensor in enumerate(output_tensor_list):
+                # 环形回路：若该输出被配置为回灌输入，则缓存供下一次迭代使用
                 if self.loop_pair and self.loop_pair[1] == k:
                     self.output_tensor_to_loop = output_tensor.copy()
 
                 if self.replace_out_dataset_by_input:
                     output_tensor = self.input_tensor_list_to_out[k]
-
+                    # 输出 k 由输入 k 替换而来，用输入 k 的图片名（越界时回退到最后一个）
+                    name_idx = k if k < len(input_image_names) else len(input_image_names) - 1
+                else:
+                    # 模型输出不与特定输入一一对应，用主输入（第一个）的图片名
+                    name_idx = 0
 
                 if output_order == 'chw':
                     output_tensor = output_tensor.squeeze(0)
@@ -138,7 +182,7 @@ class ProcessDatasetByModel:
                 elif output_order == 'nhwc':
                     output_tensor = output_tensor.transpose(0, 2, 3, 1)
 
-                image_name = Path(image_path).stem
+                image_name = input_image_names[name_idx] if input_image_names else f"sample{i}"
 
                 if self.replace_out_dataset_by_input:
                     output_path = str(self.output_dir / f"{image_name}_in{k}{output_format}")
@@ -228,10 +272,22 @@ def preprocess_image(image:np.ndarray, input_size:tuple[int, int], mean_rgb:list
     
     return normalized, r, left, top
 
-def process_predictions(output: np.ndarray) -> list[list[int, int, int, int, int, float]]:
-    """处理模型输出，返回置信度最高的3个检测结果"""
+def process_predictions(output: np.ndarray, input_size:tuple[int, int]) -> list[list[int, int, int, int, int, float]]:
+    """处理模型输出，返回置信度最高的3个检测结果
+
+    Args:
+        output (np.ndarray): 模型输出，形状 (1, N, 6)。
+        input_size (tuple[int, int]): 模型输入尺寸 (W, H)，用于中心/面积得分归一化，
+            替代原先硬编码的 320/640。
+    """
 
     conf_threshold:float=0.25
+
+    # 用模型实际输入尺寸 (W, H) 计算中心/面积得分，替代硬编码 320/640
+    input_w, input_h = int(input_size[0]), int(input_size[1])
+    half_w, half_h = input_w / 2.0, input_h / 2.0
+    max_distance = np.sqrt(half_w**2 + half_h**2)
+    max_area = float(input_w * input_h)
 
     # 输出形状为 (1, 300, 6)
     output = output.squeeze()  # 移除批次维度，形状变为 (300, 6)
@@ -268,13 +324,11 @@ def process_predictions(output: np.ndarray) -> list[list[int, int, int, int, int
 
         # 计算综合评分
         # 1. 中心距离得分（距离中心越近得分越高）
-        center_distance = np.sqrt((cx - 320)**2 + (cy - 320)**2)
-        max_distance = np.sqrt(320**2 + 320**2)
+        center_distance = np.sqrt((cx - half_w)**2 + (cy - half_h)**2)
         center_score = 1 - (center_distance / max_distance)
         
         # 2. 面积得分（面积越大得分越高）
         area = w * h
-        max_area = 640 * 640  # 假设最大可能面积
         area_score = area / max_area
         
         # 3. 综合得分（加权平均）
@@ -486,7 +540,7 @@ class GenYoloCroppedDataset:
             # 预处理
             input_tensor, scale, x_offset, y_offset = preprocess_image(image, input_size=input_sizes, std_rgb=[255, 255, 255])
             output = onnx_executor.put([input_tensor], input_format="nchw")[0] # 推理
-            results = process_predictions(output) # 处理预测结果
+            results = process_predictions(output, input_sizes) # 处理预测结果
 
             if results:
                 # 裁剪并保存

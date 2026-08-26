@@ -260,10 +260,9 @@ qdq_path, enc_path = quantizer.convert(
     export_encodings=False,          # True：encodings 输出到 QDQ 同目录；False：临时目录（clean() 删除）
 )
 # quantizer.clean()
-
-# 可选：把 AIMET 编码转成 QAIRT quantization_overrides JSON（供 qairt-quantizer 使用）
-# quantizer.export_qairt_overrides()
 ```
+
+> 若要把 AIMET 编码作为 QNN 的外置量化器（将编码写入 QNN DLC 的量化），请通过 `OnnxToQNN.set_use_aimet()` 启用（见下方「接入 QNN」），无需手动转换 QAIRT quantization_overrides。
 
 ### 关键参数
 
@@ -280,7 +279,7 @@ qdq_path, enc_path = quantizer.convert(
 
 ### 输出产物
 - **QDQ ONNX**（`{quantized_model_path}`）：带 Q/DQ 节点的量化图，可直接 ONNX 部署或转 RKNN / QNN
-- **encodings JSON**（v2.0.0）：量化编码；`export_qairt_overrides()` 可转为 QAIRT `quantization_overrides` JSON
+- **encodings JSON**（v2.0.0）：量化编码；可作为 QNN 的外置量化器使用（经 `OnnxToQNN.set_use_aimet()` 接入）
 
 > 数据集 txt 格式与 `OnnxToQNN` / `OnnxToRKNN` 完全一致：每行一个样本、多输入图片路径空格分隔、相对路径基于 txt 所在目录、letterbox 预处理。
 

@@ -7,19 +7,15 @@ import shutil
 from pathlib import Path
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
-import onnx  # 仅用于类型注解
 
-
-import os
-import re
-import random
-import heapq
-from pathlib import Path
-from collections import defaultdict, deque
 import numpy as np
 import cv2
 import onnx  # 仅用于类型注解
 import onnxruntime as ort
+
+
+
+
 
 
 # 一个上下文管理器以安全地更改目录
@@ -342,7 +338,7 @@ def read_dataset_txt_to_list(dataset_txt_path: str) -> list[list[str]]:
         for line in lines: # 如果行不为空，则分割路径
             line = line.strip() # 去除首尾空白字符
             if line:
-                one_line_paths_list = [path for path in line.split(' ') if path] # 按空格分割路径，并过滤掉空字符串
+                one_line_paths_list = [path for path in line.split() if path] # 按任意空白（空格/Tab/多空格）分割路径，并过滤掉空字符串
 
                 one_line_path_list = []
                 for img_path in one_line_paths_list:
@@ -969,9 +965,9 @@ class NumpySaver:
                     cv2.imwrite(output_path, data)
                     
             except Exception as e:
-                pass
+                print(f"[NumpySaver] Write error on {output_path}: {e}")
 
-        print(f"written {len(write_buffer)} {output_format} files.")
+        print(f"[NumpySaver] Written {len(write_buffer)} {output_format} files.")
 
     @classmethod
     def save_numpy_array(cls, data_and_path:list[tuple[np.ndarray, str]], output_format:str):

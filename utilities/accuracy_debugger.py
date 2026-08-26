@@ -519,13 +519,13 @@ class SnpeAccuracyDebugger:
         self.tmp_dir = Path(tmp_dir).resolve()
         self.onnx_path = Path(onnx_path).resolve()
 
-        self.debugger_picture_list:list[str] = []
+        self.debugger_picture_list:list[Path] = []
         for i in range(len(debugger_picture_list)):
             p = Path(debugger_picture_list[i]).resolve()
             if p.exists():
                 self.debugger_picture_list.append(p)
             else:
-                ValueError("Accuracy analysis data not found")
+                raise ValueError(f"Accuracy analysis data not found: {p}")
 
         self.command_runnr = run_subprocess
 
@@ -548,14 +548,14 @@ class SnpeAccuracyDebugger:
 
     @staticmethod
     def find_latest_subdir(base_dir: Path) -> Path:
-        """在 base_dir 下找到最新的子文件夹（按文件夹名排序）"""
+        """在 base_dir 下找到最新的子文件夹（按修改时间，最新者优先）"""
         base_dir = Path(base_dir)
         if not base_dir.exists():
             raise FileNotFoundError(f"base directory not found: {base_dir}")
 
         subdirs = sorted(
             [d for d in base_dir.iterdir() if d.is_dir()],
-            key=lambda d: d.name,
+            key=lambda d: d.stat().st_mtime,   # 按修改时间排序（替代原来的按目录名排序）
             reverse=True
         )
         if not subdirs:

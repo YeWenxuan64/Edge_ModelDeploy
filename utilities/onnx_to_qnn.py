@@ -53,7 +53,7 @@ class QnnHybridQuantGen:
             "act_bitwidth": act_bitwidth,
             "bias_bitwidth": bias_bitwidth,
         }
-        print(f"Hybrid quantization is set: {len(custom_hybrid)} subgraph(s) dtype={dtype} "
+        print(f"[QnnHybridQuantGen] Hybrid quantization is set: {len(custom_hybrid)} subgraph(s) dtype={dtype} "
               f"w{weights_bitwidth}a{act_bitwidth}b{bias_bitwidth}, rest quantized by global settings")
 
     def generate_hybrid_quantization_overrides(self, tmp_onnx_path:str) -> str|None:
@@ -68,7 +68,7 @@ class QnnHybridQuantGen:
         try:
             model = onnx.load_model(tmp_onnx_path)
         except Exception as e:
-            print(f"Error loading ONNX model for hybrid quantization: {e}")
+            print(f"[QnnHybridQuantGen] Error loading ONNX model for hybrid quantization: {e}")
             return None
 
         nodes = list(model.graph.node)
@@ -78,11 +78,11 @@ class QnnHybridQuantGen:
         try:
             middle = find_hybrid_subgraph_nodes(model, self.hybrid_quantization["custom_hybrid"])
         except ValueError as e:
-            print(f"Error: {e}")
+            print(f"[QnnHybridQuantGen] Error: {e}")
             return None
 
         if not middle:
-            print("Error: no nodes selected for hybrid quantization")
+            print("[QnnHybridQuantGen] Error: no nodes selected for hybrid quantization")
             return None
 
         hq = self.hybrid_quantization
@@ -121,7 +121,7 @@ class QnnHybridQuantGen:
         with open(str(overrides_path), 'w') as f:
             json.dump(overrides, f, indent=4)
 
-        print(f"Hybrid quantization overrides generated: {len(middle)} nodes, "
+        print(f"[QnnHybridQuantGen] Hybrid quantization overrides generated: {len(middle)} nodes, "
               f"{len(activation_encodings)} activation tensors, {len(param_encodings)} param tensors -> {overrides_path}")
         return str(overrides_path)
 
@@ -156,7 +156,7 @@ class QnnAimetConnector:
         self.config_file = (AimetQuantsimConfig.resolve_path(config_file)
                             if config_file is not None else None)
         if self.config_file is not None:
-            print(f"[AIMET] load quantsim_config: {self.config_file}")
+            print(f"[QnnAimetConnector] load quantsim_config: {self.config_file}")
 
     def get_quantization_method(self, quant_method:str, bitwidth:str, param_quant_schema:str='symmetric', act_quant_schema:str='asymmetric', use_cle_algorithm:bool=False):
         """设置 AIMET 量化方案、位宽与权重/激活对称性（convert() 前调用）。
@@ -182,7 +182,7 @@ class QnnAimetConnector:
         self.act_quant_schema = act_quant_schema
         self.use_cle_algorithm = use_cle_algorithm
 
-        print(f"Enabled AIMET 2.x quantization path (scheme={self.quant_method}, {bitwidth}")
+        print(f"[QnnAimetConnector] Enabled AIMET 2.x quantization path (scheme={self.quant_method}, {bitwidth}")
 
     def current_hybrid_config(self) -> tuple:
         """实时读取 converter.hybrid_quantizer 的混合量化配置（与调用顺序无关）。
@@ -283,9 +283,9 @@ class QnnAimetConnector:
             return_code = converter.accuracy_analyzer.accuracy_analysis(mean_rgb, std_rgb, set_input_order)
 
             if return_code == 0:
-                print("Accuracy analysis completed successfully.")
+                print("[QnnAimetConnector] Accuracy analysis completed successfully.")
             else:
-                print("Accuracy analysis failed.")
+                print("[QnnAimetConnector] Accuracy analysis failed.")
 
     @staticmethod
     def reorder_qdq_input_chains_by_graph_order(qdq_model_path:str) -> str:
@@ -314,7 +314,7 @@ class QnnAimetConnector:
 
         onnx.checker.check_model(model, full_check=True)
         onnx.save_model(model, qdq_model_path)
-        print(f"[AIMET] Reordered QDQ input chains to match graph input order: {real_inputs} (aggressive)")
+        print(f"[QnnAimetConnector] Reordered QDQ input chains to match graph input order: {real_inputs} (aggressive)")
         return qdq_model_path
 
 
@@ -447,7 +447,7 @@ class OnnxToQNN:
         self.act_quant_schema = act_quant_schema
         self.use_cle_algorithm = use_cle_algorithm
         
-        print(f"[QnnxToQNN] Quantization method set to: quant_method: param={self.param_quant_method}, act={self.act_quant_method}; bitwidth={self.weights_bitwidth}w{self.act_bitwidth}a"
+        print(f"[OnnxToQNN] Quantization method set to: quant_method: param={self.param_quant_method}, act={self.act_quant_method}; bitwidth={self.weights_bitwidth}w{self.act_bitwidth}a"
               f", schema: act={self.act_quant_schema}, param={self.param_quant_schema}; use_cle_algorithm={self.use_cle_algorithm}")
 
     def use_custom_calibration_data(self, custom_calibration_data_path:str|None=None):
@@ -475,7 +475,7 @@ class OnnxToQNN:
         else:
             self.custom_calibration_data_path = Path(custom_calibration_data_path).resolve()
 
-        print(f"[QnnxToQNN] Custom calibration dataset path set to: {self.custom_calibration_data_path}")
+        print(f"[OnnxToQNN] Custom calibration dataset path set to: {self.custom_calibration_data_path}")
 
     def do_hybrid_quantization(self, custom_hybrid:list[list[str, str]], bitwidth:str="w8a16", bias_bitwidth:int=8, float_bitwidth:int|None=None):
         """
@@ -509,7 +509,7 @@ class OnnxToQNN:
         weights_bitwidth, act_bitwidth = parse_bitwidth(bitwidth)
         self.hybrid_quantizer = QnnHybridQuantGen(custom_hybrid, weights_bitwidth, act_bitwidth, bias_bitwidth, float_bitwidth)
 
-        print(f"[QnnxToQNN] Hybrid quantization set to: {custom_hybrid}, bitwidth={bitwidth}, bias_bitwidth={bias_bitwidth}, float_bitwidth={float_bitwidth}")
+        print(f"[OnnxToQNN] Hybrid quantization set to: {custom_hybrid}, bitwidth={bitwidth}, bias_bitwidth={bias_bitwidth}, float_bitwidth={float_bitwidth}")
 
     def set_use_aimet(self, quant_method:str='tf_enhanced', bitwidth:str="w8a8", param_quant_schema:str='symmetric', act_quant_schema:str='asymmetric',
                       use_cle_algorithm:bool=False):
@@ -564,7 +564,7 @@ class OnnxToQNN:
 
         self.accuracy_analyzer = SnpeAccuracyDebugger(self.tmp_dir, self.tmp_onnx_path, accuracy_analysis_picture_list, self.run_subprocess)
 
-        print(f"[QnnxToQNN] Accuracy analysis data list set to: {accuracy_analysis_picture_list}")
+        print(f"[OnnxToQNN] Accuracy analysis data list set to: {accuracy_analysis_picture_list}")
 
 
     def convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]], set_input_order:str='nhwc'):
@@ -584,8 +584,11 @@ class OnnxToQNN:
                 - Defaults to 'nhwc'.
         """
 
-        # 1.
-        self.run_env_script()
+        # 1. 初始化 QAIRT 环境（source envsetup.sh），失败则终止转换
+        ret = self.run_env_script()
+        if not ret:
+            print("[OnnxToQNN] Error: QAIRT environment initialization failed (run_env_script failed), aborting conversion.")
+            exit(1)
 
         # 2.
         self.modify_onnx_model(mean_rgb, std_rgb)
@@ -600,7 +603,7 @@ class OnnxToQNN:
             self.aimet_connector.convert(onnx_model_info, mean_rgb, std_rgb, set_input_order)
             return
 
-        print(f"Model info: {onnx_model_info}")
+        print(f"[OnnxToQNN] Model info: {onnx_model_info}")
 
         # 4.2
         if self.hybrid_quantizer is not None:
@@ -619,11 +622,17 @@ class OnnxToQNN:
         else:
             calibration_data_index_path = self.custom_calibration_data_path
 
-        # 7.
+        # 7. 量化：区分「未请求量化」与「请求了量化但校准数据生成失败」
         if calibration_data_index_path is not None:
             quantized_dlc_model_path = self.quantize_model(dlc_model_path, calibration_data_index_path)
-        else:
+        elif self.dataset_path is None and self.custom_calibration_data_path is None:
+            # 未提供校准数据集：跳过量化，直接输出未量化 DLC
+            print("[OnnxToQNN] No calibration data provided, skipping quantization, outputting unquantized DLC.")
             quantized_dlc_model_path = dlc_model_path
+        else:
+            # 提供了数据集但校准数据生成失败，禁止静默回退到未量化模型
+            print("[OnnxToQNN] Error: calibration data generation failed, cannot quantize, aborting conversion.")
+            exit(1)
 
         if quantized_dlc_model_path is None:
             exit(1)
@@ -646,9 +655,9 @@ class OnnxToQNN:
             return_code = self.accuracy_analyzer.accuracy_analysis(mean_rgb, std_rgb, set_input_order)
 
             if return_code == 0:
-                print("Accuracy analysis completed successfully.")
+                print("[OnnxToQNN] Accuracy analysis completed successfully.")
             else:
-                print("Accuracy analysis failed.")
+                print("[OnnxToQNN] Accuracy analysis failed.")
 
     def clean(self):
         """清理本次转换产生的临时文件/目录: file_or_dir_to_clean 中登记的项"""
@@ -661,7 +670,7 @@ class OnnxToQNN:
     @staticmethod
     def run_subprocess(command:str) -> int:
         executable = '/bin/bash'
-        print(f"Running command: {command}")
+        print(f"[OnnxToQNN] Running command: {command}")
 
         # 使用实时输出的方式执行命令
         process = subprocess.Popen(command, shell=True,
@@ -688,7 +697,7 @@ class OnnxToQNN:
         command = f"source '{envsetup_script}' && env"
         executable = '/bin/bash'
         encoding = 'utf-8'
-        print("Setting up QAIRT Linux environment...")
+        print("[OnnxToQNN] Setting up QAIRT Linux environment...")
             
         # 执行脚本
         proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, executable=executable)
@@ -696,7 +705,7 @@ class OnnxToQNN:
         stdout, stderr = proc.communicate() # 获取输出
         
         if proc.returncode != 0:
-            print(f"Error executing script: {stderr.decode(encoding)}")
+            print(f"[OnnxToQNN] Error executing script: {stderr.decode(encoding)}")
             return False
         
         # 解析环境变量
@@ -704,12 +713,14 @@ class OnnxToQNN:
             if '=' in line:
                 key, value = line.split('=', 1)
                 os.environ[key] = value
-        
+
+        return True
+
     def modify_onnx_model(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
         self.tmp_dir.mkdir(exist_ok=True) # 确保tmp目录存在
 
         if not self.model_path.exists():
-            print(f"Error: ONNX file not found at {self.model_path}")
+            print(f"[OnnxToQNN] Error: ONNX file not found at {self.model_path}")
             return None
         
         model = onnx.load_model(str(self.model_path))
@@ -726,7 +737,7 @@ class OnnxToQNN:
         # 复制ONNX文件到tmp目录
         onnx.save_model(model, str(self.tmp_onnx_path))
         self.file_or_dir_to_clean.append(self.tmp_onnx_path)
-        print(f"Copied ONNX file to {self.tmp_onnx_path}")
+        print(f"[OnnxToQNN] Copied ONNX file to {self.tmp_onnx_path}")
 
     def convert_onnx_model(self, onnx_model_info:dict, set_input_order:str, quantization_overrides_path:str|None=None, output_dlc_name:str|None=None, input_network_path:str|None=None, is_quantized:bool=False) -> str|None:
         """
@@ -785,7 +796,7 @@ class OnnxToQNN:
         return_code = self.run_subprocess(command)
         
         if return_code == 0:
-            print("Convert onnx to qnn-dlc successful!")
+            print("[OnnxToQNN] Convert onnx to qnn-dlc successful!")
 
             self.file_or_dir_to_clean.append(dlc_path)
             return dlc_path
@@ -817,7 +828,7 @@ class OnnxToQNN:
                 # 获取当前输入的尺寸
                 input_shape = input_info["shape"]
                 if len(input_shape) != 4 or input_shape[0] != 1:
-                    print(f"Error: Unsupported input shape for input {idx + 1}")
+                    print(f"[OnnxToQNN] Error: Unsupported input shape for input {idx + 1}")
                     continue
 
                 height, width = input_shape[2], input_shape[3]
@@ -838,7 +849,7 @@ class OnnxToQNN:
                     # 使用OpenCV读取图片
                     img = cv2.imread(full_img_path)
                     if img is None:
-                        print(f"Warning: Could not read image {full_img_path}")
+                        print(f"[OnnxToQNN] Warning: Could not read image {full_img_path}")
                         continue
 
                     # 等比缩放 + 居中填充 + BGR转RGB + 布局/类型转换 (复用 utils.letterbox_image)
@@ -869,7 +880,7 @@ class OnnxToQNN:
                     futures.append(future)
 
                     if len(futures) >= max_workers:
-                        print(f"Processed a batch of {max_workers} images")
+                        print(f"[OnnxToQNN] Processed a batch of {max_workers} images")
                         concurrent.futures.wait(futures, timeout=2)
 
                         for i in range(len(futures)):
@@ -895,9 +906,9 @@ class OnnxToQNN:
                     # 过滤掉空字符串，但保留位置（这样列对齐）
                     formatted_row = ' '.join(item if item else '' for item in row)
                     f.write(formatted_row + '\n')
-                print(f'{calibration_data_index} created listing {len(calibration_files)} columns.')
+                print(f"[OnnxToQNN] {calibration_data_index} created listing {len(calibration_files)} columns.")
 
-            print("Calibration data generation completed successfully!")
+            print("[OnnxToQNN] Calibration data generation completed successfully!")
 
             self.file_or_dir_to_clean.append(calibration_data_index)
             for file_list in calibration_files:
@@ -906,7 +917,7 @@ class OnnxToQNN:
             return calibration_data_index
 
         except Exception as e:
-            print(f"Error generating calibration data: {str(e)}")
+            print(f"[OnnxToQNN] Error generating calibration data: {str(e)}")
             return None
 
     def quantize_model(self, dlc_model_path:str, calibration_data_index_path:str) -> str|None:
@@ -915,8 +926,8 @@ class OnnxToQNN:
         quantized_dlc_model_path = dlc_model_file.parent / f"{dlc_model_file.stem}_quantized.dlc"
 
         if not dlc_model_file.exists():
-            print(f"Error: DLC model not found at {dlc_model_file}")
-            return False
+            print(f"[OnnxToQNN] Error: DLC model not found at {dlc_model_file}")
+            return None
         
 
         quantize_args = f'--weights_bitwidth {self.weights_bitwidth}'
@@ -941,10 +952,10 @@ class OnnxToQNN:
 
         if return_code == 0:
             self.file_or_dir_to_clean.append(quantized_dlc_model_path)
-            print("Model quantization completed successfully!")
+            print("[OnnxToQNN] Model quantization completed successfully!")
             return quantized_dlc_model_path
         else:
-            print("Error during model quantization.")
+            print("[OnnxToQNN] Error during model quantization.")
             return None
 
     def write_config_file(self, dlc_model_path:str) -> str:
@@ -990,7 +1001,7 @@ class OnnxToQNN:
         self.file_or_dir_to_clean.append(str(config_backend_path))
         self.file_or_dir_to_clean.append(str(config_file_path))
         
-        print(f"Config file created at: {config_backend_path}")
+        print(f"[OnnxToQNN] Config file created at: {config_backend_path}")
         return config_file_path
 
     def generate_context_binary_model(self, quantized_dlc_model_path:str, config_path:str):
@@ -1001,10 +1012,10 @@ class OnnxToQNN:
         return_code = self.run_subprocess(command)
 
         if return_code == 0:
-            print("Context binary generation completed successfully!")
+            print("[OnnxToQNN] Context binary generation completed successfully!")
             return True
         else:
-            print("Error during context binary generation.")
+            print("[OnnxToQNN] Error during context binary generation.")
             return False
 
 

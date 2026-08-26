@@ -62,6 +62,9 @@ class OnnxToRKNN:
         #self.set_do_accuracy_analysis()
         self.accuracy_analysis_picture_list = None
 
+        # 精度分析调试器（set_do_accuracy_analysis() 时创建，convert()/clean() 据此使用/清理）
+        self.accuracy_analyzer = None
+
         self.file_or_dir_to_clean = ["check0_base_optimize.onnx", "check1_fold_constant.onnx", "check2_correct_ops.onnx", "check3_fuse_ops.onnx"]
 
     def extra_optimize(self, quantized_algorithm:str='normal', compress_weight:bool=False, model_pruning:bool=False, flash_attention:bool=False):
@@ -117,8 +120,10 @@ class OnnxToRKNN:
         """
         if accuracy_analysis_picture_list is not None:
             self.accuracy_analysis_picture_list = [str(Path(path).resolve()) for path in accuracy_analysis_picture_list]
+            self.accuracy_analyzer = RknnAccuracyDebugger(self.tmp_dir, self.tmp_dir / self.model_path.name)
         else:
             self.accuracy_analysis_picture_list = None
+            self.accuracy_analyzer = None
 
         print(f"[OnnxToRKNN] set_do_accuracy_analysis: accuracy_analysis_picture_list={self.accuracy_analysis_picture_list}")
 
@@ -158,36 +163,35 @@ class OnnxToRKNN:
         with temporary_chdir(self.tmp_dir):
             self.self_convert(mean_rgb, std_rgb)
 
-        if self.accuracy_analysis_picture_list is not None:
-            debugger = RknnAccuracyDebugger(self.tmp_dir, self.tmp_model_path)
-            debugger.plot_accuracy_analysis()
-            debugger.plot_network_analysis(show=True) # 带路径追踪的精度分析（Netron 风格网络图）
+        if self.accuracy_analyzer is not None:
+            self.accuracy_analyzer.plot_accuracy_analysis()
+            self.accuracy_analyzer.plot_network_analysis(show=True) # 带路径追踪的精度分析（Netron 风格网络图）
 
     def clean(self):
         clean_files_or_dirs([str(self.tmp_dir / name) for name in self.file_or_dir_to_clean])
-        if debugger is not None:
-            debugger.clean()
+        if self.accuracy_analyzer:
+            self.accuracy_analyzer.clean()
 
 
     def self_convert(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
         rknn = RKNN(verbose=True)
 
         # Pre-process config
-        print('--> Config model')
+        print('[OnnxToRKNN] Config model')
         rknn.config(mean_values=mean_rgb, std_values=std_rgb, quantized_algorithm=self.quantized_algorithm, target_platform=self.target_platform, 
                     compress_weight=self.compress_weight, model_pruning=self.model_pruning, enable_flash_attention=self.flash_attention)
-        print('done')
+        print('[OnnxToRKNN] done')
 
         # Load model
-        print('--> Loading model')
+        print('[OnnxToRKNN] Loading model')
         ret = rknn.load_onnx(model=str(self.tmp_model_path))
         if ret != 0:
-            print('Load model failed!')
+            print('[OnnxToRKNN] Load model failed!')
             exit(ret)
-        print('done')
+        print('[OnnxToRKNN] done')
         
         # Build model
-        print('--> Building model')
+        print('[OnnxToRKNN] Building model')
         if self.dataset_path is not None:
             if self.custom_hybrid is None:
                 ret = rknn.build(do_quantization=True, dataset=self.dataset_path)
@@ -204,29 +208,29 @@ class OnnxToRKNN:
             ret = rknn.build(do_quantization=False)
 
         if ret != 0:
-            print('Build model failed!')
+            print('[OnnxToRKNN] Build model failed!')
             exit(ret)
-        print('done')
+        print('[OnnxToRKNN] done')
 
         # Export rknn model
-        print('--> Export rknn model')
+        print('[OnnxToRKNN] Export rknn model')
         
         os.makedirs(self.rknn_model_path.parent, exist_ok=True)
         
         ret = rknn.export_rknn(str(self.rknn_model_path))
         if ret != 0:
-            print('Export rknn model failed!')
+            print('[OnnxToRKNN] Export rknn model failed!')
             exit(ret)
-        print('done')
+        print('[OnnxToRKNN] done')
 
         if self.accuracy_analysis_picture_list is not None:
-            print(f'accuracy_analysis_picture_list: {self.accuracy_analysis_picture_list}')
+            print(f'[OnnxToRKNN] accuracy_analysis_picture_list: {self.accuracy_analysis_picture_list}')
             rknn.accuracy_analysis(inputs=self.accuracy_analysis_picture_list)
             self.file_or_dir_to_clean.append(str(self.tmp_dir / "snapshot"))
 
         # Release
         rknn.release()
-        print('--> Released rknn')
+        print('[OnnxToRKNN] Released rknn')
 
 
 
