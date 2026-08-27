@@ -1,6 +1,7 @@
 protobuf<=4.25.4
 easydict
 
-ml_dtypes>0.3.1
+ml_dtypes>0.5
 tf2onnx
 
+numpy<2.0

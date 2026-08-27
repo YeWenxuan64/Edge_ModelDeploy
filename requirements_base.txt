@@ -17,3 +17,14 @@ onnx==1.17.0
 onnxslim
 
 opencv-python>=4.5.5
+
+#snpe_accuracy_analysis
+paramiko
+plotly
+pathlib2
+xlsxwriter
+pydantic
+aenum
+onnxsim
+
+aimet-onnx

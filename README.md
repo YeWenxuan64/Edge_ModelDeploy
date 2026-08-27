@@ -121,7 +121,7 @@ sudo apt install python3-pip python3-venv python3-tk
 ```bash
 # 严格按此顺序执行（逐条！）
 pip install -r requirements_base.txt
-pip install -r requirements_torch_cpu.txt --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements_torch_cpu.txt
 pip install -r requirements_tensorflow.txt
 pip install -r requirements_overwrite.txt
 pip install rknn-toolkit2 --no-deps
@@ -132,10 +132,10 @@ pip install rknn-toolkit2 --no-deps
 > | 步骤 | 命令 | 说明 |
 > |------|------|------|
 > | 1. | `pip install -r requirements_base.txt` | 基础依赖（numpy, opencv-python 等） |
-> | 2. | `pip install -r requirements_torch_cpu.txt --index-url https://download.pytorch.org/whl/cpu` | PyTorch **CPU 版**。也可以装普通 GPU 版（`requirements_torch.txt`），但 GPU 版体积异常膨胀，且对其他依赖的版本约束更严格，在依赖有冲突的环境中很难调通 |
-> | 3. | `pip install -r requirements_tensorflow.txt` | TensorFlow（与 PyTorch 有共同依赖，需在 base 之后安装） |
+> | 2. | `pip install -r requirements_torch_cpu.txt` | PyTorch **CPU 版**。也可以自行安装普通 GPU 版，但 GPU 版体积会稍微**膨胀**，且 Linux 下会强制安装体积巨大的 Nvidia 驱动 |
+> | 3. | `pip install -r requirements_tensorflow.txt` | TensorFlow **CPU 版**（与 PyTorch 有共同依赖，需在 base 之后安装） |
 > | 4. | `pip install -r requirements_overwrite.txt` | **包版本覆盖** — 将某些包降级/锁定到兼容版本（必须在最后装！） |
-> | 5. | `pip install rknn-toolkit2 --no-deps` | Rockchip RKNN 工具（`--no-deps` 避免上游依赖冲突） |
+> | 5. | `pip install rknn-toolkit2 --no-deps` | Rockchip RKNN 工具（可选）（`--no-deps` 避免上游依赖冲突） |
 >
 > **为什么顺序重要？** 核心原因是 **`protobuf`** 和 **`easydict`** 等包在 TensorFlow 与 PyTorch 不同版本间存在冲突 — 先装 A 框架拉高版本，再装 B 框架时可能不兼容。`requirements_overwrite.txt` 会在最后统一锁定兼容版本。此外 **RKNN / QNN 框架对 TensorFlow 和 PyTorch 的版本要求极其严苛**，混装极易踩坑，分步安装可以精确控制每一层的依赖版本。
 
