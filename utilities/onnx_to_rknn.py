@@ -10,7 +10,7 @@ current_dir = Path(__file__).parent.resolve()
 sys.path.append(str(current_dir))
 
 from utils import temporary_chdir, clean_files_or_dirs, read_dataset_txt_to_list
-from accuracy_debugger import RknnAccuracyDebugger
+
 
 
 
@@ -120,6 +120,7 @@ class OnnxToRKNN:
         """
         if accuracy_analysis_picture_list is not None:
             self.accuracy_analysis_picture_list = [str(Path(path).resolve()) for path in accuracy_analysis_picture_list]
+            from accuracy_debugger import RknnAccuracyDebugger
             self.accuracy_analyzer = RknnAccuracyDebugger(self.tmp_dir, self.tmp_dir / self.model_path.name)
         else:
             self.accuracy_analysis_picture_list = None

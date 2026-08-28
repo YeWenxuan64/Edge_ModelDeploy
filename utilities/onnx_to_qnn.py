@@ -1,6 +1,8 @@
 import os
 import sys
 import json
+import platform
+import shutil
 import subprocess
 from pathlib import Path
 from itertools import zip_longest
@@ -19,9 +21,125 @@ sys.path.append(str(current_dir))
 from utils import temporary_chdir, letterbox_image, clean_files_or_dirs, read_dataset_txt_to_list
 from utils import sanitize_name, parse_bitwidth, find_hybrid_subgraph_nodes
 from utils import get_onnx_model_info, normalize_onnx_model, reorder_onnx_nodes_by_input, reorder_onnx_nodes_by_output
-from accuracy_debugger import SnpeAccuracyDebugger
-from onnx_aimet_quant import AimetOnnxQuantizer, AimetQuantsimConfig
 
+
+
+
+
+
+class QAIRTScript:
+    """QAIRT 无扩展名 Python shebang 脚本的跨平台路径字典 + 调用前缀生成器。
+
+    背景：qairt-converter / qairt-quantizer 等在 SDK 中是无扩展名的 Python
+    shebang 脚本，位于 bin/<arch> 子目录下：
+        x86_64 Windows : bin/x86_64-windows-msvc/<tool>
+        ARM64  Windows : bin/aarch64-windows-msvc/<tool>
+        x86_64 Linux   : bin/x86_64-linux-clang/<tool>
+        ARM64  Linux   : bin/aarch64-oe-linux-gcc11.2/<tool>
+    Windows 无法直接执行无扩展名文件，须以 `python <脚本路径>` 调用；
+    Linux 由 shebang 直接执行。本类以字典集中管理各平台脚本相对路径，
+    get() 按当前平台自动输出完整调用前缀，使下方执行逻辑无需关心平台差异。
+
+    用法：
+        QAIRTScript.get('qairt-converter')
+        # Windows -> 'python "D:\\...\\qairt\\2.38.0.250901\\bin\\x86_64-windows-msvc\\qairt-converter"'
+        # Linux   -> '"/opt/qairt/.../bin/x86_64-linux-clang/qairt-converter"'
+    """
+
+    # 平台 key -> bin 子目录名
+    PLATFORM_BIN_DIRS = {
+        'windows_x86_64': 'x86_64-windows-msvc',
+        'windows_arm64': 'aarch64-windows-msvc',
+        'linux_x86_64': 'x86_64-linux-clang',
+        'linux_arm64': 'aarch64-oe-linux-gcc11.2',
+    }
+
+    # 工具名 -> 各平台脚本相对路径（相对 SDK 根目录）。
+    # 只记录当前流程实际用到的工具，其余按需扩展。
+    # 若某版本 SDK 未提供对应工具，运行时由系统自然报错，不做额外判断。
+    TOOL_PATHS = {
+        'qairt-converter': {
+            'windows_x86_64': 'bin/x86_64-windows-msvc/qairt-converter',
+            'windows_arm64': 'bin/arm64x-windows-msvc/qairt-converter',
+            'linux_x86_64': 'bin/x86_64-linux-clang/qairt-converter',
+            'linux_arm64': 'bin/aarch64-oe-linux-gcc11.2/qairt-converter',
+        },
+        'qairt-quantizer': {
+            'windows_x86_64': 'bin/x86_64-windows-msvc/qairt-quantizer',
+            'windows_arm64': 'bin/arm64x-windows-msvc/qairt-quantizer',
+            'linux_x86_64': 'bin/x86_64-linux-clang/qairt-quantizer',
+            'linux_arm64': 'bin/aarch64-oe-linux-gcc11.2/qairt-quantizer',
+        },
+        # SNPE 精度分析工具（accuracy_debugger.py 使用；aarch64-windows-msvc 提供该工具）
+        'snpe-accuracy-debugger': {
+            'windows_x86_64': 'bin/x86_64-windows-msvc/snpe-accuracy-debugger',
+            'windows_arm64': 'bin/aarch64-windows-msvc/snpe-accuracy-debugger',
+            'linux_x86_64': 'bin/x86_64-linux-clang/snpe-accuracy-debugger',
+            'linux_arm64': 'bin/aarch64-oe-linux-gcc11.2/snpe-accuracy-debugger',
+        },
+    }
+
+    # 类级 SDK 根目录（由 set_sdk_root() 设置；get() 无显式参数时使用）
+    _sdk_root: str | Path | None = None
+
+    @classmethod
+    def current_platform_key(cls) -> str:
+        """返回当前平台 key：'windows_x86_64' / 'windows_arm64' / 'linux_x86_64' / 'linux_arm64'。"""
+        machine = platform.machine().lower()
+        if sys.platform.startswith('win'):
+            return 'windows_arm64' if machine in ('arm64', 'aarch64') else 'windows_x86_64'
+        # Linux：按 CPU 架构区分 x86_64 / arm64（arm64 对应 aarch64-oe-linux-gcc11.2 工具链）
+        return 'linux_arm64' if machine in ('arm64', 'aarch64') else 'linux_x86_64'
+
+    @classmethod
+    def set_sdk_root(cls, sdk_root: str | Path) -> None:
+        """设置类级 SDK 根目录（版本目录），之后 get() 无需再传 sdk_root。
+
+        优先级（get 解析时）：显式传入 sdk_root > set_sdk_root 设置的 > 环境变量 QAIRT_SDK_ROOT。
+        """
+        cls._sdk_root = Path(sdk_root).resolve()
+        print(f"[QAIRTScript] SDK root set: {cls._sdk_root}")
+
+    @classmethod
+    def get(cls, tool_name:str) -> str:
+        """按当前平台输出工具调用前缀。
+
+        Args:
+            tool_name: 工具键名，如 'qairt-converter'。
+        Returns:
+            str: 调用前缀，如
+                Windows -> 'python "D:\\...\\bin\\x86_64-windows-msvc\\qairt-converter"'
+                Linux   -> '/opt/.../bin/x86_64-linux-clang/qairt-converter'
+                下方拼接参数即可得到完整命令。
+
+        Raises:
+            FileNotFoundError: 当前平台 SDK 未提供该工具，或脚本文件不存在。
+        """
+
+        platform_key = cls.current_platform_key()
+        rel_path = cls.TOOL_PATHS[tool_name].get(platform_key)
+        if rel_path is None:
+            raise FileNotFoundError(
+                f'{tool_name} is not provided by the QAIRT SDK on {platform_key} ')
+
+        sdk_root = cls._sdk_root
+        if sdk_root is None:
+            sdk_root = os.environ.get('QAIRT_SDK_ROOT')
+
+        script_path = Path(sdk_root) / rel_path
+
+        if sys.platform.startswith('win'):
+            # Windows：无扩展名脚本须经 python 解释器调用。
+            # QAIRT Windows 工具绑定 Python 3.10 ABI（python310.dll），必须用
+            # Python 3.10 解释器运行（3.11+ 会报 Python version mismatch）。
+            # 解释器优先级：QAIRT_PYTHON 环境变量 > PATH 中的 python。
+            # 例如：set QAIRT_PYTHON=E:\python_virtual_environment\edge_modeldeploy_venv\python.exe
+            python_exe = os.environ.get('QAIRT_PYTHON') or 'python'
+            return f'"{python_exe}" "{script_path}"'
+        
+        # Linux/Unix：shebang 直接执行，返回脚本完整路径（加引号避免路径含空格）
+        # 与类 docstring 示例一致（Linux -> '"/opt/qairt/.../bin/<arch>/<tool>"'）
+        return f'"{script_path}"'
 
 
 
@@ -153,8 +271,11 @@ class QnnAimetConnector:
         # 传入 htp 版本（如 'htp_v68'/'htp_v73'）时，在此加载对应版本的内置
         # quantsim_config，得到其绝对路径。对称性等后续由 AimetOnnxQuantizer.
         # _build_sim 基于该内置配置改写（defaults 级）后应用，绝不改动算子级配置。
-        self.config_file = (AimetQuantsimConfig.resolve_path(config_file)
-                            if config_file is not None else None)
+        if config_file is not None:
+            from onnx_aimet_quant import AimetQuantsimConfig
+            self.config_file = AimetQuantsimConfig.resolve_path(config_file)
+        else:
+            self.config_file = None
         if self.config_file is not None:
             print(f"[QnnAimetConnector] load quantsim_config: {self.config_file}")
 
@@ -223,6 +344,7 @@ class QnnAimetConnector:
         qdq_model_path = converter.tmp_dir / f"{tmp_onnx_path.stem}_qdq.onnx"
 
         # 1.
+        from onnx_aimet_quant import AimetOnnxQuantizer
         quantizer = AimetOnnxQuantizer(str(tmp_onnx_path), qdq_model_path, converter.dataset_path, self.config_file)
 
         # 2.
@@ -360,8 +482,15 @@ class OnnxToQNN:
         current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
 
         qairt_path = Path(current_dir).resolve() / 'qairt'
-        version_dir = next(qairt_path.iterdir())# 获取qairt目录下的第一个子目录
+
+        # 版本号间隔较大，依赖目录名排序即可：字典序最大的即最新版本
+        version_dir = max(
+            (d for d in qairt_path.iterdir() if d.is_dir()),
+            key=lambda d: d.name,
+        )
+        print(f"[OnnxToQNN] Selected latest QAIRT SDK version dir: {version_dir}")
         self.qnn_sdk_dir = version_dir
+        QAIRTScript.set_sdk_root(self.qnn_sdk_dir)
 
         self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
 
@@ -561,8 +690,8 @@ class OnnxToQNN:
                 - For models with multiple inputs, provide multiple image paths. Example: ['/home/xxx/1.jpg', '/home/xxx/2.jpg']
                 - Defaults to None.
         """
-
-        self.accuracy_analyzer = SnpeAccuracyDebugger(self.tmp_dir, self.tmp_onnx_path, accuracy_analysis_picture_list, self.run_subprocess)
+        from accuracy_debugger import SnpeAccuracyDebugger
+        self.accuracy_analyzer = SnpeAccuracyDebugger(self.tmp_dir, self.tmp_onnx_path, accuracy_analysis_picture_list, self.run_subprocess, QAIRTScript)
 
         print(f"[OnnxToQNN] Accuracy analysis data list set to: {accuracy_analysis_picture_list}")
 
@@ -669,14 +798,20 @@ class OnnxToQNN:
 
     @staticmethod
     def run_subprocess(command:str) -> int:
-        executable = '/bin/bash'
         print(f"[OnnxToQNN] Running command: {command}")
 
-        # 使用实时输出的方式执行命令
-        process = subprocess.Popen(command, shell=True,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT,  # 将stderr重定向到stdout
-                                universal_newlines=True, executable=executable, env=os.environ)
+        # 平台适配：Windows 用 cmd（shell=True 默认），Linux/Unix 用 bash。
+        # QAIRT 无扩展名脚本在 Windows 下由 QAIRTScript.get() 自动加 python 前缀。
+        popen_kwargs = dict(
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # 将stderr重定向到stdout
+            universal_newlines=True,
+            env=os.environ,
+        )
+        if sys.platform.startswith('win'):
+            process = subprocess.Popen(command, shell=True, **popen_kwargs)
+        else:
+            process = subprocess.Popen(command, shell=True, executable='/bin/bash', **popen_kwargs)
         
         # 实时打印输出
         while True:
@@ -692,27 +827,79 @@ class OnnxToQNN:
         return return_code
 
     def run_env_script(self):
-        # Linux/Unix系统使用bash脚本
-        envsetup_script = self.qnn_sdk_dir / 'bin/envsetup.sh'
-        command = f"source '{envsetup_script}' && env"
-        executable = '/bin/bash'
-        encoding = 'utf-8'
-        print("[OnnxToQNN] Setting up QAIRT Linux environment...")
-            
-        # 执行脚本
-        proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, executable=executable)
-        
-        stdout, stderr = proc.communicate() # 获取输出
-        
-        if proc.returncode != 0:
-            print(f"[OnnxToQNN] Error executing script: {stderr.decode(encoding)}")
-            return False
-        
+        """按平台加载 QAIRT SDK 环境：Windows -> envsetup.ps1，Linux/Unix -> envsetup.sh。
+        Windows 分支（x86_64 / ARM64）：dot-source bin/envsetup.ps1 并解析环境变量。
+        Returns:
+            bool: 环境加载成功返回 True，失败返回 False。
+        """
+        if sys.platform.startswith('win'):
+            # ---------------- Windows ----------------
+            envsetup_script = self.qnn_sdk_dir / 'bin' / 'envsetup.ps1'
+            powershell_exe = shutil.which('powershell') or shutil.which('pwsh')
+
+            if platform.machine().lower() in ('amd64', 'x86_64'):
+                arch = 'X86_64'
+            else:
+                arch = 'ARM64'
+
+            # 同一 PowerShell 会话 dot-source envsetup.ps1（显式 -arch 避开 WMI 检测），
+            # 再导出全部环境变量；[INFO]/[WARN] 日志在 ===QAIRT_ENV_START=== 之前，解析时跳过
+            command = (
+                f"& {{ . '{envsetup_script}' -arch {arch}; "
+                f"Write-Output '===QAIRT_ENV_START==='; "
+                f"Get-ChildItem Env: | ForEach-Object {{ \"{{0}}={{1}}\" -f $_.Name, $_.Value }} }}"
+            )
+            proc = subprocess.Popen([powershell_exe, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    universal_newlines=True, encoding='utf-8', errors='replace')
+            stdout, stderr = proc.communicate()
+            if proc.returncode != 0:
+                print(f"[OnnxToQNN] Error executing envsetup.ps1: {stderr}")
+                return False
+
+            # 只解析 env 导出段（标记行之后），前面的 [INFO]/[WARN] 日志忽略
+            env_block = stdout.split('===QAIRT_ENV_START===', 1)
+            if len(env_block) != 2:
+                print(f"[OnnxToQNN] Error parsing envsetup.ps1 output: {stdout}")
+                return False
+
+            env_to_parse = env_block[1]
+
+        else:
+            # ---------------- Linux/Unix ----------------
+            envsetup_script = self.qnn_sdk_dir / 'bin/envsetup.sh'
+            command = f"source '{envsetup_script}' && env"
+            print("[OnnxToQNN] Setting up QAIRT Linux environment...")
+
+            # 执行脚本
+            proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, executable='/bin/bash')
+            stdout, stderr = proc.communicate() # 获取输出
+
+            if proc.returncode != 0:
+                print(f"[OnnxToQNN] Error executing script: {stderr.decode('utf-8')}")
+                return False
+
+            env_to_parse = stdout.decode('utf-8')
+
+
         # 解析环境变量
-        for line in stdout.decode().split('\n'):
+        for line in env_to_parse.splitlines():
             if '=' in line:
                 key, value = line.split('=', 1)
                 os.environ[key] = value
+
+        # QAIRT 工具绑定 Python 3.10 ABI：QAIRT_PYTHON 默认当前解释器
+        if 'QAIRT_PYTHON' not in os.environ:
+            os.environ['QAIRT_PYTHON'] = sys.executable
+            print(f"[OnnxToQNN] QAIRT_PYTHON defaulted to current interpreter: {sys.executable}")
+        if sys.version_info[:2] != (3, 10):
+            print(f"[OnnxToQNN] Warning: QAIRT require Python 3.10, current is {sys.version.split()[0]}")
+
+        # QAIRT 工具需要可写临时目录（受限环境系统 TEMP 不可写），指向项目 tmp
+        qairt_tmp_dir = self.tmp_dir / 'qairt_tmp'
+        qairt_tmp_dir.mkdir(parents=True, exist_ok=True)
+        os.environ['QAIRT_TMP_DIR'] = str(qairt_tmp_dir)
+        self.file_or_dir_to_clean.append(qairt_tmp_dir)
 
         return True
 
@@ -791,7 +978,7 @@ class OnnxToQNN:
         if input_network_path is None:
             input_network_path = str(self.tmp_onnx_path)
 
-        command = f"qairt-converter --input_network {input_network_path} {layout_args} {extra_args} -o {dlc_path}"
+        command = f"{QAIRTScript.get('qairt-converter')} --input_network {input_network_path} {layout_args} {extra_args} -o {dlc_path}"
 
         return_code = self.run_subprocess(command)
         
@@ -943,7 +1130,7 @@ class OnnxToQNN:
 
         extra_args = f'{quantize_args} --target_backend HTP'
         
-        command = f"qairt-quantizer --input_dlc {dlc_model_path} --input_list {input_list_str} --output_dlc {quantized_dlc_model_path} {extra_args}"
+        command = f"{QAIRTScript.get('qairt-quantizer')} --input_dlc {dlc_model_path} --input_list {input_list_str} --output_dlc {quantized_dlc_model_path} {extra_args}"
 
         with temporary_chdir(self.tmp_dir):
             return_code = self.run_subprocess(command)
@@ -984,9 +1171,15 @@ class OnnxToQNN:
         }
 
 
+        # 平台适配：HTP 后端扩展库 Linux 为 libQnnHtpNetRunExtensions.so，
+        if sys.platform.startswith('win'):
+            shared_library = 'QnnHtpNetRunExtensions.dll'
+        else:
+            shared_library = 'libQnnHtpNetRunExtensions.so'
+
         config_file = {
             "backend_extensions": {
-                "shared_library_path": "libQnnHtpNetRunExtensions.so",
+                "shared_library_path": shared_library,
                 "config_file_path": str(config_backend_path)
             }
         }
@@ -1004,9 +1197,14 @@ class OnnxToQNN:
         print(f"[OnnxToQNN] Config file created at: {config_backend_path}")
         return config_file_path
 
-    def generate_context_binary_model(self, quantized_dlc_model_path:str, config_path:str):
+    def generate_context_binary_model(self, quantized_dlc_model_path:str, config_path:str) -> bool:
+        # 平台适配：backend / model 库名 Linux 为 .so（lib 前缀），Windows 为 .dll（无 lib 前缀）。
+        if sys.platform.startswith('win'):
+            model_lib, backend_lib = 'QnnModelDlc.dll', 'QnnHtp.dll'
+        else:
+            model_lib, backend_lib = 'libQnnModelDlc.so', 'libQnnHtp.so'
 
-        command = f"qnn-context-binary-generator --model libQnnModelDlc.so --backend libQnnHtp.so --config_file {config_path}"
+        command = f"qnn-context-binary-generator --model {model_lib} --backend {backend_lib} --config_file {config_path}"
         command += f" --dlc_path {quantized_dlc_model_path} --output_dir {self.qnn_model_path.parent} --binary_file {self.qnn_model_path.stem}"
 
         return_code = self.run_subprocess(command)
