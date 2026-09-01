@@ -1,5 +1,7 @@
 import os
 import re
+import sys
+import subprocess
 import copy
 import random
 import heapq
@@ -971,6 +973,11 @@ class NumpySaver:
 
     @classmethod
     def save_numpy_array(cls, data_and_path:list[tuple[np.ndarray, str]], output_format:str):
+        """
+        Args:
+            data_and_path: [(data, path), ...]
+            output_format: '.npy' | '.raw' | 'image'
+        """
         if cls.write_threadpool is None:
             cls.write_threadpool = ThreadPoolExecutor(max_workers=6)
 
@@ -982,3 +989,41 @@ class NumpySaver:
         if cls.write_threadpool is not None:
             cls.write_threadpool.shutdown(wait=True)
         cls.write_threadpool = None
+
+
+
+def run_command(command: str, signature: str = "") -> int:
+    """在 shell 中执行命令并实时打印输出，返回进程返回码。
+
+    Args:
+        command: 要执行的 shell 命令字符串。
+        signature: 日志前缀（如 "[OnnxToQNN]"），用于区分调用来源。
+
+    Returns:
+        int: 进程返回码（0 表示成功）。
+
+    平台适配：Windows 用 cmd（shell=True 默认），Linux/Unix 用 bash。
+    """
+    print(f"{signature} Running command: {command}")
+
+    popen_kwargs = dict(
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # 将 stderr 重定向到 stdout
+        universal_newlines=True,
+        env=os.environ,
+    )
+    if sys.platform.startswith('win'):
+        process = subprocess.Popen(command, shell=True, **popen_kwargs)
+    else:
+        process = subprocess.Popen(command, shell=True, executable='/bin/bash', **popen_kwargs)
+
+    # 实时打印输出
+    while True:
+        output = process.stdout.readline()
+        if output == '' and process.poll() is not None:
+            break
+        if output:
+            print(output.strip())
+
+    return_code = process.poll()
+    return return_code

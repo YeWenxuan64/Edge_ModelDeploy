@@ -15,7 +15,134 @@ import cv2
 
 current_dir = Path(__file__).parent.resolve()
 sys.path.append(str(current_dir))
-from utils import clean_files_or_dirs
+from utils import clean_files_or_dirs, run_command, parse_bitwidth
+
+
+
+
+def plot_accuracy_summary(names:list[str]=None, single_euc:np.ndarray=None, single_cos:np.ndarray=None, 
+                            entire_euc:np.ndarray=None, entire_cos:np.ndarray=None, mse_vals=None, 
+                            entire_val_color:str="blue", save_path=None):
+    """统一的逐层精度可视化：欧氏距离柱状图 + 余弦相似度折线图（两个子图始终保留）。
+
+    使用分支按传入数据绘制：只画实际存在的数据（None 则跳过该部分），
+    即使某子图没有任何数据也会保留该子图（显示标题、坐标轴与网格，不报错）。
+
+    Args:
+        names: x 轴刻度标签（可为 None）。
+        single_euc: 欧氏距离柱状数据（逐层单层误差，可为 None）。
+        single_cos: 余弦相似度折线数据（逐层单层余弦，可为 None）。
+        entire_euc: 可选累积欧氏距离（entire，自输入累计），以折线叠加在上图。
+        entire_cos: 可选累积余弦相似度（entire），以折线叠加在下图。
+        mse_vals: 可选 MSE 右轴折线数据。
+        save_path: 保存路径。
+    """
+    from matplotlib import axes
+    import matplotlib.pyplot as plt
+
+    # 数据长度：从任一可用数组推断（names 优先），用于 x 轴范围与刻度
+    n = 0
+    for arr in (names, single_euc, single_cos, entire_euc, entire_cos, mse_vals):
+        if arr is not None:
+            n = len(arr)
+            break
+    layer_index = np.arange(n)
+
+    # 两个子图始终创建（即使无数据也保留）
+    fig, (ax_euc, ax_cos) = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
+    ax_euc:axes.Axes
+    ax_cos:axes.Axes
+
+    # ---- 上图：欧氏距离（分支：只画有数据的部分）----
+    extra_axes: list[axes.Axes] = []
+    has_euc_data = False
+
+    if single_euc is not None:
+        single_euc = np.asarray(single_euc, dtype=np.float64)
+        # 数据清洗：避免 log(0) 报错，将绝对的 0 值替换为极小值
+        euc_plot = single_euc.copy()
+        euc_plot[euc_plot == 0] = 1e-10
+        ax_euc.set_yscale('linear')
+        ax_euc.bar(layer_index, euc_plot, color='skyblue', edgecolor='black',
+                    linewidth=0.5, alpha=0.7, label='Euc Dist Per Layer')
+        has_euc_data = True
+
+    if entire_euc is not None:
+        # 累积欧氏距离与单层欧氏距离使用同一坐标刻度
+        entire_euc_plot = np.asarray(entire_euc, dtype=np.float64).copy()
+        entire_euc_plot[entire_euc_plot == 0] = 1e-10
+        ax_euc.plot(layer_index, entire_euc_plot, color=entire_val_color, marker='.',
+                    linestyle='-', linewidth=1.5, markersize=2, label='Euc (entire)')
+        has_euc_data = True
+
+    if mse_vals is not None:
+        # 右侧纵轴：MSE（量级可能千分之一~个位，与欧氏距离的几十上百分离显示）
+        ax_mse = ax_euc.twinx()
+        ax_mse.plot(layer_index, mse_vals, color='purple', marker='.', linestyle='-',
+                    linewidth=1, markersize=2, label='MSE Per Layer')
+        ax_mse.set_ylabel('MSE', fontsize=12)
+        extra_axes.append(ax_mse)
+        has_euc_data = True
+
+    ax_euc.set_title(f'Euclidean Distance', fontsize=14, fontweight='bold')
+    ax_euc.set_ylabel('Euclidean Distance', fontsize=12)
+    ax_euc.grid(True, which="both", ls="--", alpha=0.5)
+    if has_euc_data:
+        # 合并右轴（MSE）与左轴（柱状 / entire）的图例
+        lines, labels = ax_euc.get_legend_handles_labels()
+        for ax in extra_axes:
+            l, lab = ax.get_legend_handles_labels()
+            lines += l
+            labels += lab
+        if lines:
+            ax_euc.legend(lines, labels, loc='upper left')
+
+    # ---- 下图：余弦相似度（分支：只画有数据的部分）----
+    has_cos_data = False
+
+    if single_cos is not None:
+        single_cos = np.asarray(single_cos, dtype=np.float64)
+        # 数据清洗：将恰好等于 0 的余弦值置为 NaN，matplotlib 会跳过这些点且不连线，
+        # 避免异常的 0 值把 y 轴显示范围压扁（正常余弦值集中在 0.98~1.0 附近）
+        cos_sim_plot = np.where(single_cos == 0.0, np.nan, single_cos)
+        single_label = 'Cosine (single)' if entire_cos is not None else 'Per Layer'
+        ax_cos.set_yscale('linear')
+        ax_cos.plot(layer_index, cos_sim_plot, color='green', marker='.',
+                    linestyle='-', linewidth=1, markersize=2, label=single_label)
+        has_cos_data = True
+
+    if entire_cos is not None:
+        entire_cos_plot = np.where(np.asarray(entire_cos) == 0.0, np.nan, np.asarray(entire_cos))
+        ax_cos.plot(layer_index, entire_cos_plot, color=entire_val_color, marker='.',
+                    linestyle='-', linewidth=1.5, markersize=2, label='Cosine (entire)')
+        has_cos_data = True
+
+    ax_cos.set_title('Cosine Similarity', fontsize=14, fontweight='bold')
+    ax_cos.set_ylabel('Cosine Similarity', fontsize=12)
+    ax_cos.set_xticks(layer_index)
+    if names is not None:
+        ax_cos.set_xticklabels(names, rotation=-45, ha='left', fontsize=10)
+    if has_cos_data:
+        ax_cos.axhline(0.99, color='red', linestyle='--', linewidth=1, alpha=0.6,
+                        label='Warning Threshold (0.99)')
+        ax_cos.legend()
+    ax_cos.grid(True, which="both", ls="--", alpha=0.5)
+
+    # 消除 x 轴两端默认的 5% 空白边距（留半个柱宽避免首尾柱被裁切）
+    if n > 0:
+        ax_cos.set_xlim(-0.5, n - 0.5)
+
+    # 调整布局、保存并显示
+    plt.tight_layout()
+    if save_path is not None:
+        save_path = Path(save_path).resolve()
+
+        plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+    plt.show()
+
+    return save_path
+
 
 
 class RknnAccuracyDebugger:
@@ -136,52 +263,66 @@ class RknnAccuracyDebugger:
         single_cos = np.array([r['single_cos'] for r in rows], dtype=float)
         single_euc = np.array([r['single_euc'] for r in rows], dtype=float)
 
-        # 图例颜色/样式与 QNN 精度分析保持一致
-        fig, (ax_euc, ax_cos) = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
-        ax_euc:axes.Axes
-        ax_cos:axes.Axes
-
-        # 图1：欧氏距离（逐层柱状）+ 累积欧氏距离（右侧纵轴折线）
-        ax_euc.set_yscale('linear')
-        ax_euc.bar(x, single_euc, color='skyblue', edgecolor='black', linewidth=0.5, alpha=0.7, label='Euc Dist Per Layer')
-        ax_euc.set_title('Euclidean Distance & Euc(entire) (Per Layer)', fontsize=14, fontweight='bold')
-        ax_euc.set_ylabel('Euclidean Distance', fontsize=12)
-        ax_euc.grid(True, which='both', ls='--', alpha=0.5)
-
-        # 右侧纵轴：累积欧氏距离（entire，与单层欧氏距离量级接近，分离显示便于对比）
-        ax_entire = ax_euc.twinx()
-        ax_entire.plot(x, entire_euc, color='orange', marker='.', linestyle='-', linewidth=1.5, markersize=2, label='Euc (entire)')
-        ax_entire.set_ylabel('Euc (entire)', fontsize=12)
-
-        # 合并两个轴的图例
-        lines_euc, labels_euc = ax_euc.get_legend_handles_labels()
-        lines_entire, labels_entire = ax_entire.get_legend_handles_labels()
-        ax_euc.legend(lines_euc + lines_entire, labels_euc + labels_entire, loc='upper left')
-
-        # 图2：余弦相似度（逐层折线）
-        ax_cos.set_yscale('linear')
-        ax_cos.plot(x, single_cos, color='green', marker='.', linestyle='-', linewidth=1, markersize=2, label='Cosine (single)')
-        ax_cos.plot(x, entire_cos, color='orange', marker='.', linestyle='-', linewidth=1.5, markersize=2, label='Cosine (entire)')
-        ax_cos.set_title('Cosine Similarity (Per Layer)', fontsize=14, fontweight='bold')
-        ax_cos.set_ylabel('Cosine Similarity', fontsize=12)
-        ax_cos.set_xticks(range(n))
-        ax_cos.set_xticklabels(layer_names, rotation=-45, ha='left', fontsize=10)
-
-        ax_cos.axhline(0.99, color='red', linestyle='--', linewidth=1, alpha=0.6, label='Warning Threshold (0.99)')
-        ax_cos.legend(loc='lower left')
-        ax_cos.grid(True, which='both', ls='--', alpha=0.5)
-
-        # 消除 x 轴两端默认的 5% 空白边距（留半个柱宽避免首尾柱被裁切）
-        ax_cos.set_xlim(-0.5, n - 0.5)
-
-
-        plt.tight_layout()
         save_path = self.tmp_dir / 'rknn_accuracy_analysis_summary.png'
-        # self.file_or_dir_to_clean.append(save_path)
 
-        plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {save_path}")
-        plt.show()
+        plot_accuracy_summary(
+            names=layer_names,
+            single_euc=single_euc,
+            single_cos=single_cos,
+            entire_euc=entire_euc,
+            entire_cos=entire_cos,
+            entire_val_color="orange",
+            save_path=save_path,
+        )
+
+        self.file_or_dir_to_clean.append(save_path)
+
+        # # 图例颜色/样式与 QNN 精度分析保持一致
+        # fig, (ax_euc, ax_cos) = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
+        # ax_euc:axes.Axes
+        # ax_cos:axes.Axes
+
+        # # 图1：欧氏距离（逐层柱状）+ 累积欧氏距离（右侧纵轴折线）
+        # ax_euc.set_yscale('linear')
+        # ax_euc.bar(x, single_euc, color='skyblue', edgecolor='black', linewidth=0.5, alpha=0.7, label='Euc Dist Per Layer')
+        # ax_euc.set_title('Euclidean Distance & Euc(entire) (Per Layer)', fontsize=14, fontweight='bold')
+        # ax_euc.set_ylabel('Euclidean Distance', fontsize=12)
+        # ax_euc.grid(True, which='both', ls='--', alpha=0.5)
+
+        # # 右侧纵轴：累积欧氏距离（entire，与单层欧氏距离量级接近，分离显示便于对比）
+        # ax_entire = ax_euc.twinx()
+        # ax_entire.plot(x, entire_euc, color='orange', marker='.', linestyle='-', linewidth=1.5, markersize=2, label='Euc (entire)')
+        # ax_entire.set_ylabel('Euc (entire)', fontsize=12)
+
+        # # 合并两个轴的图例
+        # lines_euc, labels_euc = ax_euc.get_legend_handles_labels()
+        # lines_entire, labels_entire = ax_entire.get_legend_handles_labels()
+        # ax_euc.legend(lines_euc + lines_entire, labels_euc + labels_entire, loc='upper left')
+
+        # # 图2：余弦相似度（逐层折线）
+        # ax_cos.set_yscale('linear')
+        # ax_cos.plot(x, single_cos, color='green', marker='.', linestyle='-', linewidth=1, markersize=2, label='Cosine (single)')
+        # ax_cos.plot(x, entire_cos, color='orange', marker='.', linestyle='-', linewidth=1.5, markersize=2, label='Cosine (entire)')
+        # ax_cos.set_title('Cosine Similarity (Per Layer)', fontsize=14, fontweight='bold')
+        # ax_cos.set_ylabel('Cosine Similarity', fontsize=12)
+        # ax_cos.set_xticks(range(n))
+        # ax_cos.set_xticklabels(layer_names, rotation=-45, ha='left', fontsize=10)
+
+        # ax_cos.axhline(0.99, color='red', linestyle='--', linewidth=1, alpha=0.6, label='Warning Threshold (0.99)')
+        # ax_cos.legend(loc='lower left')
+        # ax_cos.grid(True, which='both', ls='--', alpha=0.5)
+
+        # # 消除 x 轴两端默认的 5% 空白边距（留半个柱宽避免首尾柱被裁切）
+        # ax_cos.set_xlim(-0.5, n - 0.5)
+
+
+        # plt.tight_layout()
+        # save_path = self.tmp_dir / 'rknn_accuracy_analysis_summary.png'
+        # # self.file_or_dir_to_clean.append(save_path)
+
+        # plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
+        # print(f"Figure saved to: {save_path}")
+        # plt.show()
 
     # ------------------------------------------------------------------
     # 带路径追踪的精度分析：从多个输入到多个输出的排列组合路径
@@ -513,113 +654,84 @@ class RknnAccuracyDebugger:
         clean_files_or_dirs(self.file_or_dir_to_clean)
 
 
-class SnpeAccuracyDebugger:
-    def __init__(self, tmp_dir:str, onnx_path:str, debugger_picture_list:list[str], run_subprocess:Callable[[str], int], qairt_script):
-        self.tmp_dir = Path(tmp_dir).resolve()
-        self.onnx_path = Path(onnx_path).resolve()
+class QAIRTAccuracyDebugger:
+    """基于 qnn-net-run --dlc_path --debug 的双 DLC 精度对比分析器（独立类）。
 
-        self.debugger_picture_list:list[Path] = []
-        for i in range(len(debugger_picture_list)):
-            p = Path(debugger_picture_list[i]).resolve()
-            if p.exists():
-                self.debugger_picture_list.append(p)
-            else:
-                raise ValueError(f"Accuracy analysis data not found: {p}")
+    直接用两个 DLC 作为材料（FP32 golden + 量化 target）：
+      1) 各跑一次 qnn-net-run --dlc_path <dlc> --backend <lib> --input_list <raw列表> --debug，
+         得到每层输出（Result_0/*.raw，文件名 = sanitized 张量名）；
+      2) 按张量名匹配，手动计算 cosine / 绝对欧氏距离 ||x-y||2 / mse；
+      3) 渲染 AccuracyGraph（HTML，cos+euc 双着色）+ plot_accuracy_summary（PNG）+ CSV。
 
-        self.command_runnr = run_subprocess
+    backend 选择（x86 实测结论）：
+      - FP32 DLC -> CPU 后端（libQnnCpu.so；HTP 要求量化模型）
+      - 量化 DLC -> HTP 后端（libQnnHtp.so；CPU 后端拒绝量化/16bit 激活中间层）
+    """
+
+    def __init__(self, tmp_dir:str, onnx_path:str=None, debugger_picture_list:list=None, qairt_script=None):
 
         from onnx_to_qnn import QAIRTScript
-        self.qairt_script:QAIRTScript = qairt_script
-
-        # working_dir 是 snpe-accuracy-debugger 的 --working_dir，其内部依赖符号链接（golden/quant 输出目录）
-        # tmp_dir 所在文件系统支持符号链接时优先放在tmp_dir 下便于统一清理；
-        # 不支持时（无开发者模式的 Windows / 部分网络盘）回退到用户主目录。
+        
+        self.tmp_dir = Path(tmp_dir).resolve()
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
-        self.working_dir_in_tmp_dir = self._can_create_symlink(self.tmp_dir)
-        if self.working_dir_in_tmp_dir:
-            self.working_dir = self.tmp_dir / 'accuracy_analysis'
+        self.working_dir = self.tmp_dir / 'qnn_accuracy_analysis'
+        self.onnx_path = Path(onnx_path).resolve()
+        self.debugger_picture_list = [Path(p).resolve() for p in (debugger_picture_list or []) if Path(p).exists()]
+        
+        self.qairt_script:QAIRTScript = qairt_script
+        self.qairt_sdk_root = Path(getattr(self.qairt_script, 'qairt_sdk_root', None) or os.environ.get('QAIRT_SDK_ROOT'))
+
+        if self.qairt_script is not None:
+            self.exe_qnn_net_run = self.qairt_script.get_tool('qnn-net-run')
+            self.platform_arch = self.qairt_script.current_platform_arch()
+            self.backend_lib_golden = self.qairt_script.get_lib('libQnnCpu')
+            # HTP 后端在 x86_64 Windows 上无执行路径（无 QEMU 模拟器、无平台 stub/skel，
+            # 仅 aarch64/arm64x Windows 有真实 NPU），QnnHtp.dll 初始化会让 qnn-net-run 卡死。
+            # x86_64 Linux 通过 QEMU 模拟器可运行，故仅 x86_64 Windows 回退到 CPU 后端。
+            if self.platform_arch == 'x86_64-windows-msvc':
+                print("[QAIRTAccuracyDebugger] x86_64-windows-msvc: HTP backend unavailable "
+                      "(no simulator/platform libs); using CPU backend for target DLC too.")
+                self.backend_lib_target = self.backend_lib_golden
+            else:
+                self.backend_lib_target = self.qairt_script.get_lib('libQnnHtp')
         else:
-            print(f"[SnpeAccuracyDebugger] tmp_dir does not support symlink creation, falling back to working_dir={Path.home() / 'accuracy_analysis'}")
-            self.working_dir = Path.home() / 'accuracy_analysis'
+            self.platform_arch = 'x86_64-linux-clang'
+            self.exe_qnn_net_run = str(self.qairt_sdk_root / 'bin' / self.platform_arch / 'qnn-net-run')
+            self.backend_lib_golden = self.qairt_sdk_root / 'lib' / self.platform_arch / 'libQnnCpu.so'
+            self.backend_lib_target = self.qairt_sdk_root / 'lib' / self.platform_arch / 'libQnnHtp.so'
 
-        if self.working_dir_in_tmp_dir:
-            self.tmp_working_dir = self.working_dir
-        else:
-            self.tmp_working_dir = self.tmp_dir / 'accuracy_analysis'
-            
-        self.golden_dir = self.working_dir / 'golden_dir'
-        self.quant_dir = self.working_dir / 'quant_dir'
+        self.onnx_info: dict = {}
+        self.file_or_dir_to_clean: list[str] = [str(self.working_dir)]
 
-        self.file_or_dir_to_clean:list[str] = []
-        self.file_or_dir_to_clean.append(self.working_dir)
-        self.file_or_dir_to_clean.append(self.tmp_working_dir)
-        self.file_or_dir_to_clean.append(str(self.tmp_dir / "working_directory"))
+    # ------------------------------------------------------------------
+    # 模型信息 / 通用工具
+    # ------------------------------------------------------------------
 
-    def set_model_inof(self, onnx_info:dict, golden_dlc_path:str, quant_dlc_path:str):
-        self.onnx_info = onnx_info
-        self.golden_dlc_path = Path(golden_dlc_path).resolve()
-        self.quant_dlc_path = Path(quant_dlc_path).resolve()
+    def set_model_info(self, onnx_info: dict):
+        """设置模型输入/输出信息（prepare_input_data 需要 inputs 的名称与形状）。"""
+        self.onnx_info = onnx_info or {}
 
-    @staticmethod
-    def _can_create_symlink(directory: Path) -> bool:
-        """探测 directory 所在文件系统是否支持创建符号链接（探测后立即清理）。
 
-        Windows 上创建符号链接需要开发者模式或管理员权限，否则 os.symlink 抛
-        OSError（如 WinError 1314: A required privilege is not held by the client）；
-        部分网络盘/旧文件系统也不支持。失败一律返回 False。
+    def prepare_input_data(self, mean_rgb: list = [[0, 0, 0]], std_rgb: list = [[1, 1, 1]],
+                           set_input_order: str = 'nchw') -> str:
+        """根据 debugger_picture_list 与 ONNX 输入信息生成输入 raw 与 input_list。
+
+        返回 input_list 文件路径（qnn-net-run 格式：每行一个样本，多输入用空格分隔）。
         """
-        probe = directory / f'.symlink_probe_{os.getpid()}'
-        try:
-            probe.symlink_to(directory, target_is_directory=True)
-            return probe.is_symlink()
-        except (OSError, NotImplementedError):
-            return False
-        finally:
-            try:
-                if probe.is_symlink() or probe.exists():
-                    probe.unlink()
-            except OSError:
-                pass
-
-    @staticmethod
-    def find_latest_subdir(base_dir: Path) -> Path:
-        """在 base_dir 下找到最新的子文件夹（按修改时间，最新者优先）"""
-        base_dir = Path(base_dir)
-        if not base_dir.exists():
-            raise FileNotFoundError(f"base directory not found: {base_dir}")
-
-        subdirs = sorted(
-            [d for d in base_dir.iterdir() if d.is_dir()],
-            key=lambda d: d.stat().st_mtime,   # 按修改时间排序（替代原来的按目录名排序）
-            reverse=True
-        )
-        if not subdirs:
-            raise FileNotFoundError(f"No subdirectories found in {base_dir}")
-
-        latest = subdirs[0]
-        print(f"Latest subdirectory: {latest}")
-        return latest
-
-    def prepare_input_data(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]], set_input_order:str='nchw'):
-        analysis_input_dir = self.tmp_working_dir / f'analysis_inputs'
+        analysis_input_dir = self.working_dir / 'analysis_inputs'
         analysis_input_dir.mkdir(exist_ok=True)
 
-        input_infos:list[dict[str, str|list[int]]] = self.onnx_info['inputs']
-        output_infos:list[dict[str, str|list[int]]] = self.onnx_info['outputs']
-
-        input_tensor_path_list:list[str] = []
-        input_arg_list:list[str] = []
-        output_arg_list:list[str] = []
+        input_infos = self.onnx_info.get('inputs') or [{'name': 'input0', 'shape': [1, 3, 320, 320]}]
+        input_tensor_path_list: list[str] = []
 
         for i, input_info in enumerate(input_infos):
             mean_value = mean_rgb[i % len(mean_rgb)]
             std_value = std_rgb[i % len(std_rgb)]
             image_path = self.debugger_picture_list[i % len(self.debugger_picture_list)]
 
-            input_name:str = input_info["name"]
-            input_shape:list[int] = input_info["shape"] # nchw
+            input_name = input_info['name']
+            input_shape = input_info['shape']  # nchw
             channels, height, width = input_shape[1], input_shape[2], input_shape[3]
-
 
             if image_path.suffix == '.npy':
                 image_float = np.load(str(image_path))
@@ -628,418 +740,181 @@ class SnpeAccuracyDebugger:
             else:
                 image = cv2.imread(str(image_path))
                 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-                # 将图片缩放到目标空间尺寸
-                image_resized = cv2.resize(image_rgb, (width, height))  # [H, W, 3]
+                image_resized = cv2.resize(image_rgb, (width, height))
                 image_float = image_resized.astype(np.float32)
-
-                # mean_arr = np.array(mean_value, dtype=np.float32)
-                # std_arr = np.array(std_value, dtype=np.float32)
-                # image_float = (image_float - mean_arr) / std_arr
-
-                # 处理通道数不匹配的情况（如 [1,96,16,16] NCHW）
                 if channels != 3:
                     image_float = cv2.cvtColor(image_float, cv2.COLOR_RGB2GRAY)
-                    image_float = np.tile(image_float, (1, 1, channels))[:, :, :channels] # 裁剪到精确通道数
-
-                image_float = np.expand_dims(image_float, axis=0)  # [1, H, W, C]
-
+                    image_float = np.tile(image_float, (1, 1, channels))[:, :, :channels]
+                image_float = np.expand_dims(image_float, axis=0)
                 if set_input_order == 'nchw':
-                    # [1, H, W, C] -> [1, C, H, W]
                     image_float = np.transpose(image_float, (0, 3, 1, 2))
 
-
             input_tensor_path = str(analysis_input_dir / f'{input_name}.raw')
-            input_shape_str = str(image_float.shape).replace('(', '').replace(')', '').replace(' ', '')
-
             image_float.tofile(input_tensor_path)
-            print(image_float.shape, image_float.max(), image_float.min())
-
+            print(f"[QAIRTAccuracyDebugger] input {input_name}: {image_float.shape} -> {input_tensor_path}")
             input_tensor_path_list.append(input_tensor_path)
-            input_arg_list.append(f'--input_tensor "{input_name}" {input_shape_str} {input_tensor_path}')
-            
 
-        for output_info in output_infos:
-            output_name:str = output_info["name"]
-            output_arg_list.append(f'--output_tensor "{output_name}"')
+        input_list = self.working_dir / 'input_list.txt'
+        with open(input_list, 'w') as f:
+            f.write(' '.join(input_tensor_path_list) + '\n')
+        print(f"[QAIRTAccuracyDebugger] input_list: {input_list}")
+        return str(input_list)
 
+    def run_qnn_net_run(self, dlc_path:str, backend_lib:str, input_list:str, output_dir: str) -> int:
+        """执行 qnn-net-run --dlc_path <dlc> --backend <lib> --input_list --output_dir [--debug]。"""
+        qnn_net_run = self.exe_qnn_net_run
 
-        analysis_input_list = str(self.tmp_working_dir / f"analysis_input_list.txt")
-        with open(analysis_input_list, 'w') as f:
-            f.write(' '.join(input_tensor_path_list))
+        cmd = f'{qnn_net_run} --backend "{backend_lib}" --debug --log_level warn'
+        cmd += f' --dlc_path {dlc_path} --input_list {input_list} --output_dir {output_dir}'
 
-        print(f"Accuracy analysis input list: {analysis_input_list}")
-        print(f"Accuracy analysis input tensor args: {input_arg_list}")
-        print(f"Accuracy analysis output tensor args: {output_arg_list}")
-        return analysis_input_list, input_arg_list, output_arg_list
+        return run_command(cmd, signature="[QAIRTAccuracyDebugger]")
 
-    def _plot_accuracy_summary(self, names:list[str]=None, euc_vals:np.ndarray=None, cos_sim:np.ndarray=None, 
-                               entire_euc:np.ndarray=None, entire_cos:np.ndarray=None,
-                               mse_vals=None, title_suffix='', save_path=None):
-        """统一的逐层精度可视化：欧氏距离柱状图 + 余弦相似度折线图（两个子图始终保留）。
+    # ------------------------------------------------------------------
+    # 主入口：双 DLC 对比
+    # ------------------------------------------------------------------
 
-        使用分支按传入数据绘制：只画实际存在的数据（None 则跳过该部分），
-        即使某子图没有任何数据也会保留该子图（显示标题、坐标轴与网格，不报错）。
+    def accuracy_analysis(self, golden_dlc_path: str, target_dlc_path: str,
+                          mean_rgb: list = [[0, 0, 0]], std_rgb: list = [[1, 1, 1]],
+                          set_input_order: str = 'nchw') -> int:
+        """双 DLC 精度对比主入口：
+        1) qnn-net-run 跑 FP32 DLC（CPU 后端）拿每层输出；
+        2) qnn-net-run 跑量化 DLC（HTP 后端）拿每层输出；
+        3) 逐层计算 cosine / 欧氏距离 / mse；
+        4) 渲染 PNG + (可选 HTML) + CSV。
 
         Args:
-            names: x 轴刻度标签（可为 None）。
-            euc_vals: 欧氏距离柱状数据（逐层单层误差，可为 None）。
-            cos_sim: 余弦相似度折线数据（逐层单层余弦，可为 None）。
-            entire_euc: 可选累积欧氏距离（entire，自输入累计），以折线叠加在上图。
-            entire_cos: 可选累积余弦相似度（entire），以折线叠加在下图。
-            mse_vals: 可选 MSE 右轴折线数据。
-            save_path: 保存路径。
-            title_suffix: 标题后缀。
+            golden_dlc_path: FP32（未量化）DLC 路径。
+            target_dlc_path: 量化 DLC 路径。
+            backend_golden / backend_target: 覆盖默认后端 lib 名。
         """
-        from matplotlib import axes
-        import matplotlib.pyplot as plt
+        self.working_dir.mkdir(parents=True, exist_ok=True)
 
-        # 数据长度：从任一可用数组推断（names 优先），用于 x 轴范围与刻度
-        n = 0
-        for arr in (names, euc_vals, cos_sim, entire_euc, entire_cos, mse_vals):
-            if arr is not None:
-                n = len(arr)
-                break
-        layer_index = np.arange(n)
+        input_list = self.prepare_input_data(mean_rgb, std_rgb, set_input_order)
 
-        # 两个子图始终创建（即使无数据也保留）
-        fig, (ax_euc, ax_cos) = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
-        ax_euc:axes.Axes
-        ax_cos:axes.Axes
+        names, entire_cos, entire_euc, mse_vals = self.entire_accuracy_analysis(golden_dlc_path, target_dlc_path, input_list)
 
-        # ---- 上图：欧氏距离（分支：只画有数据的部分）----
-        extra_axes: list[axes.Axes] = []
-        has_euc_data = False
-
-        if euc_vals is not None:
-            euc_vals = np.asarray(euc_vals, dtype=np.float64)
-            # 数据清洗：避免 log(0) 报错，将绝对的 0 值替换为极小值
-            euc_plot = euc_vals.copy()
-            euc_plot[euc_plot == 0] = 1e-10
-            ax_euc.set_yscale('linear')
-            ax_euc.bar(layer_index, euc_plot, color='skyblue', edgecolor='black',
-                       linewidth=0.5, alpha=0.7, label='Euc Dist Per Layer')
-            has_euc_data = True
-
-        if entire_euc is not None:
-            # 累积欧氏距离与单层欧氏距离使用同一坐标刻度
-            entire_euc_plot = np.asarray(entire_euc, dtype=np.float64).copy()
-            entire_euc_plot[entire_euc_plot == 0] = 1e-10
-            ax_euc.plot(layer_index, entire_euc_plot, color='purple', marker='.',
-                        linestyle='-', linewidth=1.5, markersize=2, label='Euc (entire)')
-            has_euc_data = True
-
-        if mse_vals is not None:
-            # 右侧纵轴：MSE（量级可能千分之一~个位，与欧氏距离的几十上百分离显示）
-            ax_mse = ax_euc.twinx()
-            ax_mse.plot(layer_index, mse_vals, color='blue', marker='.', linestyle='-',
-                        linewidth=1, markersize=2, label='MSE Per Layer')
-            ax_mse.set_ylabel('MSE', fontsize=12)
-            extra_axes.append(ax_mse)
-            has_euc_data = True
-
-        ax_euc.set_title(f'Euclidean Distance (Per Layer){title_suffix}', fontsize=14, fontweight='bold')
-        ax_euc.set_ylabel('Euclidean Distance', fontsize=12)
-        ax_euc.grid(True, which="both", ls="--", alpha=0.5)
-        if has_euc_data:
-            # 合并右轴（MSE）与左轴（柱状 / entire）的图例
-            lines, labels = ax_euc.get_legend_handles_labels()
-            for ax in extra_axes:
-                l, lab = ax.get_legend_handles_labels()
-                lines += l
-                labels += lab
-            if lines:
-                ax_euc.legend(lines, labels, loc='upper left')
-
-        # ---- 下图：余弦相似度（分支：只画有数据的部分）----
-        has_cos_data = False
-
-        if cos_sim is not None:
-            cos_sim = np.asarray(cos_sim, dtype=np.float64)
-            # 数据清洗：将恰好等于 0 的余弦值置为 NaN，matplotlib 会跳过这些点且不连线，
-            # 避免异常的 0 值把 y 轴显示范围压扁（正常余弦值集中在 0.98~1.0 附近）
-            cos_sim_plot = np.where(cos_sim == 0.0, np.nan, cos_sim)
-            single_label = 'Cosine (single)' if entire_cos is not None else 'Per Layer'
-            ax_cos.set_yscale('linear')
-            ax_cos.plot(layer_index, cos_sim_plot, color='green', marker='.',
-                        linestyle='-', linewidth=1, markersize=2, label=single_label)
-            has_cos_data = True
-
-        if entire_cos is not None:
-            entire_cos_plot = np.where(np.asarray(entire_cos) == 0.0, np.nan, np.asarray(entire_cos))
-            ax_cos.plot(layer_index, entire_cos_plot, color='purple', marker='.',
-                        linestyle='-', linewidth=1.5, markersize=2, label='Cosine (entire)')
-            has_cos_data = True
-
-        ax_cos.set_title('Cosine Similarity (Per Layer)', fontsize=14, fontweight='bold')
-        ax_cos.set_ylabel('Cosine Similarity', fontsize=12)
-        ax_cos.set_xticks(layer_index)
-        if names is not None:
-            ax_cos.set_xticklabels(names, rotation=-45, ha='left', fontsize=10)
-        if has_cos_data:
-            ax_cos.axhline(0.99, color='red', linestyle='--', linewidth=1, alpha=0.6,
-                           label='Warning Threshold (0.99)')
-            ax_cos.legend()
-        ax_cos.grid(True, which="both", ls="--", alpha=0.5)
-
-        # 消除 x 轴两端默认的 5% 空白边距（留半个柱宽避免首尾柱被裁切）
-        if n > 0:
-            ax_cos.set_xlim(-0.5, n - 0.5)
-
-        # 调整布局、保存并显示
-        plt.tight_layout()
-        if save_path is not None:
-            save_path = Path(save_path).resolve()
-            self.file_or_dir_to_clean.append(save_path)
-
-            plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
-            print(f"Figure saved to: {save_path}")
-        plt.show()
-
-
-    def qnn_infer(self, working_dir:str, dlc_model:str, analysis_input_list:list, input_arg_list:list, output_arg_list:list) -> int:
-        architecture = self.qairt_script.PLATFORM_BIN_DIRS[self.qairt_script.current_platform_key()]
-        qnn_sdk_root = os.environ.get('QNN_SDK_ROOT')
-
-        input_tensor_args = ' '.join(input_arg_list)
-        output_tensor_args = ' '.join(output_arg_list)
-
-        # 通过包装器执行 snpe-accuracy-debugger：绕过 SDK 内部 UTF-8 decode 崩溃
-        # （中文 Windows 下 PowerShell 输出 GBK），不改 SDK 文件。
-        # 工具前缀按平台自动适配；--architecture 同样平台化。
-        python_exe = os.environ.get('QAIRT_PYTHON') or sys.executable
-        wrapper = Path(__file__).parent / 'snpe_accuracy_debugger_wrapper.py'
-        command = f'"{python_exe}" "{wrapper}" --inference_engine'
-        command += f" --working_dir {str(working_dir)}"
-        command += f" --engine_path {qnn_sdk_root}"
-        command += f" --architecture {architecture}"
-        command += f" --framework onnx"
-        command += f" --runtime cpu"
-        command += f" --stage converted"
-
-        command += f" --model_path {str(self.onnx_path)}"
-        command += f" --static_model {str(dlc_model)}"
-        command += f" --input_list {analysis_input_list}"
-        command += f" {input_tensor_args}"
-        command += f" {output_tensor_args}"
-
-        #command += f" --verbose"
-
-        ret = self.command_runnr(command)
-        return ret
-    
-    def analysis_results(self) -> int:
-        self.qairt_script
-
-        framework_runner_dir = self.find_latest_subdir(self.golden_dir / 'inference_engine')
-        inference_engine_dir = self.find_latest_subdir(self.quant_dir / 'inference_engine')
-
-        # 同 qnn_infer：通过包装器执行，绕过 SDK 内部 UTF-8 decode 崩溃
-        python_exe = os.environ.get('QAIRT_PYTHON') or sys.executable
-        wrapper = Path(__file__).parent / 'snpe_accuracy_debugger_wrapper.py'
-        command = f'"{python_exe}" "{wrapper}" --verification'
-        command += f" --working_dir {str(self.working_dir)}"
-
-        command += f" --default_verifier CosineSimilarity"
-        command += f" --default_verifier MSE"
-        command += f" --golden_output_reference_directory {framework_runner_dir}"
-        command += f" --inference_results {inference_engine_dir}"
-        command += f" --tensor_mapping {inference_engine_dir}/tensor_mapping.json"
-        command += f" --graph_struct {inference_engine_dir}/model_graph_struct.json"
-
-        command += f" --verbose"
-
-        ret = self.command_runnr(command)
-        return ret
-
-    def snpe_accuracy_analysis(self, verification_dir:str):
-        # 1. 找到最新的 summary.csv
-        file_path = verification_dir / 'summary.csv'
-        print(f"Loading summary from: {file_path}")
-        df = pd.read_csv(file_path)
-
-        # 提取关键列
-        sizes = df['Size'].values
-        mses = df['mse'].values.astype(np.float32)
-        cossim = df["cosinesimilarity"].values.astype(np.float32)
-
-        try:
-            names = df['Target Name'].values
-        except KeyError:
-            try:
-                names = df['Name'].values
-            except KeyError:
-                names = None
-
-        # 2. 核心计算
-        squared_errors = mses * sizes # 计算每一层的误差平方和 (SSE)
-
-        layer_euc = np.sqrt(squared_errors) # 逐层欧氏距离
-
-        # 3. 可视化绘图（复用统一绘图方法）
-        self._plot_accuracy_summary(
+        # 统计显示 1：PNG 双子图（欧氏距离柱状 + 余弦折线）
+        plot_accuracy_summary(
             names=names,
-            entire_euc=layer_euc,
-            entire_cos=cossim,
-            mse_vals=mses,
+            entire_euc=entire_euc,
+            entire_cos=entire_cos,
+            mse_vals=mse_vals,
+            entire_val_color="blue",
             save_path=self.tmp_dir / 'qnn_accuracy_analysis_summary.png',
         )
 
-        # 4. Netron 风格网络图（AccuracyGraph：按 ONNX 图结构展示 + 累积精度着色）
-        #    snpe_accuracy_analysis 只有 entire 分析：summary.csv 的逐层结果即为自输入
-        #    累积误差（entire_cos / entire_euc），不含 single（单层）数据，因此构建
-        #    results 时 single_cos / single_euc 置 None（AccuracyGraph 显示 single=n/a，
-        #    仅用 entire 着色）。
-        if names is not None:
+        # 统计显示 2：AccuracyGraph HTML（若有 ONNX 可建图结构）
+        if self.onnx_path is not None:
             self._plot_network_analysis_entire_only(
-                names=names,
-                entire_cos=cossim,
-                entire_euc=layer_euc,
-                mse_vals=mses,
+                names=names, entire_cos=entire_cos, entire_euc=entire_euc, mse_vals=mse_vals,
             )
 
+        return 0
+
+    def clean(self):
+        clean_files_or_dirs(self.file_or_dir_to_clean)
+
+
+    def entire_accuracy_analysis(self, golden_dlc_path:str, target_dlc_path:str, input_list:str) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray]:
+        golden_dir = self.working_dir / 'golden_output'
+        target_dir = self.working_dir / 'target_output'
+        for d in (golden_dir, target_dir):
+            if d.exists():
+                shutil.rmtree(d)
+            d.mkdir(parents=True)
+
+        ret = self.run_qnn_net_run(golden_dlc_path, self.backend_lib_golden, input_list, str(golden_dir))
+        if ret != 0:
+            raise RuntimeError(f"qnn-net-run golden DLC failed with code {ret}")
+        
+        ret = self.run_qnn_net_run(target_dlc_path, self.backend_lib_target, input_list, str(target_dir))
+        if ret != 0:
+            raise RuntimeError(f"qnn-net-run target DLC failed with code {ret}")
+
+        names, entire_cos, entire_euc, mse_vals = self._compare_dlc_outputs(golden_dir, target_dir)
+        return names, entire_cos, entire_euc, mse_vals
+
+    def _compare_dlc_outputs(self, golden_dir: Path, target_dir: Path):
+        """读两个 Result_0 目录，按张量名（sanitized 文件名）匹配，算 cos/euc/mse。"""
+        def load(d):
+            out = {}
+            for p in Path(d).rglob('*.raw'):
+                out[p.stem] = np.fromfile(p, dtype=np.float32)
+            return out
+
+        gold = load(golden_dir)
+        targ = load(target_dir)
+        common = {n for n in gold if n in targ and gold[n].size == targ[n].size}
+        # 优先按 ONNX 计算图顺序排序；不在图中的额外张量（如 hybrid 转换节点）排后面
+        if self.onnx_path is not None:
+            graph = self._build_onnx_tensor_graph()
+            order = [n for n in graph['order'] if n in common]
+            order += sorted(common - set(order))
+        else:
+            order = sorted(common)
+        print(f"[QAIRTAccuracyDebugger] matched layers: {len(order)}")
+
+        names, cos, euc, mse = [], [], [], []
+        for n in order:
+            a, b = gold[n], targ[n]
+            names.append(n)
+            cos.append(float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12)))
+            euc.append(float(np.linalg.norm(a - b)))
+            mse.append(float(np.mean((a - b) ** 2)))
+        return names, np.asarray(cos), np.asarray(euc), np.asarray(mse)
+
+    # ------------------------------------------------------------------
+    # 渲染：AccuracyGraph（HTML）与结果组织
+    # ------------------------------------------------------------------
+
     def _plot_network_analysis_entire_only(self, names, entire_cos, entire_euc, mse_vals=None):
-        """snpe_accuracy_analysis 专用：仅基于 entire（累积）数据渲染 AccuracyGraph。
-
-        summary.csv 只提供逐层的累积余弦/欧氏误差（自输入累计），不包含
-        单层误差，因此 single_cos / single_euc 一律置 None，AccuracyGraph
-        悬停面板显示 single=n/a，仅用 entire 着色。
-
-        Args:
-            names: summary.csv 的目标名（SNPE 张量名 / raw 文件名）。
-            entire_cos: 逐层累积余弦相似度。
-            entire_euc: 逐层累积欧氏距离。
-            mse_vals: 可选逐层 MSE（仅记录到节点信息）。
-        """
+        """仅基于 entire（累积）数据渲染 AccuracyGraph：single_cos/single_euc 置 None。"""
         graph = self._build_onnx_tensor_graph()
         node_info = graph['node_info']
 
-        results: list[dict] = []
+        results = []
         for i, name in enumerate(names):
             raw_stem = str(name)
             if raw_stem.endswith('.raw'):
                 raw_stem = raw_stem[:-4]
             tensor = self._match_tensor(raw_stem, graph)
             results.append({
-                'golden': str(name),
-                'infer': None,
-                'tensor': tensor,
+                'golden': str(name), 'infer': None, 'tensor': tensor,
                 'layer_name': graph['tensors'].get(tensor, str(name)) if tensor is not None else str(name),
                 'op_type': node_info.get(tensor)[0] if tensor is not None and tensor in node_info else 'Unknown',
                 'entire_cos': float(entire_cos[i]),
                 'entire_euc': float(entire_euc[i]),
-                'single_cos': None,
-                'single_euc': None,
+                'single_cos': None, 'single_euc': None,
                 'mse': float(mse_vals[i]) if mse_vals is not None else None,
             })
 
         children, parents, _ = self._build_layer_graph(results, graph)
-        self.plot_network_analysis(results, children, parents, graph, show=True)
+        self.draw_network_analysis(results, children, parents, graph, show=True)
 
+    def draw_network_analysis(self, results: list, children: dict, parents: dict,
+                              graph: dict, show: bool = True) -> dict:
+        """接入 AccuracyGraph 渲染 Netron 风格网络图（HTML）。"""
+        real_rows = [{
+            'layer_name': r['layer_name'], 'op_type': r['op_type'],
+            'entire_cos': r['entire_cos'], 'entire_euc': r['entire_euc'],
+            'single_cos': r['single_cos'], 'single_euc': r['single_euc'],
+        } for r in results]
 
-    def accuracy_analysis(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]], set_input_order:str='nhwc') -> int:
-        # 符号链接分支 tmp_working_dir 与 working_dir 为同一目录：先统一去重清理、
-        # 再重建（输入数据由 prepare_input_data 在目录重建后写入），避免 rmtree 互相删除
-        for d in set([self.tmp_working_dir, self.working_dir]): # 去重
-            if d.exists():
-                shutil.rmtree(d)
+        (input_rows, output_rows, input_layers, output_layers,
+         aug_children, aug_parents) = self._build_terminal_nodes(results, children, parents, graph)
 
-        self.tmp_working_dir.mkdir(parents=True, exist_ok=True)
-        self.working_dir.mkdir(parents=True, exist_ok=True)
-        self.golden_dir.mkdir(exist_ok=True)
-        self.quant_dir.mkdir(exist_ok=True)
-
-        analysis_input_list, input_arg_list, output_arg_list = self.prepare_input_data(mean_rgb, std_rgb, set_input_order)
-        ret_golden, ret_quant = 1, 1
-
-
-        # 并行执行 Golden（未量化）和 Quantized（量化）推理，两者互不依赖
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            golden_future = executor.submit(
-                self.qnn_infer, self.golden_dir, self.golden_dlc_path,
-                analysis_input_list, input_arg_list, output_arg_list
-            )
-            quant_future = executor.submit(
-                self.qnn_infer, self.quant_dir, self.quant_dlc_path,
-                analysis_input_list, input_arg_list, output_arg_list
-            )
-            ret_golden = golden_future.result()
-            ret_quant = quant_future.result()
-
-        if ret_golden != 0:
-            print(f"Failed to run framework runner")
-            exit(1)
-        
-        if ret_quant != 0:
-            print(f"Failed to run inference engine")
-            exit(1)
-
-        ret = self.analysis_results()
-        if ret != 0:
-            print(f"Failed to run verification")
-            exit(1)
-
-
-        # 符号链接可用时（working_dir 已在 tmp_dir 下），snpe 输出目录就地保留：
-        # 无需拷贝到 tmp_working_dir，也无需删除 working_dir（clean() 时统一清理），直接引用 working_dir 下的结果路径。
-        # 回退到用户主目录时，先拷贝结果到 tmp_working_dir 再删除 working_dir。
-        if self.working_dir_in_tmp_dir:
-            golden_dst = self.find_latest_subdir(self.golden_dir / "inference_engine")
-            quant_dst = self.find_latest_subdir(self.quant_dir / "inference_engine")
-            verification_dst = self.find_latest_subdir(self.working_dir / 'verification')
-        else:
-            golden_infer_src = self.find_latest_subdir(self.golden_dir / "inference_engine")
-            quant_infer_src = self.find_latest_subdir(self.quant_dir / "inference_engine")
-            verification_src = self.find_latest_subdir(self.working_dir / 'verification')
-
-            golden_dst = self.tmp_working_dir / 'golden_dir' / "inference_engine" / "latest"
-            quant_dst = self.tmp_working_dir / 'quant_dir' / "inference_engine" / "latest"
-            verification_dst = self.tmp_working_dir / "verification"
-
-            # 多线程并行 copytree
-            def do_copy(src: Path, dst: Path):
-                print(f"Copying inference results from {src} to {dst}")
-                shutil.copytree(src, dst, symlinks=False, dirs_exist_ok=True, ignore_dangling_symlinks=True)
-
-            copy_pairs = [(golden_infer_src, golden_dst), (quant_infer_src, quant_dst), (verification_src, verification_dst)]
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                futures:list[Future] = []
-                for src, dst in copy_pairs:
-                    dst.parent.mkdir(parents=True, exist_ok=True) # 预创建目标父目录
-                    futures.append(executor.submit(do_copy, src, dst))
-
-                for f in futures:
-                    f.result()
-
-            shutil.rmtree(self.working_dir)
-
-        self.snpe_accuracy_analysis(verification_dst)
-
-        return ret
-
-    # ------------------------------------------------------------------
-    # ONNX 图结构解析 / 张量匹配 / 层图构建
-    # （模仿 onnx_to_rknn.RknnAccuracyDebugger，并接入 accuracy_debugger.AccuracyGraph）
-    # ------------------------------------------------------------------
+        data = {
+            'rows': input_rows + real_rows + output_rows,
+            'inputs': input_layers, 'outputs': output_layers, 'paths': {},
+        }
+        output_path = self.tmp_dir / 'qnn_graph_accuracy_analysis.html'
+        viz = AccuracyGraph(data=data, children=aug_children, parents=aug_parents,
+                            output_path=output_path, title='QNN Graph Accuracy Analysis')
+        viz.render(show=show)
+        return data
 
     def _build_onnx_tensor_graph(self) -> dict:
-        """
-        解析 self.onnx_path 的 ONNX 计算图，构建张量级 DAG。
-
-        SNPE 会把 ONNX 张量名中的 '/' 与 '.' 替换为 '_'（例如
-        '/body/.../Conv_output_0' -> '_body_..._Conv_output_0'），因此这里统一在
-        "清洗后" 的命名空间上建图，与 accuracy_analysis 产出的 raw 文件名一致。
-
-        Returns:
-            dict:
-                - tensors (dict[str, str]): 清洗名 -> 原始 ONNX 张量名
-                - node_info (dict[str, tuple[str, list[str]]]): 张量 -> (op_type, 输入清洗名列表)
-                - pred (dict[str, list[str]]): 张量 -> 产生它的输入张量
-                - succ (dict[str, list[str]]): 张量 -> 消费它的后继张量
-                - inputs (list[str]): 模型输入清洗名
-                - outputs (list[str]): 模型输出清洗名
-                - input_sizes (dict[str, int]): 模型输入清洗名 -> 元素个数
-        """
+        """解析 self.onnx_path 的 ONNX 计算图，构建张量级 DAG（清洗名命名空间）。"""
         import onnx
 
         model = onnx.load(str(self.onnx_path))
@@ -1084,6 +959,19 @@ class SnpeAccuracyDebugger:
             if s:
                 input_sizes[sanitize(t.name)] = s
 
+        # ONNX 计算图遍历顺序（sanitized 张量名）：用于统计图/报告按图顺序排序
+        order = []
+        for n in g.node:
+            for o in n.output:
+                if o:
+                    s = sanitize(o)
+                    if s not in order:
+                        order.append(s)
+        for t in g.output:
+            s = sanitize(t.name)
+            if s not in order:
+                order.append(s)
+
         return {
             'tensors': tensors,
             'node_info': node_info,
@@ -1092,19 +980,11 @@ class SnpeAccuracyDebugger:
             'inputs': [sanitize(t.name) for t in g.input],
             'outputs': [sanitize(t.name) for t in g.output],
             'input_sizes': input_sizes,
+            'order': order,
         }
 
     def _match_tensor(self, layer_name: str, graph: dict) -> str | None:
-        """
-        将 SNPE raw 文件名（不含 .raw）匹配到清洗后的 ONNX 张量名。
-
-        先精确匹配；失败则取"最长的、是该层名前缀的 ONNX 张量名"
-        （应对 SNPE 追加后缀的中间张量，如 _Concat_1_output_0_reshape）。
-
-        平台差异兼容：Windows SNPE 的 raw 名去掉开头分隔符（/body/... -> body_...），
-        而 sanitize 保留开头下划线（_body_...）；Linux 则一致。因此对候选名同时
-        尝试原始名、补开头下划线、去开头下划线三种形式，保证两平台都能命中。
-        """
+        """将 raw 文件名（不含 .raw）匹配到清洗后的 ONNX 张量名。"""
         candidates = {layer_name, '_' + layer_name, layer_name.lstrip('_')}
         for c in candidates:
             if c in graph['tensors']:
@@ -1118,18 +998,7 @@ class SnpeAccuracyDebugger:
         return best
 
     def _build_layer_graph(self, rows: list[dict], graph: dict):
-        """
-        构建"层图"：以结果行为节点，边由 ONNX 张量依赖推导（模仿 RknnAccuracyDebugger）。
-
-        - 同一 ONNX 张量对应多个层（SNPE 的输入/输出处理链）按快照顺序串联。
-        - 沿 ONNX succ 广度优先，跳过没有快照层的中间张量，连到下一个有快照层的张量。
-
-        Returns:
-            tuple:
-                - children (dict[str, list[str]]): 层 -> 下游层列表
-                - parents (dict[str, list[str]]): 层 -> 上游层列表
-                - tensor_layers (dict[str, list[str]]): ONNX 张量 -> 对应层列表
-        """
+        """构建"层图"：以结果行为节点，边由 ONNX 张量依赖推导。"""
         succ = graph['succ']
 
         tensor_layers: dict[str, list[str]] = defaultdict(list)
@@ -1143,14 +1012,12 @@ class SnpeAccuracyDebugger:
             if a and b and a != b:
                 children[a].append(b)
 
-        # 同一张量的层链（SNPE 输入/输出处理链）
         for tin, lst in tensor_layers.items():
             if tin is None:
                 continue
             for i in range(len(lst) - 1):
                 add_edge(lst[i], lst[i + 1])
 
-        # ONNX 张量后继边：跳过未映射张量，连到下一个映射张量
         for tin, lst in tensor_layers.items():
             if tin is None:
                 continue
@@ -1178,37 +1045,16 @@ class SnpeAccuracyDebugger:
         return children, parents, tensor_layers
 
     def _build_terminal_nodes(self, results: list[dict], children: dict, parents: dict, graph: dict):
-        """
-        在真实层之外追加 Input / Output 示意终端节点并连边。
-
-        - Input：每个模型输入合成一个无精度数据的 'Input' 节点，沿 succ 广度优先
-          连到其消费链中第一个有快照层的张量（首层），放图顶部。
-        - Output：每个模型输出追加一个无精度数据的示意 'Output' 终端节点
-          （不替换/不改写原输出层），从真正的输出层连出；若该输出张量未被 dump，
-          则反向 BFS 找到能到达它的最深快照层连出。命名加 '(out)' 后缀避免与原层重名。
-
-        Returns:
-            tuple:
-                - input_rows (list[dict]): Input 节点行
-                - output_rows (list[dict]): Output 示意节点行
-                - input_layers (list[str]): Input 节点名
-                - output_layers (list[str]): Output 节点名
-                - aug_children (dict[str, list[str]]): 加入终端节点边后的 children
-                - aug_parents (dict[str, list[str]]): 加入终端节点边后的 parents
-        """
-        from collections import defaultdict as _defaultdict
-
-        tensor_layers = _defaultdict(list)
+        """在真实层之外追加 Input / Output 示意终端节点并连边。"""
+        tensor_layers = defaultdict(list)
         for r in results:
             if r.get('tensor') is not None:
                 tensor_layers[r['tensor']].append(r['layer_name'])
-        # 同一张量可能对应多个层（处理链），链尾(lst[-1])才是真正的最终输出层，
-        # 输出终端应从它连出（与 _build_layer_graph 的 l_in = lst[-1] 保持一致）
         tensor_to_layer = {t: lst[-1] for t, lst in tensor_layers.items()}
         node_order = {r['layer_name']: i for i, r in enumerate(results)}
 
-        aug_children = _defaultdict(list)
-        aug_parents = _defaultdict(list)
+        aug_children = defaultdict(list)
+        aug_parents = defaultdict(list)
         for a, cl in children.items():
             aug_children[a] = list(cl)
             for b in cl:
@@ -1217,7 +1063,6 @@ class SnpeAccuracyDebugger:
         succ = graph['succ']
         pred = graph['pred']
 
-        # ---- Input 节点（无精度数据），连到下游首个快照层 ----
         input_rows: list[dict] = []
         input_layers: list[str] = []
         for inp in graph['inputs']:
@@ -1240,28 +1085,21 @@ class SnpeAccuracyDebugger:
                 aug_children[onnx_name].append(tgt)
                 aug_parents[tgt].append(onnx_name)
             input_rows.append({
-                'layer_name': onnx_name,
-                'op_type': 'Input',
-                'entire_cos': None,
-                'entire_euc': None,
-                'single_cos': None,
-                'single_euc': None,
+                'layer_name': onnx_name, 'op_type': 'Input',
+                'entire_cos': None, 'entire_euc': None,
+                'single_cos': None, 'single_euc': None,
             })
 
-        # ---- Output 示意节点（不替换原层，仅追加终端节点）----
         existing_names = set(node_order) | set(input_layers)
         output_layers: list[str] = []
         output_rows: list[dict] = []
         for out in graph['outputs']:
             onnx_out = graph['tensors'].get(out, out)
-            # 原输出层通常已占用输出张量名（如 output0），示意节点加后缀避免重名
             node_name = onnx_out if onnx_out not in existing_names else f'{onnx_out} (out)'
             output_layers.append(node_name)
             if out in tensor_to_layer:
-                # 有真实输出层：从该层连出到示意终端
                 producers = [tensor_to_layer[out]]
             else:
-                # 无真实层：反向 BFS 找到能到达该输出的最深快照层
                 producers = []
                 seen: set[str] = set()
                 dq = deque(pred.get(out, []))
@@ -1279,68 +1117,12 @@ class SnpeAccuracyDebugger:
                 aug_children[prod].append(node_name)
                 aug_parents[node_name].append(prod)
             output_rows.append({
-                'layer_name': node_name,
-                'op_type': 'Output',
-                'entire_cos': None,
-                'entire_euc': None,
-                'single_cos': None,
-                'single_euc': None,
+                'layer_name': node_name, 'op_type': 'Output',
+                'entire_cos': None, 'entire_euc': None,
+                'single_cos': None, 'single_euc': None,
             })
 
         return input_rows, output_rows, input_layers, output_layers, aug_children, aug_parents
-
-
-    def plot_network_analysis(self, results: list[dict], children: dict, parents: dict,
-                              graph: dict, show: bool = True) -> dict:
-        """
-        接入 accuracy_debugger.AccuracyGraph 渲染 Netron 风格网络图（HTML）。
-
-        - 节点填充色 = 累积精度 entire_cos（红-黄-绿），悬停查看单层精度与欧氏距离。
-        - Input / Output 示意终端节点由 _build_terminal_nodes() 统一生成
-          （Input 无精度数据；Output 不替换原层，仅追加示意终端节点）。
-        """
-        # ---- 1. 真实层 rows（保留原算子类型与精度数据）----
-        real_rows = [
-            {
-                'layer_name': r['layer_name'],
-                'op_type': r['op_type'],
-                'entire_cos': r['entire_cos'],
-                'entire_euc': r['entire_euc'],
-                'single_cos': r['single_cos'],
-                'single_euc': r['single_euc'],
-            }
-            for r in results
-        ]
-
-        # ---- 2. 追加 Input / Output 终端节点（独立方法）----
-        (input_rows, output_rows, input_layers, output_layers,
-         aug_children, aug_parents) = self._build_terminal_nodes(results, children, parents, graph)
-
-        graph_rows = input_rows + real_rows + output_rows
-
-        data = {
-            'rows': graph_rows,
-            'inputs': input_layers,
-            'outputs': output_layers,
-            'paths': {},
-        }
-
-        output_path = self.tmp_dir / 'qnn_graph_accuracy_analysis.html'
-        # self.file_or_dir_to_clean.append(output_path)
-
-        viz = AccuracyGraph(
-            data=data,
-            children=aug_children,
-            parents=aug_parents,
-            output_path=output_path,
-            title='QNN Graph Accuracy Analysis',
-        )
-        viz.render(show=show)
-        return data
-
-
-    def clean(self):
-        clean_files_or_dirs(self.file_or_dir_to_clean)
 
 
 
@@ -2539,4 +2321,6 @@ class AccuracyGraph:
             import webbrowser
             webbrowser.open(self.output_path.as_uri())
         return str(self.output_path)
+
+
 

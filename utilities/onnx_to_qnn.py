@@ -18,7 +18,8 @@ import onnx
 current_dir = Path(__file__).parent.resolve()
 sys.path.append(str(current_dir))
 
-from utils import temporary_chdir, letterbox_image, clean_files_or_dirs, read_dataset_txt_to_list
+from utils import temporary_chdir, NumpySaver
+from utils import letterbox_image, clean_files_or_dirs, read_dataset_txt_to_list, run_command
 from utils import sanitize_name, parse_bitwidth, find_hybrid_subgraph_nodes
 from utils import get_onnx_model_info, normalize_onnx_model, reorder_onnx_nodes_by_input, reorder_onnx_nodes_by_output
 
@@ -33,7 +34,6 @@ class QAIRTScript:
     背景：qairt-converter / qairt-quantizer 等在 SDK 中是无扩展名的 Python
     shebang 脚本，位于 bin/<arch> 子目录下：
         x86_64 Windows : bin/x86_64-windows-msvc/<tool>
-        ARM64  Windows : bin/aarch64-windows-msvc/<tool>
         x86_64 Linux   : bin/x86_64-linux-clang/<tool>
         ARM64  Linux   : bin/aarch64-oe-linux-gcc11.2/<tool>
     Windows 无法直接执行无扩展名文件，须以 `python <脚本路径>` 调用；
@@ -48,10 +48,9 @@ class QAIRTScript:
 
     # 平台 key -> bin 子目录名
     PLATFORM_BIN_DIRS = {
-        'windows_x86_64': 'x86_64-windows-msvc',
-        'windows_arm64': 'aarch64-windows-msvc',
-        'linux_x86_64': 'x86_64-linux-clang',
-        'linux_arm64': 'aarch64-oe-linux-gcc11.2',
+        'x86_64-windows-msvc': 'x86_64-windows-msvc',
+        'x86_64-linux-clang': 'x86_64-linux-clang',
+        'aarch64-oe-linux-gcc11.2': 'aarch64-oe-linux-gcc11.2',
     }
 
     # 工具名 -> 各平台脚本相对路径（相对 SDK 根目录）。
@@ -59,49 +58,71 @@ class QAIRTScript:
     # 若某版本 SDK 未提供对应工具，运行时由系统自然报错，不做额外判断。
     TOOL_PATHS = {
         'qairt-converter': {
-            'windows_x86_64': 'bin/x86_64-windows-msvc/qairt-converter',
-            'windows_arm64': 'bin/arm64x-windows-msvc/qairt-converter',
-            'linux_x86_64': 'bin/x86_64-linux-clang/qairt-converter',
-            'linux_arm64': 'bin/aarch64-oe-linux-gcc11.2/qairt-converter',
+            'x86_64-windows-msvc': 'bin/x86_64-windows-msvc/qairt-converter',
+            'x86_64-linux-clang': 'bin/x86_64-linux-clang/qairt-converter',
+            'aarch64-oe-linux-gcc11.2': 'bin/aarch64-oe-linux-gcc11.2/qairt-converter',
         },
         'qairt-quantizer': {
-            'windows_x86_64': 'bin/x86_64-windows-msvc/qairt-quantizer',
-            'windows_arm64': 'bin/arm64x-windows-msvc/qairt-quantizer',
-            'linux_x86_64': 'bin/x86_64-linux-clang/qairt-quantizer',
-            'linux_arm64': 'bin/aarch64-oe-linux-gcc11.2/qairt-quantizer',
+            'x86_64-windows-msvc': 'bin/x86_64-windows-msvc/qairt-quantizer',
+            'x86_64-linux-clang': 'bin/x86_64-linux-clang/qairt-quantizer',
+            'aarch64-oe-linux-gcc11.2': 'bin/aarch64-oe-linux-gcc11.2/qairt-quantizer',
         },
-        # SNPE 精度分析工具（accuracy_debugger.py 使用；aarch64-windows-msvc 提供该工具）
-        'snpe-accuracy-debugger': {
-            'windows_x86_64': 'bin/x86_64-windows-msvc/snpe-accuracy-debugger',
-            'windows_arm64': 'bin/aarch64-windows-msvc/snpe-accuracy-debugger',
-            'linux_x86_64': 'bin/x86_64-linux-clang/snpe-accuracy-debugger',
-            'linux_arm64': 'bin/aarch64-oe-linux-gcc11.2/snpe-accuracy-debugger',
+        'qnn-net-run': {
+            'x86_64-windows-msvc': 'bin/x86_64-windows-msvc/qnn-net-run.exe',
+            'x86_64-linux-clang': 'bin/x86_64-linux-clang/qnn-net-run',
+            'aarch64-oe-linux-gcc11.2': 'bin/aarch64-oe-linux-gcc11.2/qnn-net-run',
+        },
+    }
+
+    LIB_PATHS = {
+        "libQnnCpu": {
+            'x86_64-windows-msvc': 'lib/x86_64-windows-msvc/QnnCpu.dll',
+            'x86_64-linux-clang': 'lib/x86_64-linux-clang/libQnnCpu.so',
+            'aarch64-oe-linux-gcc11.2': 'lib/aarch64-oe-linux-gcc11.2/libQnnCpu.so',
+        },
+        "libQnnHtp": {
+            'x86_64-windows-msvc': 'lib/x86_64-windows-msvc/QnnHtp.dll',
+            'x86_64-linux-clang': 'lib/x86_64-linux-clang/libQnnHtp.so',
+            'aarch64-oe-linux-gcc11.2': 'lib/aarch64-oe-linux-gcc11.2/libQnnHtp.so',
         },
     }
 
     # 类级 SDK 根目录（由 set_sdk_root() 设置；get() 无显式参数时使用）
-    _sdk_root: str | Path | None = None
+    qairt_sdk_root: str | Path | None = None
 
-    @classmethod
-    def current_platform_key(cls) -> str:
-        """返回当前平台 key：'windows_x86_64' / 'windows_arm64' / 'linux_x86_64' / 'linux_arm64'。"""
-        machine = platform.machine().lower()
-        if sys.platform.startswith('win'):
-            return 'windows_arm64' if machine in ('arm64', 'aarch64') else 'windows_x86_64'
-        # Linux：按 CPU 架构区分 x86_64 / arm64（arm64 对应 aarch64-oe-linux-gcc11.2 工具链）
-        return 'linux_arm64' if machine in ('arm64', 'aarch64') else 'linux_x86_64'
+    # QAIRT 工具绑定 Python ABI：QAIRT_PYTHON 默认当前解释器
+    if 'QAIRT_PYTHON' not in os.environ:
+        os.environ['QAIRT_PYTHON'] = sys.executable
 
     @classmethod
     def set_sdk_root(cls, sdk_root: str | Path) -> None:
-        """设置类级 SDK 根目录（版本目录），之后 get() 无需再传 sdk_root。
-
+        """
+        设置类级 SDK 根目录（版本目录），之后 get() 无需再传 sdk_root。
         优先级（get 解析时）：显式传入 sdk_root > set_sdk_root 设置的 > 环境变量 QAIRT_SDK_ROOT。
         """
-        cls._sdk_root = Path(sdk_root).resolve()
-        print(f"[QAIRTScript] SDK root set: {cls._sdk_root}")
+        cls.qairt_sdk_root = Path(sdk_root).resolve()
+        print(f"[QAIRTScript] SDK root set: {cls.qairt_sdk_root}")
 
     @classmethod
-    def get(cls, tool_name:str) -> str:
+    def current_platform_arch(cls) -> str:
+        """
+        返回当前平台 key：'x86_64-windows-msvc' / 'x86_64-linux-clang' / 'aarch64-oe-linux-gcc11.2'。
+        Windows 统一使用 x86_64 版工具（ARM64 Windows 由高通转译执行 x86 工具，
+        """
+
+        if sys.platform.startswith('win'):
+            return 'x86_64-windows-msvc'
+        
+        else:
+            machine = platform.machine().lower()
+
+            if machine in ('arm64', 'aarch64'):
+                return 'aarch64-oe-linux-gcc11.2'
+            else:
+                return 'x86_64-linux-clang'
+
+    @classmethod
+    def get_tool(cls, tool_name:str) -> str:
         """按当前平台输出工具调用前缀。
 
         Args:
@@ -116,31 +137,44 @@ class QAIRTScript:
             FileNotFoundError: 当前平台 SDK 未提供该工具，或脚本文件不存在。
         """
 
-        platform_key = cls.current_platform_key()
+        platform_key = cls.current_platform_arch()
         rel_path = cls.TOOL_PATHS[tool_name].get(platform_key)
         if rel_path is None:
-            raise FileNotFoundError(
-                f'{tool_name} is not provided by the QAIRT SDK on {platform_key} ')
+            raise FileNotFoundError(f'{tool_name} is not provided by the QAIRT SDK on {platform_key} ')
 
-        sdk_root = cls._sdk_root
+        sdk_root = cls.qairt_sdk_root
         if sdk_root is None:
             sdk_root = os.environ.get('QAIRT_SDK_ROOT')
 
         script_path = Path(sdk_root) / rel_path
 
+        # 原生可执行文件（.exe / ELF，如 qnn-net-run）直接执行，不加 python 前缀；
+        # python 脚本（shebang，如 qairt-converter/qairt-quantizer）按平台解释器调用。
         if sys.platform.startswith('win'):
-            # Windows：无扩展名脚本须经 python 解释器调用。
-            # QAIRT Windows 工具绑定 Python 3.10 ABI（python310.dll），必须用
-            # Python 3.10 解释器运行（3.11+ 会报 Python version mismatch）。
-            # 解释器优先级：QAIRT_PYTHON 环境变量 > PATH 中的 python。
-            # 例如：set QAIRT_PYTHON=E:\python_virtual_environment\edge_modeldeploy_venv\python.exe
-            python_exe = os.environ.get('QAIRT_PYTHON') or 'python'
-            return f'"{python_exe}" "{script_path}"'
-        
-        # Linux/Unix：shebang 直接执行，返回脚本完整路径（加引号避免路径含空格）
-        # 与类 docstring 示例一致（Linux -> '"/opt/qairt/.../bin/<arch>/<tool>"'）
-        return f'"{script_path}"'
+            if script_path.suffix.lower() == '.exe':
+                return f'"{script_path}"'
+            else:
+                # Windows：无扩展名脚本须经 python 解释器调用（绑定 Python ABI）。
+                # 解释器优先级：QAIRT_PYTHON 环境变量 > PATH 中的 python。
+                python_exe = sys.executable
+                return f'"{python_exe}" "{script_path}"'
 
+        else:
+            return f'"{script_path}"'
+
+    @classmethod
+    def get_lib(cls, lib_name:str) -> str:
+        platform_key = cls.current_platform_arch()
+        rel_path = cls.LIB_PATHS[lib_name].get(platform_key)
+        if rel_path is None:
+            raise FileNotFoundError(f"{lib_name} is not provided by the QAIRT SDK on {platform_key}")
+
+        sdk_root = cls.qairt_sdk_root
+        if sdk_root is None:
+            sdk_root = os.environ.get('QAIRT_SDK_ROOT')
+
+        lib_path = Path(sdk_root) / rel_path
+        return str(lib_path)
 
 
 class QnnHybridQuantGen:
@@ -498,20 +532,22 @@ class OnnxToQNN:
         tmp_onnx_path = self.tmp_dir / sanitize_model_name
         self.tmp_onnx_path = tmp_onnx_path.with_suffix('.onnx')
 
+        self.quantize_args:dict[str, str|int|bool] = {
+            'param_quant_method': 'min-max',
+            'act_quant_method': 'min-max',
+            'bitwidth': 'w8a8',
+            'bias_bitwidth': 8,
+            'param_quant_schema': 'asymmetric',
+            'act_quant_schema': 'asymmetric',
+            'use_cle_algorithm': False
+        }
+
+        self.custom_calibration_data_path = None
+
         self.file_or_dir_to_clean = []
         self.accuracy_analyzer = None
         self.hybrid_quantizer = None
         self.aimet_connector = None
-
-        #self.set_quantization_method()
-        self.param_quant_method, self.act_quant_method = 'min-max', 'min-max'
-        self.weights_bitwidth, self.act_bitwidth = 8, 8
-        self.bias_bitwidth = 8
-        self.param_quant_schema, self.act_quant_schema = 'asymmetric', 'asymmetric'
-        self.use_cle_algorithm = False
-
-        #self.use_custom_calibration_data()
-        self.custom_calibration_data_path = None
 
     def set_quantization_method(self, param_quant_method:str='min-max', act_quant_method:str='min-max', bitwidth:str='w8a8', bias_bitwidth:int=8,
                                 param_quant_schema:str='asymmetric', act_quant_schema:str='asymmetric', use_cle_algorithm:bool=False):
@@ -564,20 +600,15 @@ class OnnxToQNN:
         if act_quant_schema not in ['asymmetric', 'symmetric', 'unsignedsymmetric']:
             raise ValueError('act_quant_schema must be one of asymmetric, symmetric, unsignedsymmetric')
         
+        self.quantize_args['param_quant_method'] = param_quant_method
+        self.quantize_args['act_quant_method'] = act_quant_method
+        self.quantize_args['bitwidth'] = bitwidth
+        self.quantize_args['bias_bitwidth'] = bias_bitwidth
+        self.quantize_args['param_quant_schema'] = param_quant_schema
+        self.quantize_args['act_quant_schema'] = act_quant_schema
+        self.quantize_args['use_cle_algorithm'] = use_cle_algorithm
 
-        self.param_quant_method = param_quant_method
-        self.act_quant_method = act_quant_method
-
-        self.weights_bitwidth, self.act_bitwidth = parse_bitwidth(bitwidth)
-
-        self.bias_bitwidth = bias_bitwidth
-        self.param_quant_schema = param_quant_schema
-
-        self.act_quant_schema = act_quant_schema
-        self.use_cle_algorithm = use_cle_algorithm
-        
-        print(f"[OnnxToQNN] Quantization method set to: quant_method: param={self.param_quant_method}, act={self.act_quant_method}; bitwidth={self.weights_bitwidth}w{self.act_bitwidth}a"
-              f", schema: act={self.act_quant_schema}, param={self.param_quant_schema}; use_cle_algorithm={self.use_cle_algorithm}")
+        print(f"[OnnxToQNN] Quantization method set to: quant_method: {self.quantize_args}")
 
     def use_custom_calibration_data(self, custom_calibration_data_path:str|None=None):
         """
@@ -690,8 +721,8 @@ class OnnxToQNN:
                 - For models with multiple inputs, provide multiple image paths. Example: ['/home/xxx/1.jpg', '/home/xxx/2.jpg']
                 - Defaults to None.
         """
-        from accuracy_debugger import SnpeAccuracyDebugger
-        self.accuracy_analyzer = SnpeAccuracyDebugger(self.tmp_dir, self.tmp_onnx_path, accuracy_analysis_picture_list, self.run_subprocess, QAIRTScript)
+        from accuracy_debugger import QAIRTAccuracyDebugger
+        self.accuracy_analyzer = QAIRTAccuracyDebugger(self.tmp_dir, self.tmp_onnx_path, accuracy_analysis_picture_list, QAIRTScript)
 
         print(f"[OnnxToQNN] Accuracy analysis data list set to: {accuracy_analysis_picture_list}")
 
@@ -780,8 +811,16 @@ class OnnxToQNN:
                 # 混合量化时，精度分析的 golden 参考必须使用纯浮点 DLC：
                 golden_dlc_path = self.convert_onnx_model(onnx_model_info, set_input_order, None, output_dlc_name=f"{self.tmp_onnx_path.stem}_golden")
 
-            self.accuracy_analyzer.set_model_inof(onnx_model_info, golden_dlc_path, quantized_dlc_model_path)
-            return_code = self.accuracy_analyzer.accuracy_analysis(mean_rgb, std_rgb, set_input_order)
+            quantized_dlc_model_path = Path(quantized_dlc_model_path)
+
+            # QAIRTAccuracyDebugger：直接用两个 DLC（FP32 golden + 量化 target）对比
+            self.accuracy_analyzer.set_model_info(onnx_model_info)
+            
+            return_code = self.accuracy_analyzer.accuracy_analysis(
+                golden_dlc_path=golden_dlc_path,
+                target_dlc_path=quantized_dlc_model_path,
+                mean_rgb=mean_rgb, std_rgb=std_rgb, set_input_order=set_input_order,
+            )
 
             if return_code == 0:
                 print("[OnnxToQNN] Accuracy analysis completed successfully.")
@@ -795,36 +834,6 @@ class OnnxToQNN:
         if self.accuracy_analyzer:
             self.accuracy_analyzer.clean()
 
-
-    @staticmethod
-    def run_subprocess(command:str) -> int:
-        print(f"[OnnxToQNN] Running command: {command}")
-
-        # 平台适配：Windows 用 cmd（shell=True 默认），Linux/Unix 用 bash。
-        # QAIRT 无扩展名脚本在 Windows 下由 QAIRTScript.get() 自动加 python 前缀。
-        popen_kwargs = dict(
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,  # 将stderr重定向到stdout
-            universal_newlines=True,
-            env=os.environ,
-        )
-        if sys.platform.startswith('win'):
-            process = subprocess.Popen(command, shell=True, **popen_kwargs)
-        else:
-            process = subprocess.Popen(command, shell=True, executable='/bin/bash', **popen_kwargs)
-        
-        # 实时打印输出
-        while True:
-            output = process.stdout.readline()
-            if output == '' and process.poll() is not None:
-                break
-            if output:
-                print(output.strip())
-        
-        # 获取返回码
-        return_code = process.poll()
-
-        return return_code
 
     def run_env_script(self):
         """按平台加载 QAIRT SDK 环境：Windows -> envsetup.ps1，Linux/Unix -> envsetup.sh。
@@ -887,13 +896,6 @@ class OnnxToQNN:
             if '=' in line:
                 key, value = line.split('=', 1)
                 os.environ[key] = value
-
-        # QAIRT 工具绑定 Python 3.10 ABI：QAIRT_PYTHON 默认当前解释器
-        if 'QAIRT_PYTHON' not in os.environ:
-            os.environ['QAIRT_PYTHON'] = sys.executable
-            print(f"[OnnxToQNN] QAIRT_PYTHON defaulted to current interpreter: {sys.executable}")
-        if sys.version_info[:2] != (3, 10):
-            print(f"[OnnxToQNN] Warning: QAIRT require Python 3.10, current is {sys.version.split()[0]}")
 
         # QAIRT 工具需要可写临时目录（受限环境系统 TEMP 不可写），指向项目 tmp
         qairt_tmp_dir = self.tmp_dir / 'qairt_tmp'
@@ -978,9 +980,9 @@ class OnnxToQNN:
         if input_network_path is None:
             input_network_path = str(self.tmp_onnx_path)
 
-        command = f"{QAIRTScript.get('qairt-converter')} --input_network {input_network_path} {layout_args} {extra_args} -o {dlc_path}"
+        command = f"{QAIRTScript.get_tool('qairt-converter')} --input_network {input_network_path} {layout_args} {extra_args} -o {dlc_path}"
 
-        return_code = self.run_subprocess(command)
+        return_code = run_command(command, signature="[OnnxToQNN]")
         
         if return_code == 0:
             print("[OnnxToQNN] Convert onnx to qnn-dlc successful!")
@@ -1020,14 +1022,8 @@ class OnnxToQNN:
 
                 height, width = input_shape[2], input_shape[3]
 
-                def to_file_thread(img: np.ndarray, output_path: str):
-                    img.tofile(output_path)
-
-                max_workers = min(16, len(dataset_path_list))
-                Threadpool_to_file = ThreadPoolExecutor(max_workers=max_workers)
-                futures: list[Future] = []
-
                 calibration_data_list = []
+                save_buffer:list[tuple[np.ndarray, str]] = []
 
                 # 处理每张图片
                 for j, one_line_paths_list in enumerate(dataset_path_list):
@@ -1062,26 +1058,19 @@ class OnnxToQNN:
 
                     calibration_data_list.append(output_path)
 
-                    # 提交文件保存任务到线程池
-                    future = Threadpool_to_file.submit(to_file_thread, img_float, output_path)
-                    futures.append(future)
+                    save_buffer.append((img_float, output_path))
+                    if len(save_buffer) >= 16:
+                        NumpySaver.save_numpy_array(save_buffer, ".raw")
+                        save_buffer.clear()
 
-                    if len(futures) >= max_workers:
-                        print(f"[OnnxToQNN] Processed a batch of {max_workers} images")
-                        concurrent.futures.wait(futures, timeout=2)
-
-                        for i in range(len(futures)):
-                            future = futures.pop(0)
-                            if future.done() is False:
-                                futures.append(future)
 
                 cv2.destroyAllWindows()
                 # 等待所有文件保存任务完成
-                concurrent.futures.wait(futures)
-                Threadpool_to_file.shutdown(wait=True)
+                NumpySaver.save_numpy_array(save_buffer, ".raw")
+                NumpySaver.flush_writes_and_close()
+                save_buffer.clear()
 
                 file_list = [os.path.abspath(file_path) for file_path in calibration_data_list]
-
                 calibration_files.append(file_list)
 
 
@@ -1115,25 +1104,26 @@ class OnnxToQNN:
         if not dlc_model_file.exists():
             print(f"[OnnxToQNN] Error: DLC model not found at {dlc_model_file}")
             return None
-        
 
-        quantize_args = f'--weights_bitwidth {self.weights_bitwidth}'
-        quantize_args += f' --act_bitwidth {self.act_bitwidth} '
-        quantize_args += f' --bias_bitwidth {self.bias_bitwidth}'
+        weights_bitwidth, act_bitwidth = parse_bitwidth(self.quantize_args['bitwidth'])
+
+        quantize_args = f'--weights_bitwidth {weights_bitwidth}'
+        quantize_args += f' --act_bitwidth {act_bitwidth} '
+        quantize_args += f' --bias_bitwidth {self.quantize_args["bias_bitwidth"]}'
         quantize_args += f' --use_per_channel_quantization'
-        quantize_args += f' --param_quantizer_calibration {self.param_quant_method}'
-        quantize_args += f' --act_quantizer_calibration {self.act_quant_method}'
-        quantize_args += f" --param_quantizer_schema {self.param_quant_schema}"
-        quantize_args += f" --act_quantizer_schema {self.act_quant_schema}"
-        if self.use_cle_algorithm:
+        quantize_args += f' --param_quantizer_calibration {self.quantize_args["param_quant_method"]}'
+        quantize_args += f' --act_quantizer_calibration {self.quantize_args["act_quant_method"]}'
+        quantize_args += f" --param_quantizer_schema {self.quantize_args['param_quant_schema']}"
+        quantize_args += f" --act_quantizer_schema {self.quantize_args['act_quant_schema']}"
+        if self.quantize_args["use_cle_algorithm"]:
             quantize_args += " --use_cle_algorithm"
 
         extra_args = f'{quantize_args} --target_backend HTP'
         
-        command = f"{QAIRTScript.get('qairt-quantizer')} --input_dlc {dlc_model_path} --input_list {input_list_str} --output_dlc {quantized_dlc_model_path} {extra_args}"
+        command = f"{QAIRTScript.get_tool('qairt-quantizer')} --input_dlc {dlc_model_path} --input_list {input_list_str} --output_dlc {quantized_dlc_model_path} {extra_args}"
 
         with temporary_chdir(self.tmp_dir):
-            return_code = self.run_subprocess(command)
+            return_code = run_command(command, signature="[OnnxToQNN]")
 
         self.file_or_dir_to_clean.append(self.tmp_dir / 'output')
 
@@ -1207,7 +1197,7 @@ class OnnxToQNN:
         command = f"qnn-context-binary-generator --model {model_lib} --backend {backend_lib} --config_file {config_path}"
         command += f" --dlc_path {quantized_dlc_model_path} --output_dir {self.qnn_model_path.parent} --binary_file {self.qnn_model_path.stem}"
 
-        return_code = self.run_subprocess(command)
+        return_code = run_command(command, signature="[OnnxToQNN]")
 
         if return_code == 0:
             print("[OnnxToQNN] Context binary generation completed successfully!")
