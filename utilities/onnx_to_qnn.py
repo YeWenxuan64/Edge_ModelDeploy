@@ -44,13 +44,6 @@ class QAIRTScript:
         # Linux   -> '"/opt/qairt/.../bin/x86_64-linux-clang/qairt-converter"'
     """
 
-    # 平台 key -> bin 子目录名
-    PLATFORM_BIN_DIRS = {
-        'x86_64-windows-msvc': 'x86_64-windows-msvc',
-        'x86_64-linux-clang': 'x86_64-linux-clang',
-        'aarch64-oe-linux-gcc11.2': 'aarch64-oe-linux-gcc11.2',
-    }
-
     # 工具名 -> 各平台脚本相对路径（相对 SDK 根目录）。
     # 只记录当前流程实际用到的工具，其余按需扩展。
     # 若某版本 SDK 未提供对应工具，运行时由系统自然报错，不做额外判断。
@@ -65,29 +58,11 @@ class QAIRTScript:
             'x86_64-linux-clang': 'bin/x86_64-linux-clang/qairt-quantizer',
             'aarch64-oe-linux-gcc11.2': 'bin/aarch64-oe-linux-gcc11.2/qairt-quantizer',
         },
-        'qnn-net-run': {
-            'x86_64-windows-msvc': 'bin/x86_64-windows-msvc/qnn-net-run.exe',
-            'x86_64-linux-clang': 'bin/x86_64-linux-clang/qnn-net-run',
-            'aarch64-oe-linux-gcc11.2': 'bin/aarch64-oe-linux-gcc11.2/qnn-net-run',
-        },
         "qnn-context-binary-generator": {
             'x86_64-windows-msvc': 'bin/x86_64-windows-msvc/qnn-context-binary-generator.exe',
             'x86_64-linux-clang': 'bin/x86_64-linux-clang/qnn-context-binary-generator',
             'aarch64-oe-linux-gcc11.2': 'bin/aarch64-oe-linux-gcc11.2/qnn-context-binary-generator',
         }
-    }
-
-    LIB_PATHS = {
-        "libQnnCpu": {
-            'x86_64-windows-msvc': 'lib/x86_64-windows-msvc/QnnCpu.dll',
-            'x86_64-linux-clang': 'lib/x86_64-linux-clang/libQnnCpu.so',
-            'aarch64-oe-linux-gcc11.2': 'lib/aarch64-oe-linux-gcc11.2/libQnnCpu.so',
-        },
-        "libQnnHtp": {
-            'x86_64-windows-msvc': 'lib/x86_64-windows-msvc/QnnHtp.dll',
-            'x86_64-linux-clang': 'lib/x86_64-linux-clang/libQnnHtp.so',
-            'aarch64-oe-linux-gcc11.2': 'lib/aarch64-oe-linux-gcc11.2/libQnnHtp.so',
-        },
     }
 
     # 类级 SDK 根目录（由 set_sdk_root() 设置；get() 无显式参数时使用）
@@ -164,20 +139,6 @@ class QAIRTScript:
 
         else:
             return f'"{script_path}"'
-
-    @classmethod
-    def get_lib(cls, lib_name:str) -> str:
-        platform_key = cls.current_platform_arch()
-        rel_path = cls.LIB_PATHS[lib_name].get(platform_key)
-        if rel_path is None:
-            raise FileNotFoundError(f"{lib_name} is not provided by the QAIRT SDK on {platform_key}")
-
-        sdk_root = cls.qairt_sdk_root
-        if sdk_root is None:
-            sdk_root = os.environ.get('QAIRT_SDK_ROOT')
-
-        lib_path = Path(sdk_root) / rel_path
-        return str(lib_path)
 
 
 class QnnHybridQuantGen:
@@ -438,8 +399,12 @@ class QnnAimetConnector:
                                                            input_network_path=str(tmp_onnx_path),
                                                            output_dlc_name=f"{tmp_onnx_path.stem}_golden")
 
-            converter.accuracy_analyzer.set_model_inof(onnx_model_info, golden_dlc_path, dlc_model_path)
-            return_code = converter.accuracy_analyzer.accuracy_analysis(mean_rgb, std_rgb, set_input_order)
+            converter.accuracy_analyzer.set_model_info(onnx_model_info)
+            return_code = converter.accuracy_analyzer.accuracy_analysis(
+                golden_dlc_path=golden_dlc_path,
+                target_dlc_path=dlc_model_path,
+                mean_rgb=mean_rgb, std_rgb=std_rgb, set_input_order=set_input_order,
+            )
 
             if return_code == 0:
                 print("[QnnAimetConnector] Accuracy analysis completed successfully.")
@@ -729,7 +694,7 @@ class OnnxToQNN:
                 - Defaults to None.
         """
         from accuracy_debugger import QnnAccuracyDebugger
-        self.accuracy_analyzer = QnnAccuracyDebugger(self.tmp_work_dir, self.tmp_onnx_path, accuracy_analysis_picture_list, QAIRTScript)
+        self.accuracy_analyzer = QnnAccuracyDebugger(self.tmp_work_dir, self.tmp_onnx_path, accuracy_analysis_picture_list)
 
         print(f"[OnnxToQNN] Accuracy analysis data list set to: {accuracy_analysis_picture_list}")
 

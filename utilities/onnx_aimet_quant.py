@@ -271,14 +271,13 @@ class AimetOnnxQuantizer:
             fold_batch_norms: 量化前是否先做 BatchNorm 折叠。默认 True。
         """
 
+        self.model_path = Path(model_path).resolve()
+
+        sanitize_model_name = sanitize_name(self.model_path.stem)
         # 临时工作目录：默认 utilities/tmp onnx_to_qnn 的 utilities/tmp 一致）
         tmp_dir = Path(__file__).resolve().parent / 'tmp'
-        sanitize_model_name = sanitize_name(self.model_path.stem)
-
         self.tmp_work_dir = tmp_dir / f"{sanitize_model_name}_to_qdq_onnx"
         self.tmp_work_dir.mkdir(parents=True, exist_ok=True)
-
-        self.model_path = Path(model_path).resolve()
 
         if quantized_model_path is not None:
             self.quantized_model_path = Path(quantized_model_path).resolve()

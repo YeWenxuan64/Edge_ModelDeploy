@@ -6,10 +6,8 @@ import shutil
 from pathlib import Path
 from typing import Callable
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, Future
 
 import numpy as np
-import pandas as pd
 import cv2
 
 
@@ -64,7 +62,7 @@ def plot_accuracy_summary(names:list[str]=None, single_euc:np.ndarray=None, sing
         euc_plot[euc_plot == 0] = 1e-10
         ax_euc.set_yscale('linear')
         ax_euc.bar(layer_index, euc_plot, color='skyblue', edgecolor='black',
-                    linewidth=0.5, alpha=0.7, label='Euc Dist Per Layer')
+                    linewidth=0.5, alpha=0.7, label='Euc (single)')
         has_euc_data = True
 
     if entire_euc is not None:
@@ -78,8 +76,8 @@ def plot_accuracy_summary(names:list[str]=None, single_euc:np.ndarray=None, sing
     if mse_vals is not None:
         # 右侧纵轴：MSE（量级可能千分之一~个位，与欧氏距离的几十上百分离显示）
         ax_mse = ax_euc.twinx()
-        ax_mse.plot(layer_index, mse_vals, color='purple', marker='.', linestyle='-',
-                    linewidth=1, markersize=2, label='MSE Per Layer')
+        ax_mse.plot(layer_index, mse_vals, color=(0.0, 0.8, 0.6), marker='.', linestyle='-',
+                    linewidth=1, markersize=2, label='MSE')
         ax_mse.set_ylabel('MSE', fontsize=12)
         extra_axes.append(ax_mse)
         has_euc_data = True
@@ -105,10 +103,9 @@ def plot_accuracy_summary(names:list[str]=None, single_euc:np.ndarray=None, sing
         # 数据清洗：将恰好等于 0 的余弦值置为 NaN，matplotlib 会跳过这些点且不连线，
         # 避免异常的 0 值把 y 轴显示范围压扁（正常余弦值集中在 0.98~1.0 附近）
         cos_sim_plot = np.where(single_cos == 0.0, np.nan, single_cos)
-        single_label = 'Cosine (single)' if entire_cos is not None else 'Per Layer'
         ax_cos.set_yscale('linear')
         ax_cos.plot(layer_index, cos_sim_plot, color='green', marker='.',
-                    linestyle='-', linewidth=1, markersize=2, label=single_label)
+                    linestyle='-', linewidth=1, markersize=2, label='Cosine (single)')
         has_cos_data = True
 
     if entire_cos is not None:
@@ -143,6 +140,327 @@ def plot_accuracy_summary(names:list[str]=None, single_euc:np.ndarray=None, sing
 
     return save_path
 
+
+# ==========================================================================
+# 图结构构建（RknnAccuracyDebugger / QnnAccuracyDebugger 共用）
+# --------------------------------------------------------------------------
+# 两个调试器数据来源不同（RKNN 快照层名 = 原始 ONNX 张量名 + 后缀；QNN raw
+# 文件名 = 清洗名），但"解析 ONNX 构建张量 DAG -> 层图 -> 终端节点"的逻辑一致，
+# 统一放在这里，两侧仅以 sanitize / include_input / name_of 等参数区分。
+# ==========================================================================
+
+
+def build_onnx_tensor_graph(model_path, *, sanitize: bool = False) -> dict:
+    """从 ONNX 模型构建张量级 DAG（含可选命名清洗）。
+
+    Args:
+        model_path: ONNX 模型路径。
+        sanitize: 是否把张量名中的 [/ .]+ 替换为 _。QNN raw 文件名即清洗后的
+            张量名，需传 True；RKNN 快照层名基于原始张量名，传 False。
+
+    Returns:
+        dict: 包含
+            - tensors (dict[str, str]): (清洗后)张量名 -> 原始张量名
+            - tensor_set (set[str]): 全部 (清洗后)张量名（输入/输出/节点输出）
+            - node_info (dict[str, tuple[str, list[str]]]): 张量 -> (算子类型, 输入张量)
+            - pred (dict[str, list[str]]): 张量 -> 产生它的节点输入张量列表
+            - succ (dict[str, list[str]]): 张量 -> 消费它的后续张量列表
+            - inputs / outputs (list[str]): 模型输入/输出名
+            - input_sizes (dict[str, int]): 输入张量 -> 元素总数（仅静态维度）
+            - order (list[str]): ONNX 计算图遍历顺序（用于报告/统计排序）
+    """
+    import onnx
+
+    model = onnx.load(str(model_path))
+    g = model.graph
+
+    def _norm(name: str) -> str:
+        return re.sub(r'[/.]+', '_', name) if sanitize else name
+
+    tensors: dict[str, str] = {}
+    for t in list(g.input) + list(g.output):
+        tensors.setdefault(_norm(t.name), t.name)
+    for n in g.node:
+        for o in n.output:
+            if o:
+                tensors.setdefault(_norm(o), o)
+
+    node_info: dict[str, tuple[str, list[str]]] = {}
+    pred: dict[str, list[str]] = {}
+    succ: dict[str, list[str]] = {}
+    for n in g.node:
+        outs = [_norm(o) for o in n.output if o]
+        ins = [_norm(i) for i in n.input if i]
+        for out in outs:
+            node_info.setdefault(out, (n.op_type, ins))
+            pred.setdefault(out, []).extend(ins)
+        for i in ins:
+            succ.setdefault(i, []).extend(outs)
+
+    def _value_size(vi) -> int | None:
+        s = 1
+        for d in vi.type.tensor_type.shape.dim:
+            v = d.dim_value
+            if v and v > 0:
+                s *= int(v)
+            else:
+                return None
+        return s
+
+    input_sizes: dict[str, int] = {}
+    for t in g.input:
+        s = _value_size(t)
+        if s:
+            input_sizes[_norm(t.name)] = s
+
+    # ONNX 计算图遍历顺序（用于统计图/报告按图顺序排序）
+    order: list[str] = []
+    for n in g.node:
+        for o in n.output:
+            if o:
+                s = _norm(o)
+                if s not in order:
+                    order.append(s)
+    for t in g.output:
+        s = _norm(t.name)
+        if s not in order:
+            order.append(s)
+
+    return {
+        'tensors': tensors,
+        'tensor_set': set(tensors),
+        'node_info': node_info,
+        'pred': pred,
+        'succ': succ,
+        'inputs': [_norm(t.name) for t in g.input],
+        'outputs': [_norm(t.name) for t in g.output],
+        'input_sizes': input_sizes,
+        'order': order,
+    }
+
+
+def match_tensor(layer_name: str, graph: dict) -> str | None:
+    """将快照/raw 层名匹配到 ONNX 张量名（graph['tensors'] 的键）。
+
+    编译器会给张量名追加后缀（RKNN 的 _sw/-rs/_mm 等）或前导下划线
+    （QNN sanitize 会把开头的 / 变成 _），因此先做精确匹配（含前导下划线变体），
+    失败则取"最长的、是候选名前缀的 ONNX 张量名"。
+
+    Returns:
+        str | None: 匹配到的张量名，未匹配返回 None。
+    """
+    candidates = {layer_name, '_' + layer_name, layer_name.lstrip('_')}
+    for c in candidates:
+        if c in graph['tensors']:
+            return c
+
+    best: str | None = None
+    best_len = -1
+    for t in graph['tensors']:
+        for c in candidates:
+            if c.startswith(t) and len(t) > best_len:
+                best, best_len = t, len(t)
+    return best
+
+
+def build_layer_graph(rows: list[dict], graph: dict, *, tensor_resolver=None) -> tuple[dict, dict, dict]:
+    """构建"层图"：以精度分析行为节点，边由 ONNX 张量依赖推导。
+
+    - 同一 ONNX 张量对应的多个层（如 template / template_int8 / template_conv，
+      输入/输出的处理链）按快照顺序串联。
+    - 沿 ONNX succ 广度优先，跳过没有快照层的中间张量，连到下一个有快照层的张量。
+
+    Args:
+        rows: 精度分析行；若缺 'tensor' 字段，会用 tensor_resolver(layer_name)
+            补齐（RKNN 在此时做匹配；QNN 的行已预先填好）。
+        graph: build_onnx_tensor_graph() 的返回值。
+        tensor_resolver: 可选，layer_name -> graph['tensors'] 键 的映射函数。
+
+    Returns:
+        tuple: (children, parents, tensor_layers)
+            - children (dict[str, list[str]]): 层 -> 下游层列表
+            - parents (dict[str, list[str]]): 层 -> 上游层列表
+            - tensor_layers (dict[str, list[str]]): ONNX 张量 -> 对应层列表
+    """
+    succ = graph['succ']
+
+    tensor_layers: dict[str, list[str]] = defaultdict(list)
+    for r in rows:
+        t = r.get('tensor')
+        if t is None and tensor_resolver is not None:
+            t = tensor_resolver(r['layer_name'])
+            r['tensor'] = t
+        tensor_layers[t].append(r['layer_name'])
+
+    node_order = {r['layer_name']: i for i, r in enumerate(rows)}
+    children: dict[str, list[str]] = defaultdict(list)
+
+    def add_edge(a: str | None, b: str | None) -> None:
+        if a and b and a != b:
+            children[a].append(b)
+
+    # 同一张量的层链（输入/输出处理层）。
+    # 注意：跳过 None 张量——否则所有"未匹配到 ONNX 张量"的层会被
+    # 错误地串成一条链，产生大量虚假边。
+    for tin, lst in tensor_layers.items():
+        if tin is None:
+            continue
+        for i in range(len(lst) - 1):
+            add_edge(lst[i], lst[i + 1])
+
+    # ONNX 张量后继边：跳过未映射张量，连到下一个映射张量
+    for tin, lst in tensor_layers.items():
+        if tin is None:
+            continue
+        l_in = lst[-1]  # 该张量对应的输出端层（链尾）
+        visited: set[str] = set()
+        dq = deque(succ.get(tin, []))
+        while dq:
+            t = dq.popleft()
+            if t in visited:
+                continue
+            visited.add(t)
+            if t in tensor_layers:
+                add_edge(l_in, tensor_layers[t][0])
+                continue  # 遇到映射张量即停止该分支
+            dq.extend(succ.get(t, []))
+
+    for k in children:
+        children[k] = sorted(set(children[k]), key=lambda x: node_order[x])
+
+    parents: dict[str, list[str]] = defaultdict(list)
+    for a, cl in children.items():
+        for b in cl:
+            parents[b].append(a)
+
+    return children, parents, tensor_layers
+
+
+def build_terminal_nodes(rows: list[dict], children: dict, parents: dict, graph: dict,
+                         *, include_input: bool = False, name_of=None) -> tuple[list[dict], list[dict], list[str], list[str], dict, dict]:
+    """在真实层之外追加 Input / Output 示意终端节点并连边。
+
+    每个模型输出追加一个示意 'Output' 终端节点（不替换/不改写原输出层），
+    从真正的输出层连出；若该输出张量未被快照，则反向 BFS 找到能到达它的最深
+    快照层连出。命名加 '(out)' 后缀避免与原层重名。Output 的精度继承其直接
+    上游真实层，使示意终端与真实输出层保持同色。
+    include_input=True（QNN，raw 不含输入层）时再追加 'Input' 终端节点（正向
+    BFS 连到下游首个快照层），精度记为无损 cos=1.0 / euc=0.0；
+    RKNN 快照默认已含输入层，传 False。
+
+    Args:
+        rows: 已含 'tensor' 字段的真实层行。
+        children / parents: build_layer_graph() 的返回值。
+        graph: build_onnx_tensor_graph() 的返回值。
+        include_input: 是否同时追加 Input 终端节点。
+        name_of: 张量键 -> 显示名 映射；QNN 经 graph['tensors'] 取原始名，
+            RKNN 张量键即原始名（name_of=None 时用恒等映射）。
+
+    Returns:
+        tuple:
+            - input_rows (list[dict]): Input 示意节点行
+            - output_rows (list[dict]): Output 示意节点行
+            - input_layers (list[str]): Input 节点名
+            - output_layers (list[str]): Output 节点名
+            - aug_children (dict): 加入终端节点边后的 children
+            - aug_parents (dict): 加入终端节点边后的 parents
+    """
+    if name_of is None:
+        name_of = lambda k: k
+
+    # 同一张量可能有多个变体层（如 output0-rs_tp / output0-rs / output0_int8 /
+    # output0），处理链的链尾(lst[-1])才是真正的最终输出层，输出终端应从它连出
+    tensor_layers: dict[str, list[str]] = defaultdict(list)
+    for r in rows:
+        t = r.get('tensor')
+        if t is not None:
+            tensor_layers[t].append(r['layer_name'])
+    tensor_to_layer = {t: lst[-1] for t, lst in tensor_layers.items()}
+    node_order = {r['layer_name']: i for i, r in enumerate(rows)}
+    layer_row = {r['layer_name']: r for r in rows}
+
+    aug_children: dict[str, list[str]] = defaultdict(list)
+    aug_parents: dict[str, list[str]] = defaultdict(list)
+    for a, cl in children.items():
+        aug_children[a] = list(cl)
+        for b in cl:
+            aug_parents[b].append(a)
+
+    succ = graph['succ']
+    pred = graph['pred']
+
+    # ---- Input 终端（可选：QNN raw 不含输入层，需示意）----
+    input_rows: list[dict] = []
+    input_layers: list[str] = []
+    if include_input:
+        for inp in graph['inputs']:
+            display = name_of(inp)
+            input_layers.append(display)
+            targets: list[str] = []
+            seen: set[str] = set()
+            dq = deque(succ.get(inp, []))
+            while dq:
+                t = dq.popleft()
+                if t in seen:
+                    continue
+                seen.add(t)
+                if t in tensor_layers:
+                    targets.append(tensor_layers[t][0])
+                    continue
+                dq.extend(succ.get(t, []))
+            targets = sorted(set(targets), key=lambda x: node_order.get(x, 0))
+            for tgt in targets:
+                aug_children[display].append(tgt)
+                aug_parents[tgt].append(display)
+            # Input 终端为理想输入源：精度记为无损（cos=1.0 / euc=0.0）
+            input_rows.append({
+                'layer_name': display, 'op_type': 'Input',
+                'entire_cos': 1.0, 'entire_euc': 0.0,
+                'single_cos': 1.0, 'single_euc': 0.0,
+            })
+
+    # ---- Output 终端 ----
+    existing_names = set(node_order) | set(input_layers)
+    output_layers: list[str] = []
+    output_rows: list[dict] = []
+    for out in graph['outputs']:
+        onnx_out = name_of(out)
+        # 原输出层通常已占用输出张量名，示意节点加后缀避免重名
+        node_name = onnx_out if onnx_out not in existing_names else f'{onnx_out} (out)'
+        output_layers.append(node_name)
+        if out in tensor_to_layer:
+            # 有真实输出层：从该层连出到示意终端
+            producers = [tensor_to_layer[out]]
+        else:
+            # 无真实层：反向 BFS 找到能到达该输出的最深快照层
+            producers = []
+            seen: set[str] = set()
+            dq = deque(pred.get(out, []))
+            while dq:
+                t = dq.popleft()
+                if t in seen:
+                    continue
+                seen.add(t)
+                if t in tensor_layers:
+                    producers.append(tensor_layers[t][-1])
+                    continue
+                dq.extend(pred.get(t, []))
+            producers = sorted(set(producers), key=lambda x: node_order.get(x, 0))
+        for prod in producers:
+            aug_children[prod].append(node_name)
+            aug_parents[node_name].append(prod)
+        # Output 终端精度继承其直接上游（producers 中按快照顺序最靠后的真实层），
+        # 使示意终端与真实输出层保持同色；无上游时保持 None。
+        if producers:
+            src_row = layer_row[producers[-1]]
+            out_acc = {k: src_row.get(k)
+                       for k in ('entire_cos', 'entire_euc', 'single_cos', 'single_euc')}
+        else:
+            out_acc = {'entire_cos': None, 'entire_euc': None,
+                       'single_cos': None, 'single_euc': None}
+        output_rows.append({'layer_name': node_name, 'op_type': 'Output', **out_acc})
+
+    return input_rows, output_rows, input_layers, output_layers, aug_children, aug_parents
 
 
 class RknnAccuracyDebugger:
@@ -279,206 +597,6 @@ class RknnAccuracyDebugger:
     # 带路径追踪的精度分析：从多个输入到多个输出的排列组合路径
     # ------------------------------------------------------------------
 
-    def _build_onnx_tensor_graph(self) -> dict:
-        """
-        从 ONNX 模型构建张量级 DAG（用于路径追踪）。
-
-        使用 self.tmp_model_path（convert() 复制到 tmp 目录的模型副本）。
-
-        Returns:
-            dict: 包含
-                - tensor_set (set[str]): 全部张量名（输入/输出/节点输出）
-                - pred (dict[str, list[str]]): 张量 -> 产生它的节点输入张量列表
-                - succ (dict[str, list[str]]): 张量 -> 消费它的后续张量列表
-                - inputs (list[str]): 模型输入名
-                - outputs (list[str]): 模型输出名
-        """
-        import onnx
-
-        model = onnx.load(str(self.tmp_model_path))
-        g = model.graph
-
-        tensor_set: set[str] = {t.name for t in list(g.input) + list(g.output)}
-        pred: dict[str, list[str]] = {}
-        succ: dict[str, list[str]] = {}
-        for node in g.node:
-            outs = [o for o in node.output if o]
-            ins = [i for i in node.input if i]
-            for out in outs:
-                tensor_set.add(out)
-                pred.setdefault(out, []).extend(ins)
-            for i in ins:
-                succ.setdefault(i, []).extend(outs)
-
-        return {
-            'tensor_set': tensor_set,
-            'pred': pred,
-            'succ': succ,
-            'inputs': [t.name for t in g.input],
-            'outputs': [t.name for t in g.output],
-        }
-
-    def _match_tensor(self, layer_name: str, tensor_set: set[str]) -> str | None:
-        """
-        将 RKNN 快照层名匹配到 ONNX 张量名。
-
-        RKNN 会在原始张量名后追加后缀（如 _sw、-rs、_mm 等），
-        因此先尝试精确匹配，失败则取"最长的、是该层名前缀的 ONNX 张量名"。
-
-        Returns:
-            str | None: 匹配到的 ONNX 张量名，未匹配返回 None。
-        """
-        if layer_name in tensor_set:
-            return layer_name
-
-        best: str | None = None
-        for t in tensor_set:
-            if layer_name.startswith(t):
-                if best is None or len(t) > len(best):
-                    best = t
-        return best
-
-    def _build_layer_graph(self, rows: list[dict], graph: dict) -> tuple[dict, dict, dict]:
-        """
-        构建"层图"：以 RKNN 快照层为节点，边由 ONNX 张量依赖关系推导。
-
-        - 同一 ONNX 张量对应的多个层（如 template / template_int8 / template_conv，
-          RKNN 的输入/输出处理链）按快照顺序串联。
-        - 沿 ONNX succ 广度优先，跳过没有快照层的中间张量，连到下一个有快照层的张量。
-
-        Returns:
-            tuple:
-                - children (dict[str, list[str]]): 层 -> 下游层列表
-                - parents (dict[str, list[str]]): 层 -> 上游层列表
-                - tensor_layers (dict[str, list[str]]): ONNX 张量 -> 对应层列表
-        """
-
-        tensor_set = graph['tensor_set']
-        succ = graph['succ']
-
-        tensor_layers: dict[str, list[str]] = defaultdict(list)
-        for r in rows:
-            r['tensor'] = self._match_tensor(r['layer_name'], tensor_set)
-            tensor_layers[r['tensor']].append(r['layer_name'])
-
-        node_order = {r['layer_name']: i for i, r in enumerate(rows)}
-        children: dict[str, list[str]] = defaultdict(list)
-
-        def add_edge(a: str | None, b: str | None) -> None:
-            if a and b and a != b:
-                children[a].append(b)
-
-        # 同一张量的层链（RKNN 输入/输出处理层）。
-        # 注意：跳过 None 张量——否则所有"未匹配到 ONNX 张量"的层会被
-        # 错误地串成一条链，产生大量虚假边。
-        for tin, lst in tensor_layers.items():
-            if tin is None:
-                continue
-            for i in range(len(lst) - 1):
-                add_edge(lst[i], lst[i + 1])
-
-        # ONNX 张量后继边：跳过未映射张量，连到下一个映射张量
-        for tin, lst in tensor_layers.items():
-            if tin is None:
-                continue
-            l_in = lst[-1]  # 该张量对应的输出端层（链尾）
-            visited: set[str] = set()
-            dq = deque(succ.get(tin, []))
-            while dq:
-                t = dq.popleft()
-                if t in visited:
-                    continue
-                visited.add(t)
-                if t in tensor_layers:
-                    add_edge(l_in, tensor_layers[t][0])
-                    continue  # 遇到映射张量即停止该分支
-                dq.extend(succ.get(t, []))
-
-        for k in children:
-            children[k] = sorted(set(children[k]), key=lambda x: node_order[x])
-
-        parents: dict[str, list[str]] = defaultdict(list)
-        for a, cl in children.items():
-            for b in cl:
-                parents[b].append(a)
-
-        return children, parents, tensor_layers
-
-    def _build_terminal_nodes(self, rows: list[dict], children: dict, parents: dict, graph: dict):
-        """
-        在真实层之外追加 Output 示意终端节点并连边（模仿 SnpeAccuracyDebugger）。
-
-        RKNN 精度分析结果默认已包含输入层，因此这里只追加输出节点：
-        每个模型输出追加一个无精度数据的示意 'Output' 终端节点
-        （不替换/不改写原输出层），从真正的输出层连出；若该输出张量未被快照，
-        则反向 BFS 找到能到达它的最深快照层连出。命名加 '(out)' 后缀避免与原层重名。
-
-        Returns:
-            tuple:
-                - output_rows (list[dict]): Output 示意节点行
-                - output_layers (list[str]): Output 节点名
-                - aug_children (dict[str, list[str]]): 加入终端节点边后的 children
-                - aug_parents (dict[str, list[str]]): 加入终端节点边后的 parents
-        """
-
-        tensor_layers = defaultdict(list)
-        for r in rows:
-            t = r.get('tensor')
-            if t is not None:
-                tensor_layers[t].append(r['layer_name'])
-        # 同一张量可能有多个变体层（如 output0-rs_tp / output0-rs / output0_int8 /
-        # output0），处理链的链尾(lst[-1])才是真正的最终输出层，输出终端应从它连出
-        tensor_to_layer = {t: lst[-1] for t, lst in tensor_layers.items()}
-        node_order = {r['layer_name']: i for i, r in enumerate(rows)}
-
-        aug_children = defaultdict(list)
-        aug_parents = defaultdict(list)
-        for a, cl in children.items():
-            aug_children[a] = list(cl)
-            for b in cl:
-                aug_parents[b].append(a)
-
-        pred = graph['pred']
-
-        existing_names = set(node_order)
-        output_layers: list[str] = []
-        output_rows: list[dict] = []
-        for out in graph['outputs']:
-            # 原输出层通常已占用输出张量名，示意节点加后缀避免重名
-            node_name = out if out not in existing_names else f'{out} (out)'
-            output_layers.append(node_name)
-            if out in tensor_to_layer:
-                # 有真实输出层：从该层连出到示意终端
-                producers = [tensor_to_layer[out]]
-            else:
-                # 无真实层：反向 BFS 找到能到达该输出的最深快照层
-                producers = []
-                seen: set[str] = set()
-                dq = deque(pred.get(out, []))
-                while dq:
-                    t = dq.popleft()
-                    if t in seen:
-                        continue
-                    seen.add(t)
-                    if t in tensor_layers:
-                        producers.append(tensor_layers[t][-1])
-                        continue
-                    dq.extend(pred.get(t, []))
-                producers = sorted(set(producers), key=lambda x: node_order.get(x, 0))
-            for prod in producers:
-                aug_children[prod].append(node_name)
-                aug_parents[node_name].append(prod)
-            output_rows.append({
-                'layer_name': node_name,
-                'op_type': 'Output',
-                'entire_cos': None,
-                'entire_euc': None,
-                'single_cos': None,
-                'single_euc': None,
-            })
-
-        return output_rows, output_layers, aug_children, aug_parents
-
     def read_path_analysis(self) -> dict:
         """
         读取 RKNN 精度分析数据，并结合 ONNX 图结构追踪"输入 -> 输出"的排列组合路径。
@@ -496,8 +614,9 @@ class RknnAccuracyDebugger:
         if not rows:
             return {}
 
-        graph = self._build_onnx_tensor_graph()
-        children, parents, _ = self._build_layer_graph(rows, graph)
+        graph = build_onnx_tensor_graph(self.tmp_model_path, sanitize=False)
+        children, parents, _ = build_layer_graph(
+            rows, graph, tensor_resolver=lambda nm: match_tensor(nm, graph))
 
         node_order = {r['layer_name']: i for i, r in enumerate(rows)}
         layer_row = {r['layer_name']: r for r in rows}
@@ -579,12 +698,13 @@ class RknnAccuracyDebugger:
             print("No path data to plot.")
             return data
 
-        graph = self._build_onnx_tensor_graph()
-        children, parents, _ = self._build_layer_graph(data['rows'], graph)
+        graph = build_onnx_tensor_graph(self.tmp_model_path, sanitize=False)
+        children, parents, tensor_layers  = build_layer_graph(
+            data['rows'], graph, tensor_resolver=lambda nm: match_tensor(nm, graph))
 
-        # 追加 Output 示意终端节点
-        output_rows, output_layers, children, parents = self._build_terminal_nodes(
-            data['rows'], children, parents, graph)
+        # 追加 Output 示意终端节点（RKNN 快照已含输入层，仅追加输出）
+        _, output_rows, _, output_layers, children, parents = build_terminal_nodes(
+            data['rows'], children, parents, graph, include_input=False, name_of=lambda k: k)
         data['rows'] = data['rows'] + output_rows
         data['outputs'] = output_layers
 
@@ -621,37 +741,19 @@ class QnnAccuracyDebugger:
       - 量化 DLC -> HTP 后端（libQnnHtp.so；CPU 后端拒绝量化/16bit 激活中间层）
     """
 
-    def __init__(self, tmp_dir:str, onnx_path:str=None, debugger_picture_list:list=None, qairt_script=None):
-
-        from onnx_to_qnn import QAIRTScript
-        
+    def __init__(self, tmp_dir:str, onnx_path:str=None, debugger_picture_list:list=None):
         self.tmp_dir = Path(tmp_dir).resolve()
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self.working_dir = self.tmp_dir / 'qnn_accuracy_analysis'
         self.onnx_path = Path(onnx_path).resolve()
         self.debugger_picture_list = [Path(p).resolve() for p in (debugger_picture_list or []) if Path(p).exists()]
         
-        self.qairt_script:QAIRTScript = qairt_script
-        self.qairt_sdk_root = Path(getattr(self.qairt_script, 'qairt_sdk_root', None) or os.environ.get('QAIRT_SDK_ROOT'))
-
-        if self.qairt_script is not None:
-            self.exe_qnn_net_run = self.qairt_script.get_tool('qnn-net-run')
-            self.platform_arch = self.qairt_script.current_platform_arch()
-            self.backend_lib_golden = self.qairt_script.get_lib('libQnnCpu')
-            # HTP 后端在 x86_64 Windows 上无执行路径（无 QEMU 模拟器、无平台 stub/skel，
-            # 仅 aarch64/arm64x Windows 有真实 NPU），QnnHtp.dll 初始化会让 qnn-net-run 卡死。
-            # x86_64 Linux 通过 QEMU 模拟器可运行，故仅 x86_64 Windows 回退到 CPU 后端。
-            if self.platform_arch == 'x86_64-windows-msvc':
-                print("[QAIRTAccuracyDebugger] x86_64-windows-msvc: HTP backend unavailable "
-                      "(no simulator/platform libs); using CPU backend for target DLC too.")
-                self.backend_lib_target = self.backend_lib_golden
-            else:
-                self.backend_lib_target = self.qairt_script.get_lib('libQnnHtp')
+        if sys.platform.startswith('win'):
+            self.backend_lib_golden = "QnnCpu.dll"
+            self.backend_lib_target = "QnnCpu.dll"
         else:
-            self.platform_arch = 'x86_64-linux-clang'
-            self.exe_qnn_net_run = str(self.qairt_sdk_root / 'bin' / self.platform_arch / 'qnn-net-run')
-            self.backend_lib_golden = self.qairt_sdk_root / 'lib' / self.platform_arch / 'libQnnCpu.so'
-            self.backend_lib_target = self.qairt_sdk_root / 'lib' / self.platform_arch / 'libQnnHtp.so'
+            self.backend_lib_golden = "libQnnCpu.so"
+            self.backend_lib_target = "libQnnHtp.so"
 
         self.onnx_info: dict = {}
         self.file_or_dir_to_clean: list[str] = [str(self.working_dir)]
@@ -715,9 +817,8 @@ class QnnAccuracyDebugger:
 
     def run_qnn_net_run(self, dlc_path:str, backend_lib:str, input_list:str, output_dir: str) -> int:
         """执行 qnn-net-run --dlc_path <dlc> --backend <lib> --input_list --output_dir [--debug]。"""
-        qnn_net_run = self.exe_qnn_net_run
 
-        cmd = f'{qnn_net_run} --backend "{backend_lib}" --debug --log_level warn'
+        cmd = f'qnn-net-run --backend {backend_lib} --debug --log_level warn'
         cmd += f' --dlc_path {dlc_path} --input_list {input_list} --output_dir {output_dir}'
 
         return run_command(cmd, signature="[QAIRTAccuracyDebugger]")
@@ -814,7 +915,7 @@ class QnnAccuracyDebugger:
         common = {n for n in gold if n in targ and gold[n].size == targ[n].size}
         # 优先按 ONNX 计算图顺序排序；不在图中的额外张量（如 hybrid 转换节点）排后面
         if self.onnx_path is not None:
-            graph = self._build_onnx_tensor_graph()
+            graph = build_onnx_tensor_graph(self.onnx_path, sanitize=True)
             order = [n for n in graph['order'] if n in common]
             order += sorted(common - set(order))
         else:
@@ -836,7 +937,7 @@ class QnnAccuracyDebugger:
 
     def _plot_network_analysis_entire_only(self, names, entire_cos, entire_euc, mse_vals=None):
         """仅基于 entire（累积）数据渲染 AccuracyGraph：single_cos/single_euc 置 None。"""
-        graph = self._build_onnx_tensor_graph()
+        graph = build_onnx_tensor_graph(self.onnx_path, sanitize=True)
         node_info = graph['node_info']
 
         results = []
@@ -844,7 +945,7 @@ class QnnAccuracyDebugger:
             raw_stem = str(name)
             if raw_stem.endswith('.raw'):
                 raw_stem = raw_stem[:-4]
-            tensor = self._match_tensor(raw_stem, graph)
+            tensor = match_tensor(raw_stem, graph)
             results.append({
                 'golden': str(name), 'infer': None, 'tensor': tensor,
                 'layer_name': graph['tensors'].get(tensor, str(name)) if tensor is not None else str(name),
@@ -855,7 +956,7 @@ class QnnAccuracyDebugger:
                 'mse': float(mse_vals[i]) if mse_vals is not None else None,
             })
 
-        children, parents, _ = self._build_layer_graph(results, graph)
+        children, parents, tensor_layers = build_layer_graph(results, graph)
         self.draw_network_analysis(results, children, parents, graph, show=True)
 
     def draw_network_analysis(self, results: list, children: dict, parents: dict,
@@ -868,7 +969,10 @@ class QnnAccuracyDebugger:
         } for r in results]
 
         (input_rows, output_rows, input_layers, output_layers,
-         aug_children, aug_parents) = self._build_terminal_nodes(results, children, parents, graph)
+         aug_children, aug_parents) = build_terminal_nodes(
+            results, children, parents, graph, include_input=True,
+            name_of=lambda k: graph['tensors'].get(k, k),
+        )
 
         data = {
             'rows': input_rows + real_rows + output_rows,
@@ -881,218 +985,6 @@ class QnnAccuracyDebugger:
         html_path = viz.render(show=show)
         self.file_or_dir_to_clean.append(html_path)
         return data
-
-    def _build_onnx_tensor_graph(self) -> dict:
-        """解析 self.onnx_path 的 ONNX 计算图，构建张量级 DAG（清洗名命名空间）。"""
-        import onnx
-
-        model = onnx.load(str(self.onnx_path))
-        g = model.graph
-
-        def sanitize(name: str) -> str:
-            return re.sub(r'[/.]+', '_', name)
-
-        tensors: dict[str, str] = {}
-        for t in list(g.input) + list(g.output):
-            tensors[sanitize(t.name)] = t.name
-        for n in g.node:
-            for o in n.output:
-                if o:
-                    tensors.setdefault(sanitize(o), o)
-
-        node_info: dict[str, tuple[str, list[str]]] = {}
-        pred: dict[str, list[str]] = {}
-        succ: dict[str, list[str]] = {}
-        for n in g.node:
-            outs = [sanitize(o) for o in n.output if o]
-            ins = [sanitize(i) for i in n.input if i]
-            for out in outs:
-                node_info.setdefault(out, (n.op_type, ins))
-                pred.setdefault(out, []).extend(ins)
-            for i in ins:
-                succ.setdefault(i, []).extend(outs)
-
-        def _value_size(vi) -> int | None:
-            s = 1
-            for d in vi.type.tensor_type.shape.dim:
-                v = d.dim_value
-                if v and v > 0:
-                    s *= int(v)
-                else:
-                    return None
-            return s
-
-        input_sizes: dict[str, int] = {}
-        for t in g.input:
-            s = _value_size(t)
-            if s:
-                input_sizes[sanitize(t.name)] = s
-
-        # ONNX 计算图遍历顺序（sanitized 张量名）：用于统计图/报告按图顺序排序
-        order = []
-        for n in g.node:
-            for o in n.output:
-                if o:
-                    s = sanitize(o)
-                    if s not in order:
-                        order.append(s)
-        for t in g.output:
-            s = sanitize(t.name)
-            if s not in order:
-                order.append(s)
-
-        return {
-            'tensors': tensors,
-            'node_info': node_info,
-            'pred': pred,
-            'succ': succ,
-            'inputs': [sanitize(t.name) for t in g.input],
-            'outputs': [sanitize(t.name) for t in g.output],
-            'input_sizes': input_sizes,
-            'order': order,
-        }
-
-    def _match_tensor(self, layer_name: str, graph: dict) -> str | None:
-        """将 raw 文件名（不含 .raw）匹配到清洗后的 ONNX 张量名。"""
-        candidates = {layer_name, '_' + layer_name, layer_name.lstrip('_')}
-        for c in candidates:
-            if c in graph['tensors']:
-                return c
-        best: str | None = None
-        best_len = -1
-        for t in graph['tensors']:
-            for c in candidates:
-                if c.startswith(t) and len(t) > best_len:
-                    best, best_len = t, len(t)
-        return best
-
-    def _build_layer_graph(self, rows: list[dict], graph: dict):
-        """构建"层图"：以结果行为节点，边由 ONNX 张量依赖推导。"""
-        succ = graph['succ']
-
-        tensor_layers: dict[str, list[str]] = defaultdict(list)
-        for r in rows:
-            tensor_layers[r['tensor']].append(r['layer_name'])
-
-        node_order = {r['layer_name']: i for i, r in enumerate(rows)}
-        children: dict[str, list[str]] = defaultdict(list)
-
-        def add_edge(a: str | None, b: str | None) -> None:
-            if a and b and a != b:
-                children[a].append(b)
-
-        for tin, lst in tensor_layers.items():
-            if tin is None:
-                continue
-            for i in range(len(lst) - 1):
-                add_edge(lst[i], lst[i + 1])
-
-        for tin, lst in tensor_layers.items():
-            if tin is None:
-                continue
-            l_in = lst[-1]
-            visited: set[str] = set()
-            dq = deque(succ.get(tin, []))
-            while dq:
-                t = dq.popleft()
-                if t in visited:
-                    continue
-                visited.add(t)
-                if t in tensor_layers:
-                    add_edge(l_in, tensor_layers[t][0])
-                    continue
-                dq.extend(succ.get(t, []))
-
-        for k in children:
-            children[k] = sorted(set(children[k]), key=lambda x: node_order[x])
-
-        parents: dict[str, list[str]] = defaultdict(list)
-        for a, cl in children.items():
-            for b in cl:
-                parents[b].append(a)
-
-        return children, parents, tensor_layers
-
-    def _build_terminal_nodes(self, results: list[dict], children: dict, parents: dict, graph: dict):
-        """在真实层之外追加 Input / Output 示意终端节点并连边。"""
-        tensor_layers = defaultdict(list)
-        for r in results:
-            if r.get('tensor') is not None:
-                tensor_layers[r['tensor']].append(r['layer_name'])
-        tensor_to_layer = {t: lst[-1] for t, lst in tensor_layers.items()}
-        node_order = {r['layer_name']: i for i, r in enumerate(results)}
-
-        aug_children = defaultdict(list)
-        aug_parents = defaultdict(list)
-        for a, cl in children.items():
-            aug_children[a] = list(cl)
-            for b in cl:
-                aug_parents[b].append(a)
-
-        succ = graph['succ']
-        pred = graph['pred']
-
-        input_rows: list[dict] = []
-        input_layers: list[str] = []
-        for inp in graph['inputs']:
-            onnx_name = graph['tensors'].get(inp, inp)
-            input_layers.append(onnx_name)
-            targets: list[str] = []
-            seen: set[str] = set()
-            dq = deque(succ.get(inp, []))
-            while dq:
-                t = dq.popleft()
-                if t in seen:
-                    continue
-                seen.add(t)
-                if t in tensor_layers:
-                    targets.append(tensor_layers[t][0])
-                    continue
-                dq.extend(succ.get(t, []))
-            targets = sorted(set(targets), key=lambda x: node_order.get(x, 0))
-            for tgt in targets:
-                aug_children[onnx_name].append(tgt)
-                aug_parents[tgt].append(onnx_name)
-            input_rows.append({
-                'layer_name': onnx_name, 'op_type': 'Input',
-                'entire_cos': None, 'entire_euc': None,
-                'single_cos': None, 'single_euc': None,
-            })
-
-        existing_names = set(node_order) | set(input_layers)
-        output_layers: list[str] = []
-        output_rows: list[dict] = []
-        for out in graph['outputs']:
-            onnx_out = graph['tensors'].get(out, out)
-            node_name = onnx_out if onnx_out not in existing_names else f'{onnx_out} (out)'
-            output_layers.append(node_name)
-            if out in tensor_to_layer:
-                producers = [tensor_to_layer[out]]
-            else:
-                producers = []
-                seen: set[str] = set()
-                dq = deque(pred.get(out, []))
-                while dq:
-                    t = dq.popleft()
-                    if t in seen:
-                        continue
-                    seen.add(t)
-                    if t in tensor_layers:
-                        producers.append(tensor_layers[t][-1])
-                        continue
-                    dq.extend(pred.get(t, []))
-                producers = sorted(set(producers), key=lambda x: node_order.get(x, 0))
-            for prod in producers:
-                aug_children[prod].append(node_name)
-                aug_parents[node_name].append(prod)
-            output_rows.append({
-                'layer_name': node_name, 'op_type': 'Output',
-                'entire_cos': None, 'entire_euc': None,
-                'single_cos': None, 'single_euc': None,
-            })
-
-        return input_rows, output_rows, input_layers, output_layers, aug_children, aug_parents
-
 
 
 class AccuracyGraph:
@@ -2290,6 +2182,5 @@ class AccuracyGraph:
             import webbrowser
             webbrowser.open(self.output_path.as_uri())
         return str(self.output_path)
-
 
 
