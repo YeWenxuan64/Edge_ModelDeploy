@@ -44,7 +44,7 @@ from aimet_onnx.cross_layer_equalization import equalize_model
 # utils.py 共享的子图节点搜索 / 归一化烘焙（与 onnx_to_qnn 的 QAIRT overrides / modify_onnx_model 同一实现）
 current_dir = Path(__file__).parent.resolve()
 sys.path.append(str(current_dir))
-from utils import letterbox_image, parse_bitwidth, clean_files_or_dirs, read_dataset_txt_to_list
+from utils import letterbox_image, sanitize_name, parse_bitwidth, clean_files_or_dirs, read_dataset_txt_to_list
 from utils import get_onnx_model_info, find_hybrid_subgraph_nodes, normalize_onnx_model
 
 
@@ -272,15 +272,18 @@ class AimetOnnxQuantizer:
         """
 
         # 临时工作目录：默认 utilities/tmp onnx_to_qnn 的 utilities/tmp 一致）
-        self.work_dir = Path(__file__).resolve().parent / 'tmp'
-        self.work_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir = Path(__file__).resolve().parent / 'tmp'
+        sanitize_model_name = sanitize_name(self.model_path.stem)
+
+        self.tmp_work_dir = tmp_dir / f"{sanitize_model_name}_to_qdq_onnx"
+        self.tmp_work_dir.mkdir(parents=True, exist_ok=True)
 
         self.model_path = Path(model_path).resolve()
 
         if quantized_model_path is not None:
             self.quantized_model_path = Path(quantized_model_path).resolve()
         else:
-            self.quantized_model_path = self.work_dir / f"{self.model_path.stem}_qdq.onnx"
+            self.quantized_model_path = self.tmp_work_dir / f"{self.model_path.stem}_qdq.onnx"
 
         # dataset_path 可为 None：此时默认走自定义校准集（use_custom_calibration_data）
         self.dataset_path = Path(dataset_path).resolve() if dataset_path is not None else None
@@ -484,12 +487,12 @@ class AimetOnnxQuantizer:
             self.quantized_model_path.stem,
             encoding_version='2.0.0',
             export_encodings=True,
-            encodings_dir=None if export_encodings else str(self.work_dir),
+            encodings_dir=None if export_encodings else str(self.tmp_work_dir),
         )
 
         # 4) 可选精度分析（FP32 vs 量化输出对比）
         if self.accuracy_analysis_picture_list is not None:
-            acc_txt = self.work_dir / 'accuracy_analysis.txt'
+            acc_txt = self.tmp_work_dir / 'accuracy_analysis.txt'
             with open(str(acc_txt), 'w') as f:
                 for line in self.accuracy_analysis_picture_list:
                     f.write(line + '\n')
@@ -585,7 +588,7 @@ class AimetOnnxQuantizer:
 
         # 对称/非对称通过改写 quantsim_config（defaults 级）应用：把内置配置复制到
         # 工作目录、改好对称性后再传给 QuantizationSimModel，不再逐个量化器改属性。
-        config_path = self._build_quantsim_config(self.work_dir / 'aimet_quantsim_config.json')
+        config_path = self._build_quantsim_config(self.tmp_work_dir / 'aimet_quantsim_config.json')
         self.config_file_applied = config_path
 
         print(f"[AIMET] quantsim_config applied: {config_path} " f"(param={self.param_quant_schema}, act={self.act_quant_schema})")
@@ -916,8 +919,8 @@ class AimetOnnxQuantizer:
 
         qdq_model = self.sim.to_onnx_qdq()
         fp32_model = self._model
-        qdq_path = str(self.work_dir / '_compare_qdq.onnx')
-        fp32_path = str(self.work_dir / '_compare_fp32.onnx')
+        qdq_path = str(self.tmp_work_dir / '_compare_qdq.onnx')
+        fp32_path = str(self.tmp_work_dir / '_compare_fp32.onnx')
         onnx.save(qdq_model, qdq_path)
         onnx.save(fp32_model, fp32_path)
 

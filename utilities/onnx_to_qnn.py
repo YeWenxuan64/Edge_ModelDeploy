@@ -6,8 +6,6 @@ import shutil
 import subprocess
 from pathlib import Path
 from itertools import zip_longest
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor, Future
 
 import numpy as np
 import cv2
@@ -72,6 +70,11 @@ class QAIRTScript:
             'x86_64-linux-clang': 'bin/x86_64-linux-clang/qnn-net-run',
             'aarch64-oe-linux-gcc11.2': 'bin/aarch64-oe-linux-gcc11.2/qnn-net-run',
         },
+        "qnn-context-binary-generator": {
+            'x86_64-windows-msvc': 'bin/x86_64-windows-msvc/qnn-context-binary-generator.exe',
+            'x86_64-linux-clang': 'bin/x86_64-linux-clang/qnn-context-binary-generator',
+            'aarch64-oe-linux-gcc11.2': 'bin/aarch64-oe-linux-gcc11.2/qnn-context-binary-generator',
+        }
     }
 
     LIB_PATHS = {
@@ -375,7 +378,7 @@ class QnnAimetConnector:
         """
         converter = self.converter
         tmp_onnx_path = converter.tmp_onnx_path
-        qdq_model_path = converter.tmp_dir / f"{tmp_onnx_path.stem}_qdq.onnx"
+        qdq_model_path = converter.tmp_work_dir / f"{tmp_onnx_path.stem}_qdq.onnx"
 
         # 1.
         from onnx_aimet_quant import AimetOnnxQuantizer
@@ -513,9 +516,8 @@ class OnnxToQNN:
             raise ValueError(f"Invalid target platform: {target_platform}. Available options: {self.architecture_dict.keys()}")
 
 
-        current_dir = os.path.dirname(os.path.abspath(__file__)) # 获取当前文件所在目录的绝对路径
-
-        qairt_path = Path(current_dir).resolve() / 'qairt'
+        current_dir = Path(__file__).resolve().parent # 获取当前文件所在目录的绝对路径
+        qairt_path = current_dir / 'qairt'
 
         # 版本号间隔较大，依赖目录名排序即可：字典序最大的即最新版本
         version_dir = max(
@@ -526,10 +528,15 @@ class OnnxToQNN:
         self.qnn_sdk_dir = version_dir
         QAIRTScript.set_sdk_root(self.qnn_sdk_dir)
 
-        self.tmp_dir = Path(os.path.join(current_dir, 'tmp')) # 构建tmp目录的绝对路径
+        self.tmp_dir = current_dir / 'tmp' # 构建tmp根目录的绝对路径
 
+        # 与 onnx_to_rknn.py 一致：每个模型一个独立工作子目录，避免多模型
+        # 转换时中间产物（dlc/calibration/output 等）在同一目录下互相污染。
         sanitize_model_name = sanitize_name(self.model_path.stem)
-        tmp_onnx_path = self.tmp_dir / sanitize_model_name
+        self.tmp_work_dir = self.tmp_dir / f"{sanitize_model_name}_to_qnn"
+        self.tmp_work_dir.mkdir(parents=True, exist_ok=True)
+
+        tmp_onnx_path = self.tmp_work_dir / sanitize_model_name
         self.tmp_onnx_path = tmp_onnx_path.with_suffix('.onnx')
 
         self.quantize_args:dict[str, str|int|bool] = {
@@ -721,8 +728,8 @@ class OnnxToQNN:
                 - For models with multiple inputs, provide multiple image paths. Example: ['/home/xxx/1.jpg', '/home/xxx/2.jpg']
                 - Defaults to None.
         """
-        from accuracy_debugger import QAIRTAccuracyDebugger
-        self.accuracy_analyzer = QAIRTAccuracyDebugger(self.tmp_dir, self.tmp_onnx_path, accuracy_analysis_picture_list, QAIRTScript)
+        from accuracy_debugger import QnnAccuracyDebugger
+        self.accuracy_analyzer = QnnAccuracyDebugger(self.tmp_work_dir, self.tmp_onnx_path, accuracy_analysis_picture_list, QAIRTScript)
 
         print(f"[OnnxToQNN] Accuracy analysis data list set to: {accuracy_analysis_picture_list}")
 
@@ -897,8 +904,8 @@ class OnnxToQNN:
                 key, value = line.split('=', 1)
                 os.environ[key] = value
 
-        # QAIRT 工具需要可写临时目录（受限环境系统 TEMP 不可写），指向项目 tmp
-        qairt_tmp_dir = self.tmp_dir / 'qairt_tmp'
+        # QAIRT 工具需要可写临时目录（受限环境系统 TEMP 不可写），指向模型工作子目录
+        qairt_tmp_dir = self.tmp_work_dir / 'qairt_tmp'
         qairt_tmp_dir.mkdir(parents=True, exist_ok=True)
         os.environ['QAIRT_TMP_DIR'] = str(qairt_tmp_dir)
         self.file_or_dir_to_clean.append(qairt_tmp_dir)
@@ -906,7 +913,7 @@ class OnnxToQNN:
         return True
 
     def modify_onnx_model(self, mean_rgb:list[list[int|float,]]=[[0, 0, 0]], std_rgb:list[list[int|float,]]=[[1, 1, 1]]):
-        self.tmp_dir.mkdir(exist_ok=True) # 确保tmp目录存在
+        self.tmp_work_dir.mkdir(exist_ok=True) # 确保模型工作目录存在
 
         if not self.model_path.exists():
             print(f"[OnnxToQNN] Error: ONNX file not found at {self.model_path}")
@@ -940,55 +947,57 @@ class OnnxToQNN:
                 --float_bitwidth（QDQ 模型自带编码），且未指定 output_dlc_name 时
                 输出名自动带 _quantized 后缀（与 QAIRT 标准路径 quantize_model 一致）。
         """
-        layout_params = [] # 构建输入布局参数
+
+        # input_network
+        if input_network_path is None:
+            input_network_path = str(self.tmp_onnx_path)
+
+        # output_path
+        if output_dlc_name is None and is_quantized:
+            output_dlc_name = f"{self.tmp_onnx_path.stem}_quantized"
+
+        if output_dlc_name is not None:
+            output_dlc_path = self.tmp_onnx_path.parent / f"{output_dlc_name}.dlc"
+        else:
+            output_dlc_path = self.tmp_onnx_path.with_suffix('.dlc')
+
+        # desired_input
+        layout_args = ""
         for input_info in onnx_model_info.get("inputs"): 
             input_name = input_info["name"]
             
             if set_input_order == 'nhwc': # 为每个输入添加源布局和目标布局参数
-                layout_params.extend([f'--source_model_input_layout "{input_name}" NCHW', f'--desired_input_layout "{input_name}" NHWC'])
+                layout_args += f' --source_model_input_layout "{input_name}" NCHW --desired_input_layout "{input_name}" NHWC'
                 
-            layout_params.extend([f'--desired_input_color_encoding "{input_name}" rgb rgb'])
+            layout_args += f' --desired_input_color_encoding "{input_name}" rgb rgb'
         
-        layout_args = " ".join(layout_params) # 将布局参数拼接成字符串
-
-
-        extra_args = "--target_backend HTP --onnx_skip_simplification " # --onnx_summary' # --preserve_onnx_output_order
-
+        # quantization
+        quant_args = ""
         if not is_quantized and not self.dataset_path and not self.custom_calibration_data_path:
-            extra_args += " --float_bitwidth 16"
+            quant_args += " --float_bitwidth 16"
 
         if quantization_overrides_path:
             self.file_or_dir_to_clean.append(quantization_overrides_path)
 
-            extra_args += f" --quantization_overrides {quantization_overrides_path}"
+            quant_args += f" --quantization_overrides {quantization_overrides_path}"
 
             if self.hybrid_quantizer is not None:
                 hybrid_quantization_dict = self.hybrid_quantizer.hybrid_quantization
                 if hybrid_quantization_dict["dtype"] == "float":
-                    extra_args += f" --float_bitwidth {hybrid_quantization_dict['weights_bitwidth']}"
+                    quant_args += f" --float_bitwidth {hybrid_quantization_dict['weights_bitwidth']}"
 
+        extra_args = "--target_backend HTP --onnx_skip_simplification " # --onnx_summary' # --preserve_onnx_output_order
 
-        if output_dlc_name is None and is_quantized:
-            # 量化(QDQ) DLC 自动带 _quantized 后缀（与 QAIRT 标准路径 quantize_model 输出一致）
-            output_dlc_name = f"{self.tmp_onnx_path.stem}_quantized"
-
-        if output_dlc_name is not None:
-            dlc_path = self.tmp_onnx_path.parent / f"{output_dlc_name}.dlc"
-        else:
-            dlc_path = self.tmp_onnx_path.with_suffix('.dlc')
-
-        if input_network_path is None:
-            input_network_path = str(self.tmp_onnx_path)
-
-        command = f"{QAIRTScript.get_tool('qairt-converter')} --input_network {input_network_path} {layout_args} {extra_args} -o {dlc_path}"
+        # build command
+        exe_qairt_converter = QAIRTScript.get_tool('qairt-converter')
+        command = f"{exe_qairt_converter} --input_network {input_network_path} --output_path {output_dlc_path} {layout_args} {quant_args} {extra_args} "
 
         return_code = run_command(command, signature="[OnnxToQNN]")
         
         if return_code == 0:
             print("[OnnxToQNN] Convert onnx to qnn-dlc successful!")
-
-            self.file_or_dir_to_clean.append(dlc_path)
-            return dlc_path
+            self.file_or_dir_to_clean.append(output_dlc_path)
+            return output_dlc_path
         
         else:
             return None
@@ -1010,7 +1019,7 @@ class OnnxToQNN:
             calibration_files = [] # 为每个输入创建目录和文件列表
             for idx, input_info in enumerate(onnx_model_info["inputs"]):
                 # 创建输出目录
-                output_dir = self.tmp_dir / f"calibration_data_for_input{idx + 1}"
+                output_dir = self.tmp_work_dir / f"calibration_data_for_input{idx + 1}"
                 output_dir.mkdir(parents=True, exist_ok=True)
                 self.file_or_dir_to_clean.append(output_dir)
 
@@ -1075,7 +1084,7 @@ class OnnxToQNN:
 
 
             # 创建当前输入的校准数据索引文件
-            calibration_data_index = self.tmp_dir / f"calibration_data.txt"
+            calibration_data_index = self.tmp_work_dir / f"calibration_data.txt"
             with open(str(calibration_data_index), 'w') as f:
                 # 使用zip_longest处理不等长列表，空值用空字符串填充
                 for row in zip_longest(*calibration_files, fillvalue=''):
@@ -1097,40 +1106,43 @@ class OnnxToQNN:
             return None
 
     def quantize_model(self, dlc_model_path:str, calibration_data_index_path:str) -> str|None:
-        dlc_model_file = Path(str(dlc_model_path))
+        # input_dlc
+        dlc_model_file = Path(dlc_model_path)
+
+        # input_list
         input_list_str = str(calibration_data_index_path)
-        quantized_dlc_model_path = dlc_model_file.parent / f"{dlc_model_file.stem}_quantized.dlc"
 
-        if not dlc_model_file.exists():
-            print(f"[OnnxToQNN] Error: DLC model not found at {dlc_model_file}")
-            return None
+        # output_dlc
+        quantized_dlc_path = dlc_model_file.parent / f"{dlc_model_file.stem}_quantized.dlc"
 
+        # quantization
         weights_bitwidth, act_bitwidth = parse_bitwidth(self.quantize_args['bitwidth'])
 
-        quantize_args = f'--weights_bitwidth {weights_bitwidth}'
-        quantize_args += f' --act_bitwidth {act_bitwidth} '
+        quantize_args = f'--weights_bitwidth {weights_bitwidth} --act_bitwidth {act_bitwidth}'
         quantize_args += f' --bias_bitwidth {self.quantize_args["bias_bitwidth"]}'
-        quantize_args += f' --use_per_channel_quantization'
         quantize_args += f' --param_quantizer_calibration {self.quantize_args["param_quant_method"]}'
         quantize_args += f' --act_quantizer_calibration {self.quantize_args["act_quant_method"]}'
         quantize_args += f" --param_quantizer_schema {self.quantize_args['param_quant_schema']}"
         quantize_args += f" --act_quantizer_schema {self.quantize_args['act_quant_schema']}"
+        quantize_args += f' --use_per_channel_quantization'
         if self.quantize_args["use_cle_algorithm"]:
             quantize_args += " --use_cle_algorithm"
 
-        extra_args = f'{quantize_args} --target_backend HTP'
-        
-        command = f"{QAIRTScript.get_tool('qairt-quantizer')} --input_dlc {dlc_model_path} --input_list {input_list_str} --output_dlc {quantized_dlc_model_path} {extra_args}"
+        extra_args = f'--target_backend HTP'
 
-        with temporary_chdir(self.tmp_dir):
+        # build command
+        exe_qairt_quantizer = QAIRTScript.get_tool('qairt-quantizer')
+        command = f'{exe_qairt_quantizer} --input_dlc {dlc_model_path} --input_list {input_list_str} --output_dlc {quantized_dlc_path} {quantize_args} {extra_args}'
+
+        with temporary_chdir(self.tmp_work_dir):
             return_code = run_command(command, signature="[OnnxToQNN]")
 
-        self.file_or_dir_to_clean.append(self.tmp_dir / 'output')
+        self.file_or_dir_to_clean.append(self.tmp_work_dir / 'output')
 
         if return_code == 0:
-            self.file_or_dir_to_clean.append(quantized_dlc_model_path)
+            self.file_or_dir_to_clean.append(quantized_dlc_path)
             print("[OnnxToQNN] Model quantization completed successfully!")
-            return quantized_dlc_model_path
+            return quantized_dlc_path
         else:
             print("[OnnxToQNN] Error during model quantization.")
             return None
@@ -1188,16 +1200,19 @@ class OnnxToQNN:
         return config_file_path
 
     def generate_context_binary_model(self, quantized_dlc_model_path:str, config_path:str) -> bool:
-        # 平台适配：backend / model 库名 Linux 为 .so（lib 前缀），Windows 为 .dll（无 lib 前缀）。
+        # model, backend
         if sys.platform.startswith('win'):
             model_lib, backend_lib = 'QnnModelDlc.dll', 'QnnHtp.dll'
         else:
             model_lib, backend_lib = 'libQnnModelDlc.so', 'libQnnHtp.so'
 
-        command = f"qnn-context-binary-generator --model {model_lib} --backend {backend_lib} --config_file {config_path}"
-        command += f" --dlc_path {quantized_dlc_model_path} --output_dir {self.qnn_model_path.parent} --binary_file {self.qnn_model_path.stem}"
+        # build command
+        exe_qnn_context_binary_generator = QAIRTScript.get_tool('qnn-context-binary-generator')
+        command = f'{exe_qnn_context_binary_generator} --model {model_lib} --backend {backend_lib} --config_file {config_path}'
+        command += f' --dlc_path {quantized_dlc_model_path} --output_dir {self.qnn_model_path.parent} --binary_file {self.qnn_model_path.stem}'
 
-        return_code = run_command(command, signature="[OnnxToQNN]")
+        with temporary_chdir(self.tmp_work_dir):
+            return_code = run_command(command, signature="[OnnxToQNN]")
 
         if return_code == 0:
             print("[OnnxToQNN] Context binary generation completed successfully!")

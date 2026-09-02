@@ -9,7 +9,7 @@ from rknn.api import RKNN
 current_dir = Path(__file__).parent.resolve()
 sys.path.append(str(current_dir))
 
-from utils import temporary_chdir, clean_files_or_dirs, read_dataset_txt_to_list
+from utils import temporary_chdir, sanitize_name, clean_files_or_dirs, read_dataset_txt_to_list
 
 
 
@@ -36,11 +36,12 @@ class OnnxToRKNN:
         
         current_dir = Path(__file__).parent.resolve() # 获取当前文件所在目录的绝对路径
         self.tmp_dir = current_dir / 'tmp' # 构建tmp目录的绝对路径
-
         self.model_path = Path(model_path).resolve()
         self.rknn_model_path = Path(rknn_model_path).resolve()
-        self.tmp_model_path = None
-		
+        
+        self.tmp_work_dir = self.tmp_dir / f"{sanitize_name(self.model_path.stem)}_to_rknn"
+        self.tmp_model_path = self.tmp_work_dir / self.model_path.name
+    
         if dataset_path is not None:
             self.dataset_path = Path(dataset_path).resolve()
         else:
@@ -56,16 +57,14 @@ class OnnxToRKNN:
         self.model_pruning = False
         self.flash_attention = False
 
-        # self.do_hybrid_quantization()
         self.custom_hybrid = None
-        
-        #self.set_do_accuracy_analysis()
         self.accuracy_analysis_picture_list = None
 
-        # 精度分析调试器（set_do_accuracy_analysis() 时创建，convert()/clean() 据此使用/清理）
         self.accuracy_analyzer = None
 
-        self.file_or_dir_to_clean = ["check0_base_optimize.onnx", "check1_fold_constant.onnx", "check2_correct_ops.onnx", "check3_fuse_ops.onnx"]
+        optimized_models = ["check0_base_optimize.onnx", "check1_fold_constant.onnx", "check2_correct_ops.onnx", "check3_fuse_ops.onnx"]
+        self.file_or_dir_to_clean:list[str|Path] = []
+        self.file_or_dir_to_clean.extend([self.tmp_work_dir / tmp_model for tmp_model in optimized_models])
 
     def extra_optimize(self, quantized_algorithm:str='normal', compress_weight:bool=False, model_pruning:bool=False, flash_attention:bool=False):
         """
@@ -121,7 +120,7 @@ class OnnxToRKNN:
         if accuracy_analysis_picture_list is not None:
             self.accuracy_analysis_picture_list = [str(Path(path).resolve()) for path in accuracy_analysis_picture_list]
             from accuracy_debugger import RknnAccuracyDebugger
-            self.accuracy_analyzer = RknnAccuracyDebugger(self.tmp_dir, self.tmp_dir / self.model_path.name)
+            self.accuracy_analyzer = RknnAccuracyDebugger(self.tmp_work_dir, self.tmp_model_path)
         else:
             self.accuracy_analysis_picture_list = None
             self.accuracy_analyzer = None
@@ -144,11 +143,12 @@ class OnnxToRKNN:
         """
 
         self.tmp_dir.mkdir(exist_ok=True)
+        self.tmp_work_dir.mkdir(parents=True, exist_ok=True)
 
         if self.dataset_path is not None: # 读取数据集文件
             dataset_path_list = read_dataset_txt_to_list(self.dataset_path)
 
-            tmp_dataset_path = self.tmp_dir / self.dataset_path.name
+            tmp_dataset_path = self.tmp_work_dir / self.dataset_path.name
             with open(tmp_dataset_path, 'w') as f:
                 for paths in dataset_path_list:
                     f.write(' '.join(paths) + '\n')
@@ -157,19 +157,19 @@ class OnnxToRKNN:
             self.file_or_dir_to_clean.append(self.dataset_path)
 
         # 复制 onnx 模型到 tmp 目录，转换在 tmp 目录内进行，避免污染原模型
-        self.tmp_model_path = self.tmp_dir / self.model_path.name
         shutil.copy2(self.model_path, self.tmp_model_path)
         self.file_or_dir_to_clean.append(self.tmp_model_path)
 
-        with temporary_chdir(self.tmp_dir):
+        with temporary_chdir(self.tmp_work_dir):
             self.self_convert(mean_rgb, std_rgb)
 
         if self.accuracy_analyzer is not None:
             self.accuracy_analyzer.plot_accuracy_analysis()
-            self.accuracy_analyzer.plot_network_analysis(show=True) # 带路径追踪的精度分析（Netron 风格网络图）
+            self.accuracy_analyzer.draw_network_analysis(show=True) # 带路径追踪的精度分析（Netron 风格网络图）
 
     def clean(self):
-        clean_files_or_dirs([str(self.tmp_dir / name) for name in self.file_or_dir_to_clean])
+        clean_files_or_dirs(self.file_or_dir_to_clean)
+
         if self.accuracy_analyzer:
             self.accuracy_analyzer.clean()
 
@@ -201,7 +201,9 @@ class OnnxToRKNN:
                 model_input = model_name + ".model" # 表示第一步生成的模型文件
                 data_input = model_name + ".data" # 表示第一步生成的配置文件
                 model_quantization_cfg = model_name + ".quantization.cfg" # 表示第一步生成的量化配置文件
-                self.file_or_dir_to_clean.extend([model_input, data_input, model_quantization_cfg])
+
+                tmp_hybrid_quant_cfg = [model_input, data_input, model_quantization_cfg]
+                self.file_or_dir_to_clean.extend([self.tmp_work_dir / file for file in tmp_hybrid_quant_cfg])
 
                 ret = rknn.hybrid_quantization_step1(dataset=self.dataset_path, proposal=False, custom_hybrid=self.custom_hybrid)
                 ret = rknn.hybrid_quantization_step2(model_input, data_input, model_quantization_cfg)  
@@ -227,7 +229,6 @@ class OnnxToRKNN:
         if self.accuracy_analysis_picture_list is not None:
             print(f'[OnnxToRKNN] accuracy_analysis_picture_list: {self.accuracy_analysis_picture_list}')
             rknn.accuracy_analysis(inputs=self.accuracy_analysis_picture_list)
-            self.file_or_dir_to_clean.append(str(self.tmp_dir / "snapshot"))
 
         # Release
         rknn.release()

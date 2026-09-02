@@ -7,8 +7,9 @@ import random
 import heapq
 import shutil
 from pathlib import Path
+from typing import Callable
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future
 
 import numpy as np
 import cv2
@@ -1027,3 +1028,29 @@ def run_command(command: str, signature: str = "") -> int:
 
     return_code = process.poll()
     return return_code
+
+
+class MultThreadExetutor:
+    threadpool = None
+    future_list:list[Future] = []
+
+    @classmethod
+    def run_exetutor(cls, exetutor:Callable, *args, **kwargs):
+        if cls.threadpool is None:
+            cls.threadpool = ThreadPoolExecutor(max_workers=8)
+            cls.future_list.clear()
+
+        future = cls.threadpool.submit(exetutor, *args, **kwargs)
+        cls.future_list.append(future)
+
+    @classmethod
+    def wait_and_close(cls) -> list[int]:
+        return_code_list:list[int] = []
+        if cls.threadpool is not None:
+            cls.threadpool.shutdown(wait=True)
+
+            return_code_list.extend([future.result() for future in cls.future_list])
+
+        cls.threadpool = None
+
+        return return_code_list

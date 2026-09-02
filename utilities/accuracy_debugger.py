@@ -15,7 +15,7 @@ import cv2
 
 current_dir = Path(__file__).parent.resolve()
 sys.path.append(str(current_dir))
-from utils import clean_files_or_dirs, run_command, parse_bitwidth
+from utils import clean_files_or_dirs, run_command, MultThreadExetutor
 
 
 
@@ -151,19 +151,16 @@ class RknnAccuracyDebugger:
     用 matplotlib 可视化、并解析 ONNX 图结构以进行路径追踪。
 
     Attributes:
-        tmp_dir (Path): 存放精度分析与中间产物的目录。
+        tmp_work_dir (Path): 存放精度分析与中间产物的目录。
         tmp_model_path (Path): convert() 复制到 tmp 目录的模型副本（图结构分析使用）。
         snapshot_dir (Path): RKNN 精度分析快照目录（snapshot/）。
     """
 
-    def __init__(self, tmp_dir:str, tmp_model_path:str, snapshot_dir:str|None=None):
-        self.tmp_dir = Path(tmp_dir).resolve()
+    def __init__(self, tmp_work_dir:str, tmp_model_path:str):
+        self.tmp_work_dir = Path(tmp_work_dir).resolve()
         self.tmp_model_path = Path(tmp_model_path).resolve()
 
-        if snapshot_dir is not None:
-            self.snapshot_dir = Path(snapshot_dir).resolve()
-        else:
-            self.snapshot_dir = self.tmp_dir / 'snapshot'
+        self.snapshot_dir = self.tmp_work_dir / 'snapshot'
 
         self.file_or_dir_to_clean:list[str] = []
         self.file_or_dir_to_clean.append(self.snapshot_dir)
@@ -263,7 +260,7 @@ class RknnAccuracyDebugger:
         single_cos = np.array([r['single_cos'] for r in rows], dtype=float)
         single_euc = np.array([r['single_euc'] for r in rows], dtype=float)
 
-        save_path = self.tmp_dir / 'rknn_accuracy_analysis_summary.png'
+        save_path = self.tmp_work_dir / 'rknn_accuracy_analysis_summary.png'
 
         plot_accuracy_summary(
             names=layer_names,
@@ -277,52 +274,6 @@ class RknnAccuracyDebugger:
 
         self.file_or_dir_to_clean.append(save_path)
 
-        # # 图例颜色/样式与 QNN 精度分析保持一致
-        # fig, (ax_euc, ax_cos) = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
-        # ax_euc:axes.Axes
-        # ax_cos:axes.Axes
-
-        # # 图1：欧氏距离（逐层柱状）+ 累积欧氏距离（右侧纵轴折线）
-        # ax_euc.set_yscale('linear')
-        # ax_euc.bar(x, single_euc, color='skyblue', edgecolor='black', linewidth=0.5, alpha=0.7, label='Euc Dist Per Layer')
-        # ax_euc.set_title('Euclidean Distance & Euc(entire) (Per Layer)', fontsize=14, fontweight='bold')
-        # ax_euc.set_ylabel('Euclidean Distance', fontsize=12)
-        # ax_euc.grid(True, which='both', ls='--', alpha=0.5)
-
-        # # 右侧纵轴：累积欧氏距离（entire，与单层欧氏距离量级接近，分离显示便于对比）
-        # ax_entire = ax_euc.twinx()
-        # ax_entire.plot(x, entire_euc, color='orange', marker='.', linestyle='-', linewidth=1.5, markersize=2, label='Euc (entire)')
-        # ax_entire.set_ylabel('Euc (entire)', fontsize=12)
-
-        # # 合并两个轴的图例
-        # lines_euc, labels_euc = ax_euc.get_legend_handles_labels()
-        # lines_entire, labels_entire = ax_entire.get_legend_handles_labels()
-        # ax_euc.legend(lines_euc + lines_entire, labels_euc + labels_entire, loc='upper left')
-
-        # # 图2：余弦相似度（逐层折线）
-        # ax_cos.set_yscale('linear')
-        # ax_cos.plot(x, single_cos, color='green', marker='.', linestyle='-', linewidth=1, markersize=2, label='Cosine (single)')
-        # ax_cos.plot(x, entire_cos, color='orange', marker='.', linestyle='-', linewidth=1.5, markersize=2, label='Cosine (entire)')
-        # ax_cos.set_title('Cosine Similarity (Per Layer)', fontsize=14, fontweight='bold')
-        # ax_cos.set_ylabel('Cosine Similarity', fontsize=12)
-        # ax_cos.set_xticks(range(n))
-        # ax_cos.set_xticklabels(layer_names, rotation=-45, ha='left', fontsize=10)
-
-        # ax_cos.axhline(0.99, color='red', linestyle='--', linewidth=1, alpha=0.6, label='Warning Threshold (0.99)')
-        # ax_cos.legend(loc='lower left')
-        # ax_cos.grid(True, which='both', ls='--', alpha=0.5)
-
-        # # 消除 x 轴两端默认的 5% 空白边距（留半个柱宽避免首尾柱被裁切）
-        # ax_cos.set_xlim(-0.5, n - 0.5)
-
-
-        # plt.tight_layout()
-        # save_path = self.tmp_dir / 'rknn_accuracy_analysis_summary.png'
-        # # self.file_or_dir_to_clean.append(save_path)
-
-        # plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
-        # print(f"Figure saved to: {save_path}")
-        # plt.show()
 
     # ------------------------------------------------------------------
     # 带路径追踪的精度分析：从多个输入到多个输出的排列组合路径
@@ -610,7 +561,7 @@ class RknnAccuracyDebugger:
         }
         return result
 
-    def plot_network_analysis(self, show:bool=True):
+    def draw_network_analysis(self, show:bool=True):
         """
         带路径追踪的精度分析（Netron 风格网络图）。
 
@@ -637,7 +588,7 @@ class RknnAccuracyDebugger:
         data['rows'] = data['rows'] + output_rows
         data['outputs'] = output_layers
 
-        output_path = self.tmp_dir / 'rknn_graph_accuracy_analysis.html'
+        output_path = self.tmp_work_dir / 'rknn_graph_accuracy_analysis.html'
         # self.file_or_dir_to_clean.append(output_path)
 
         viz = AccuracyGraph(
@@ -647,14 +598,16 @@ class RknnAccuracyDebugger:
             output_path=output_path,
             title='RKNN Graph Accuracy Analysis',
         )
-        viz.render(show=show)
+
+        html_path = viz.render(show=show)
+        self.file_or_dir_to_clean.append(html_path)
         return
 
     def clean(self):
         clean_files_or_dirs(self.file_or_dir_to_clean)
 
 
-class QAIRTAccuracyDebugger:
+class QnnAccuracyDebugger:
     """基于 qnn-net-run --dlc_path --debug 的双 DLC 精度对比分析器（独立类）。
 
     直接用两个 DLC 作为材料（FP32 golden + 量化 target）：
@@ -794,14 +747,16 @@ class QAIRTAccuracyDebugger:
         names, entire_cos, entire_euc, mse_vals = self.entire_accuracy_analysis(golden_dlc_path, target_dlc_path, input_list)
 
         # 统计显示 1：PNG 双子图（欧氏距离柱状 + 余弦折线）
+        plt_path = self.tmp_dir / 'qnn_accuracy_analysis_summary.png'
         plot_accuracy_summary(
             names=names,
             entire_euc=entire_euc,
             entire_cos=entire_cos,
             mse_vals=mse_vals,
             entire_val_color="blue",
-            save_path=self.tmp_dir / 'qnn_accuracy_analysis_summary.png',
+            save_path=plt_path,
         )
+        self.file_or_dir_to_clean.append(plt_path)
 
         # 统计显示 2：AccuracyGraph HTML（若有 ONNX 可建图结构）
         if self.onnx_path is not None:
@@ -823,13 +778,25 @@ class QAIRTAccuracyDebugger:
                 shutil.rmtree(d)
             d.mkdir(parents=True)
 
-        ret = self.run_qnn_net_run(golden_dlc_path, self.backend_lib_golden, input_list, str(golden_dir))
-        if ret != 0:
-            raise RuntimeError(f"qnn-net-run golden DLC failed with code {ret}")
+
+        MultThreadExetutor.run_exetutor(self.run_qnn_net_run, golden_dlc_path, self.backend_lib_golden, input_list, str(golden_dir))
+        MultThreadExetutor.run_exetutor(self.run_qnn_net_run, target_dlc_path, self.backend_lib_target, input_list, str(target_dir))
+
+        ret_list = MultThreadExetutor.wait_and_close()
+        if ret_list:
+            if ret_list[0] != 0:
+                raise RuntimeError(f"[QnnAccuracyDebugger] qnn-net-run golden DLC failed with code {ret_list[0]}")
+            if ret_list[1] != 0:
+                raise RuntimeError(f"[QnnAccuracyDebugger] qnn-net-run target DLC failed with code {ret_list[1]}")
+        else:
+            raise RuntimeError(f"[QnnAccuracyDebugger] qnn-net-run failed")
+        # ret = self.run_qnn_net_run(golden_dlc_path, self.backend_lib_golden, input_list, str(golden_dir))
+        # if ret != 0:
+        #     raise RuntimeError(f"qnn-net-run golden DLC failed with code {ret}")
         
-        ret = self.run_qnn_net_run(target_dlc_path, self.backend_lib_target, input_list, str(target_dir))
-        if ret != 0:
-            raise RuntimeError(f"qnn-net-run target DLC failed with code {ret}")
+        # ret = self.run_qnn_net_run(target_dlc_path, self.backend_lib_target, input_list, str(target_dir))
+        # if ret != 0:
+        #     raise RuntimeError(f"qnn-net-run target DLC failed with code {ret}")
 
         names, entire_cos, entire_euc, mse_vals = self._compare_dlc_outputs(golden_dir, target_dir)
         return names, entire_cos, entire_euc, mse_vals
@@ -910,7 +877,9 @@ class QAIRTAccuracyDebugger:
         output_path = self.tmp_dir / 'qnn_graph_accuracy_analysis.html'
         viz = AccuracyGraph(data=data, children=aug_children, parents=aug_parents,
                             output_path=output_path, title='QNN Graph Accuracy Analysis')
-        viz.render(show=show)
+        
+        html_path = viz.render(show=show)
+        self.file_or_dir_to_clean.append(html_path)
         return data
 
     def _build_onnx_tensor_graph(self) -> dict:
