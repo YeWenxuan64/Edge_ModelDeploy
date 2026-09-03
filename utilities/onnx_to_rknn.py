@@ -51,8 +51,9 @@ class OnnxToRKNN:
         if self.target_platform not in ['rk3588', 'rk3576', 'rk3566']:
             raise ValueError("target_platform must be 'rk3588' or 'rk3576' or 'rk3566'")
 
-        # self.extra_optimize()
-        self.quantized_algorithm = 'normal'
+        # self.set_quantization_method()
+        self.quant_method = 'normal'
+        self.bitwidth = "w8a8"
         self.compress_weight = False
         self.model_pruning = False
         self.flash_attention = False
@@ -66,12 +67,22 @@ class OnnxToRKNN:
         self.file_or_dir_to_clean:list[str|Path] = []
         self.file_or_dir_to_clean.extend([self.tmp_work_dir / tmp_model for tmp_model in optimized_models])
 
-    def extra_optimize(self, quantized_algorithm:str='normal', compress_weight:bool=False, model_pruning:bool=False, flash_attention:bool=False):
+    def set_quantization_method(self, quant_method:str='normal', bitwidth:str='w8a8', compress_weight:bool=False, model_pruning:bool=False, flash_attention:bool=False):
         """
         Args:
-            quantized_algorithm (str): The quantization algorithm to use. 
+            quant_method (str): The quantization algorithm to use. 
                 - Options: 'normal' for min-max quantization, 'kl_divergence' for KL divergence-based or 'mmse' for minimum mean square error quantization.
                 - Default is 'normal'.
+
+            bitwidth (str): Quantization bitwidth configuration in format 'w<W>a<A>', 
+                where W is weight bitwidth and A is activation bitwidth.
+                - Available options: 'w4a16', 'w8a8', 'w8a16', 'w16a16i', 'w16a16i_dfp'.
+                - w8a8: The weight is 8bit asymmetric quantitative accuracy, and the activation value is 8bit asymmetric quantitative accuracy. (RK2118 not supported)
+                - w4a16: The weight is 4bit asymmetric quantitative accuracy, the activation value is 16bit floating point accuracy. (Only RK3576/RV1126B supported)
+                - w8a16: The weight is 8bit asymmetric quantitative accuracy, the activation value is 16bit floating point accuracy. (Only RK3562 supported)
+                - w16a16i: The weight is 16bit asymmetric quantitative accuracy, the activation value is 16bit asymmetric quantitative accuracy. (Only RV1103/RV1106 supported)
+                - w16a16i_dfp: The weight is 16bit dynamic fixed-point quantitative accuracy, and the activation value is 16bit dynamic fixed-point quantitative accuracy. (Only RV1103/RV1106 supported)
+                - Default: 'w8a8'.
 
             compress_weight (bool): Whether to compress model weights to reduce memory usage. 
                 - Default is False.
@@ -83,15 +94,19 @@ class OnnxToRKNN:
                 - Default is False.
         """
 
-        if quantized_algorithm not in ['normal', 'kl_divergence', 'mmse']:
-            raise ValueError("quantized_algorithm must be 'normal' or 'kl_divergence' or 'mmse'")
-        
-        self.quantized_algorithm = quantized_algorithm
+        if quant_method not in ['normal', 'kl_divergence', 'mmse']:
+            raise ValueError("quant_method must be 'normal' or 'kl_divergence' or 'mmse'")
+
+        if bitwidth not in ['w4a16', 'w8a8', 'w8a16', 'w16a16i', 'w16a16i_dfp']:
+            raise ValueError("bitwidth must be 'w4a16', 'w8a8', 'w8a16', 'w16a16i', 'w16a16i_dfp'")
+
+        self.quant_method = quant_method
+        self.bitwidth = bitwidth
         self.compress_weight = compress_weight
         self.model_pruning = model_pruning
         self.flash_attention = flash_attention
 
-        print(f"[OnnxToRKNN] extra_optimize: quantized_algorithm={self.quantized_algorithm}, compress_weight={self.compress_weight}, model_pruning={self.model_pruning}, flash_attention={self.flash_attention}")
+        print(f"[OnnxToRKNN] set_quantization_method: quant_method={self.quant_method}, bitwidth={self.bitwidth}, compress_weight={self.compress_weight}, model_pruning={self.model_pruning}, flash_attention={self.flash_attention}")
 
     def do_hybrid_quantization(self, custom_hybrid:list[list[str]]|None=None):
         """
@@ -179,7 +194,8 @@ class OnnxToRKNN:
 
         # Pre-process config
         print('[OnnxToRKNN] Config model')
-        rknn.config(mean_values=mean_rgb, std_values=std_rgb, quantized_algorithm=self.quantized_algorithm, target_platform=self.target_platform, 
+        rknn.config(mean_values=mean_rgb, std_values=std_rgb, quantized_dtype=self.bitwidth, quantized_algorithm=self.quant_method, 
+                    target_platform=self.target_platform, 
                     compress_weight=self.compress_weight, model_pruning=self.model_pruning, enable_flash_attention=self.flash_attention)
         print('[OnnxToRKNN] done')
 
@@ -254,14 +270,12 @@ if __name__ == '__main__':
     converter = OnnxToRKNN(MODEL_PATH, RKNN_MODEL, DATASET_PATH, TARGET_PLATFORM)
 
     # 测试文件已存在，不做转换
-    # 图结构分析使用 tmp 目录下的 ONNX 模型副本（convert() 会复制到此）
-    tmp_model_path = converter.tmp_dir / converter.model_path.name
-
-    # 精度分析调试器：读取精度分析文件、plt 显示、解析图结构
-    debugger = RknnAccuracyDebugger(converter.tmp_dir, tmp_model_path)
+    # 图结构分析使用转换工作子目录下的 ONNX 模型副本（convert() 会复制到此）
+    from accuracy_debugger import RknnAccuracyDebugger
+    debugger = RknnAccuracyDebugger(converter.tmp_work_dir, converter.tmp_model_path)
 
     # 直接读取精度分析数据并绘制
     # debugger.plot_accuracy_analysis()
 
     # 带路径追踪的精度分析（Netron 风格网络图，多输入 -> 多输出 排列组合路径）
-    debugger.plot_network_analysis()
+    debugger.draw_network_analysis(show=True)

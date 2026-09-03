@@ -10,16 +10,18 @@
 | 转换工具 | 精度分析引擎 | 在本工具链的构造 | 触发方式 |
 |---------|------------|---------|---------|
 | `OnnxToRKNN` | RKNN Toolkit2 内置的 `rknn.accuracy_analysis()` | 直接调用 RKNN Toolkit2 内置的 `rknn.accuracy_analysis()` | 调用转换工具示例的方法 `set_do_accuracy_analysis()` 并传入图片 |
-| `OnnxToQNN` | QAIRT `snpe-accuracy-debugger` | 脚本多步骤调用 `snpe-accuracy-debugger` | 调用转换工具示例的方法 `set_do_accuracy_analysis()` 并传入图片 |
+| `OnnxToQNN` | QAIRT `qnn-net-run --debug`（双 DLC 对比） | `QnnAccuracyDebugger`：FP32 Golden DLC（CPU 后端）与量化 DLC（Linux 走 HTP / Windows 退化 CPU）各跑一次 `qnn-net-run --debug` 后逐张量对比 | 调用转换工具示例的方法 `set_do_accuracy_analysis()` 并传入图片 |
+
 
 ### 关注的指标
 
-精度分析围绕两个核心指标评估量化损失：
+精度分析围绕以下指标评估量化损失：
 
 | 指标 | 含义 | 判断方向 |
 |------|------|------|
 | **余弦相似度**<br> Cosine Similarity | 衡量两个张量在**方向**上的相似程度，范围 [0, 1]，1 表示完全一致 | 越接近 1 越好，< 0.99 需关注 |
 | **欧几里得距离**<br> Euclidean Distance(L2 Distance) | 衡量两个张量在**数值大小**上的绝对差异 | 越小越好，突增处即为问题层 |
+| **均方误差**<br> MSE (Mean Squared Error) | 衡量两个张量逐元素差值的平方均值，量级通常很小（千分之一~个位） | 越小越好（QNN 侧绘图时叠加在右轴，辅助判断欧氏距离的真假阳性） |
 
 > 两者结合使用：余弦相似度对方向敏感、不受数值缩放影响；<br>
 > 欧氏距离反映绝对量级差异。某层余弦相似度高但欧氏距离大，通常是合理的数值缩放（如量化引入的均匀缩放因子）；<br>
@@ -73,16 +75,16 @@ RKNN Toolkit2 内置的 `rknn.accuracy_analysis()` 自动执行
 
 ### 1.3 输出文件
 
-分析完成后，结果文件位于 `utilities/tmp/snapshot/` 下：
+分析完成后，结果文件位于 `utilities/tmp/<模型名>_to_rknn/` 下（`OnnxToRKNN` 为每个模型创建的**独立工作子目录**，快照在其 `snapshot/` 子目录中）：
 
 | 目录/文件 | 说明 |
 |----------|------|
-| `utilities/tmp/snapshot/golden/` | Golden（浮点）模型逐层中间张量（`.npy` 文件） |
-| `utilities/tmp/snapshot/simulator/` | Simulator（量化）模型逐层中间张量（`.npy` 文件） |
-| `utilities/tmp/snapshot/error_analysis.txt` | 完整逐层精度对比表（全部层数据） |
-| `utilities/tmp/snapshot/map_name_to_file.txt` | 层名与中间张量文件的映射表 |
-| `utilities/tmp/rknn_accuracy_analysis_summary.png` | 可视化汇总图表（调用 `plot_accuracy_analysis()` 生成，见[1.5](#15-可视化图表解读)） |
-| `utilities/tmp/rknn_graph_accuracy_analysis.html` | 可视化计算图精度分析 |
+| `<模型名>_to_rknn/snapshot/golden/` | Golden（浮点）模型逐层中间张量（`.npy` 文件） |
+| `<模型名>_to_rknn/snapshot/simulator/` | Simulator（量化）模型逐层中间张量（`.npy` 文件） |
+| `<模型名>_to_rknn/snapshot/error_analysis.txt` | 完整逐层精度对比表（全部层数据） |
+| `<模型名>_to_rknn/snapshot/map_name_to_file.txt` | 层名与中间张量文件的映射表 |
+| `<模型名>_to_rknn/rknn_accuracy_analysis_summary.png` | 可视化汇总图表（调用 `plot_accuracy_analysis()` 生成，见[1.5](#15-可视化图表解读)） |
+| `<模型名>_to_rknn/rknn_graph_accuracy_analysis.html` | 可视化计算图精度分析 |
 
 > 📁 以上文件在调用 `clean()` 清理前均可查阅。
 
@@ -135,7 +137,7 @@ I The error analysis results save to: ./snapshot/error_analysis.txt
 ### 1.5 可视化图表解读
 #### 1.5.1 统计图表
 
-精度分析完成后会自动读取 `utilities/tmp/snapshot/error_analysis.txt` 并生成可视化汇总图（指标含义参见[概述 · 关注的指标](#关注的指标)），默认保存为 `utilities/tmp/rknn_accuracy_analysis_summary.png`：
+精度分析完成后会自动读取 `utilities/tmp/<模型名>_to_rknn/snapshot/error_analysis.txt` 并生成可视化汇总图（指标含义参见[概述 · 关注的指标](#关注的指标)），默认保存为 `utilities/tmp/<模型名>_to_rknn/rknn_accuracy_analysis_summary.png`：
 
 ![rknn_accuracy_analysis_summary.png](./rknn_accuracy_analysis_summary.png)
 
@@ -154,7 +156,7 @@ I The error analysis results save to: ./snapshot/error_analysis.txt
 
 #### 1.5.2 计算图精度可视化
 
-除统计图表外，精度分析还会自动生成 **Netron 风格的可视化计算图**（`utilities/tmp/rknn_graph_accuracy_analysis.html`），以 DAG 形式呈现整个网络并按累积精度着色，便于观察误差沿数据流的传播路径。详见 [3. 可视化计算图精度分析](#3-可视化计算图精度分析)。
+除统计图表外，精度分析还会自动生成 **Netron 风格的可视化计算图**（`utilities/tmp/<模型名>_to_rknn/rknn_graph_accuracy_analysis.html`），以 DAG 形式呈现整个网络并按累积精度着色，便于观察误差沿数据流的传播路径。详见 [3. 可视化计算图精度分析](#3-可视化计算图精度分析)。
 
 ---
 
@@ -188,65 +190,69 @@ converter.convert(mean_rgb=[[0, 0, 0]], std_rgb=[[1, 1, 1]])
 > - 单输入模型传入一个图片路径；多输入模型按输入数量传入多个路径。
 > - `accuracy_analysis_picture_list` 中的图片**建议不被包含在量化校准数据中**，以确保评估的独立性。
 > - 需在 `convert()` **之前**调用；若未调用，精度分析将被跳过，不影响正常转换。
+> - `convert()` 会自动准备双 DLC 并完成对比：无混合量化时直接用转换产出的**未量化 DLC** 作为 Golden；混合量化时自动再转换一份**纯浮点 Golden DLC**（`<模型名>_golden.dlc`）作参考。
 
 ### 2.2 分析流程
 
-QNN 精度分析自动执行以下三步（**Step 1 与 Step 2 并行执行**，两者互不依赖）：
+QNN 精度分析由 `QnnAccuracyDebugger` 实现，核心是**双 DLC 逐张量对比**（不再依赖 `snpe-accuracy-debugger` / `qairt-accuracy-debugger`），自动执行以下步骤：
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Step 1: Golden 推理        ┐                             │
-│  使用 snpe-accuracy-debugger │ 并行                       │
-│  在未量化的 DLC 模型上推理    ├──────────────────────────── │
-│  得到各层浮点参考输出         │                             │
-├──────────────────────────────────────────────────────────┤
-│  Step 2: Quantized 推理     ┘                             │
-│  使用 snpe-accuracy-debugger 在量化后的 DLC 模型上推理     │
-│  得到各层量化输出 (Inference Results)                      │
-├──────────────────────────────────────────────────────────┤
-│  Step 3: Verification 对比                                │
-│  逐层计算 CosineSimilarity + MSE                          │
-│  生成 summary.csv 和可视化图表                             │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ ① 准备输入：精度分析图片 → 按 ONNX 输入信息 resize/归一化/布局  │
+│    转换 → .raw 文件 + input_list.txt                          │
+├──────────────────────────────────────────────────────────────┤
+│ ② Golden 推理（并行）：qnn-net-run --debug                    │
+│    FP32 Golden DLC → CPU 后端（libQnnCpu.so / .dll）          │
+│    逐层输出 .raw（文件名 = sanitized 张量名）                  │
+├──────────────────────────────────────────────────────────────┤
+│ ③ Target 推理（并行）：qnn-net-run --debug                    │
+│    量化 DLC → Linux：HTP 后端（libQnnHtp.so）                 │
+│                Windows x86：CPU 后端（无 HTP 执行环境）       │
+│    逐层输出 .raw                                              │
+├──────────────────────────────────────────────────────────────┤
+│ ④ 逐张量对比：按清洗后的张量名精确匹配 → 计算累计(entire)      │
+│    Cosine / 欧氏距离 / MSE → 渲染 summary PNG + AccuracyGraph │
+└──────────────────────────────────────────────────────────────┘
 ```
+
+> **关于指标口径：** Golden 与 Target 都是对同一输入做**完整推理**后取各层输出，两者逐层对比得到的是**累计（entire）精度**；若要得到 RKNN 那样的**单层（single）** 精度，需要对每一层单独隔离并分别重编译推理，本工具链 QNN 路径暂未实现。
 
 ### 2.3 输出文件
 
-> **关于工作目录的说明：** 高通 `snpe-accuracy-debugger` 在精度分析过程中会在工作目录下创建**文件链接（symlink）**。<br>
-> 由于部分文件系统（如 Windows 的 NTFS、网络共享挂载等）不支持符号链接，本工具暂时使用用户主目录 `~/accuracy_analysis/` 作为临时工作目录。<br>
-> 分析完成后，所有结果会自动**拷贝到 `utilities/tmp/accuracy_analysis/`**，随后删除 `~/accuracy_analysis/` 临时目录。
+> **关于工作目录的说明：** 与 RKNN 一致，QNN 精度分析在**每个模型独立的工作子目录** `utilities/tmp/<模型名>_to_qnn/` 内进行（`qnn-net-run --debug` 直接写出 `.raw` 结果，无 symlink 问题，也不再用 `~/accuracy_analysis/`）。分析产物会登记到调试器的 `file_or_dir_to_clean`，`clean()` 时统一清理。
 
-分析完成后，最终输出文件位于 `utilities/tmp/` 下：
+分析完成后，最终输出文件位于 `utilities/tmp/<模型名>_to_qnn/` 下：
 
 | 目录/文件 | 说明 |
 |----------|------|
-| `utilities/tmp/accuracy_analysis/golden_dir/` | Golden（浮点）模型逐层推理结果 |
-| `utilities/tmp/accuracy_analysis/quant_dir/` | Quantized（量化）模型逐层推理结果 |
-| `utilities/tmp/accuracy_analysis/verification/summary.csv` | 逐层精度对比表 |
-| `utilities/tmp/accuracy_analysis_summary.png` | 可视化汇总图表（见[2.4](#24-可视化图表解读)） |
-| `utilities/tmp/qnn_graph_accuracy_analysis.html` | 可视化计算图精度分析（见[3](#3-可视化计算图精度分析)） |
+| `<模型名>_to_qnn/qnn_accuracy_analysis/analysis_inputs/` | 精度分析输入 `.raw`（由图片 / `.npy` / `.raw` 预处理生成） |
+| `<模型名>_to_qnn/qnn_accuracy_analysis/input_list.txt` | `qnn-net-run` 输入列表 |
+| `<模型名>_to_qnn/qnn_accuracy_analysis/golden_output/` | Golden（FP32）模型逐层输出（`.raw`） |
+| `<模型名>_to_qnn/qnn_accuracy_analysis/target_output/` | Quantized 模型逐层输出（`.raw`） |
+| `<模型名>_to_qnn/qnn_accuracy_analysis_summary.png` | 可视化汇总图表（见[2.4](#24-可视化图表解读)） |
+| `<模型名>_to_qnn/qnn_graph_accuracy_analysis.html` | 可视化计算图精度分析（见[3](#3-可视化计算图精度分析)） |
 
 > 📁 以上文件在调用 `clean()` 清理前均可查阅。
 
 ### 2.4 可视化图表解读
 
-`accuracy_analysis_summary.png` 包含两个子图（指标含义参见[概述 · 关注的指标](#关注的指标)）：
+`qnn_accuracy_analysis_summary.png` 由统一的 `plot_accuracy_summary()` 生成，包含两个子图。**由于 QNN 只提供累计（entire）指标，图中没有柱状条、全部为折线**（指标含义参见[概述 · 关注的指标](#关注的指标)）：
 
-**上图 — 欧氏距离（Euclidean Distance）& MSE（逐层柱状图 + 折线图）**
-- 柱状图：每层的欧氏距离，**柱子突出的层即为量化损失最大的层**
-- 蓝色折线（右轴）：每层的 MSE，与欧氏距离结合可判断误差的真假阳性
+**上图 — 欧氏距离（Euclidean Distance）& MSE（累计折线图）**
+- 蓝色折线：每层的**累计**欧氏距离（`entire euc`），折线陡升处即误差累计量级突然增大的区域
+- 青绿色折线（右轴）：每层的 MSE，与欧氏距离结合可判断误差的真假阳性
 
-**下图 — 余弦相似度（Cosine Similarity）（逐层折线图）**
-- 绿色折线：每层的余弦相似度，**低于红线的层需重点关注**
+**下图 — 余弦相似度（Cosine Similarity）（累计折线图）**
+- 蓝色折线：每层的**累计**余弦相似度（`entire cos`），**跌破红线的层需重点关注**
 - 红色虚线：0.99 警戒阈值（对于 INT8 量化，0.9 以上通常可接受）
 
-> ⚠️ **关于 "lost" 层：** QNN 通过文件名相似度匹配 Golden 与 Quantized 的逐层输出，**无法匹配（名称相似度 < 0.8 或张量尺寸不一致）的层会被标记为 "lost" 并排除在统计之外**，绘图时会在终端打印 `LOST PAIRS` 清单。这类层通常是图优化中被融合/消除的节点，一般可忽略；若数量异常多则需检查模型转换是否异常。
+> ⚠️ **关于无法匹配的层：** Golden 与 Target 的逐层输出按**清洗后的张量名精确匹配**（同时要求尺寸一致），**无法匹配或尺寸不一致的张量会被直接剔除**（不进入统计、也不在图上绘制），终端打印实际参与统计的层数（`matched layers: N`）。这类层通常是图优化中被融合/消除或两侧命名差异导致的节点，一般可忽略；若匹配到的层数远小于预期，需检查模型转换是否异常。
 
 ![qnn_accuracy_analysis_summary.png](./qnn_accuracy_analysis_summary.png)
 
 ### 2.5 计算图精度可视化
 
-除统计图表外，精度分析还会自动生成 **Netron 风格的可视化计算图**（`utilities/tmp/qnn_graph_accuracy_analysis.html`），以 DAG 形式呈现整个网络并按累积精度着色，便于观察误差沿数据流的传播路径。详见 [3. 可视化计算图精度分析](#3-可视化计算图精度分析)。
+除统计图表外，精度分析还会自动生成 **Netron 风格的可视化计算图**（`utilities/tmp/<模型名>_to_qnn/qnn_graph_accuracy_analysis.html`），以 DAG 形式呈现整个网络并按**累积精度**着色（QNN 侧仅有累计指标）。详见 [3. 可视化计算图精度分析](#3-可视化计算图精度分析)。
 
 
 ## 3. 可视化计算图精度分析
@@ -257,40 +263,23 @@ QNN 精度分析自动执行以下三步（**Step 1 与 Step 2 并行执行**，
 
 | 转换路径 | 数据源 | 触发入口 | 输出文件 |
 |---------|--------|---------|---------|
-| RKNN | `RknnAccuracyDebugger.read_path_analysis()` | `plot_network_analysis(show=True)` | `rknn_graph_accuracy_analysis.html` |
-| QNN | `SnpeAccuracyDebugger` 解析结果 | `plot_network_analysis(...)` | `qnn_graph_accuracy_analysis.html` |
+| RKNN | `RknnAccuracyDebugger.read_path_analysis()`（含 `entire` 与 `single`） | `draw_network_analysis(show=True)` | `rknn_graph_accuracy_analysis.html` |
+| QNN | `QnnAccuracyDebugger` 双 DLC 对比结果（仅 `entire`） | `draw_network_analysis(...)`（内部按仅累计模式渲染） | `qnn_graph_accuracy_analysis.html` |
 
-### 3.1 触发方式
 
-**方式一：随转换自动触发。** 在转换脚本中启用精度分析（`set_do_accuracy_analysis()`）后，`convert()` 完成精度分析时会**自动**调用 `plot_network_analysis(show=True)`，在浏览器中弹出计算图：
-
-```python
-converter.set_do_accuracy_analysis(accuracy_analysis_picture_list=[IMG])
-converter.convert(...)   # 精度分析结束后自动弹出计算图 HTML
-```
-
-**方式二：独立调用。** 转换完成后，可直接构造调试器对象单独渲染（无需重新转换），便于反复查看或调整：
-
-```python
-from utilities.accuracy_debugger import RknnAccuracyDebugger
-
-debugger = RknnAccuracyDebugger(tmp_dir, tmp_model_path)
-debugger.plot_network_analysis(show=True)   # QNN 侧对应 SnpeAccuracyDebugger
-```
-
-### 3.2 图形解读
+### 3.1 图形解读
 
 ![graph_accuracy_analysis.png](./graph_accuracy_analysis.png)
 
 - **节点（方框）**：每个网络层一个节点，边框颜色按**算子类型**区分（Netron 色板：卷积/全连接、激活、池化、归一化、Tensor、量化层等）。
 - **节点填充色**：按**累积余弦精度 `entire_cos`** 着色 —— **红 = 差、黄 = 中、绿 = 良**（映射区间 0.80~1.00）。某节点变红，说明从输入到该层的累积精度已明显下降。
 - **连线（箭头）**：数据流方向，采用 Netron 风格漂浮贝塞尔曲线，跨多层长边会自动插入虚拟节点绕行，避免连线绕到图外。
-- **悬停节点**：显示该层的**单层精度（single_cos）与欧氏距离（single_euc）** 等详细信息，用于区分"本层引入的误差"与"上游累积的误差"。
-- **Input / Output 终端节点**：图首尾自动追加示意节点（Input 无精度数据，Output 仅示意，不替换原层）。
+- **悬停节点**：显示该层的**单层精度（single_cos）与欧氏距离（single_euc）** 等详细信息，用于区分"本层引入的误差"与"上游累积的误差"。（QNN 侧无单层数据，悬停仅显示累计指标。）
+- **Input / Output 终端节点**：图首尾自动追加示意节点 —— RKNN 快照已含输入层，故只追加 Output 示意；QNN 的 `.raw` 不含输入层，会同时追加 Input（精度记为无损 cos=1.0）与 Output 示意节点（继承其直接上游的精度着色，不替换原层）。
 
-> **判读技巧：** 沿数据流找**第一个由绿转红的节点**，即为量化损失的主要来源层；若某节点本身单层精度尚可、但填充色已红，说明误差来自上游，应继续向上追溯。
+> **判读技巧：** 沿数据流找**第一个由绿转红的节点**，即为量化损失的主要来源层；若某节点本身单层精度尚可、但填充色已红，说明误差来自上游，应继续向上追溯。（QNN 侧只有累计指标，可将“由绿转红”的起点当作主要来源层。）
 
-### 3.3 交互操作
+### 3.2 交互操作
 
 输出为**自包含 SVG + 内联 JS 的 HTML**（无外部依赖，可直接用浏览器打开）：
 
@@ -300,7 +289,7 @@ debugger.plot_network_analysis(show=True)   # QNN 侧对应 SnpeAccuracyDebugger
 - **图例**：右上角颜色条标注 `entire_cos` 累积精度对应的红-黄-绿区间。
 
 
-### 3.4 典型分析场景
+### 3.3 典型分析场景
 
 **① 区分多输出网络各输出的精度。** 对于检测/分割/多任务等**多输出网络**，逐层图表只能给出一个整体序列，难以分辨"到底是哪一路输出精度差"。可视化计算图把每个 **Output 终端节点**独立呈现并各自着色，可**直接对比各输出分支的累积精度**——哪一路输出节点偏红，就说明该任务/分支的量化损失更大，从而针对性地对该分支做混合量化或校准优化，而非笼统地处理整网。
 
@@ -325,15 +314,15 @@ debugger.plot_network_analysis(show=True)   # QNN 侧对应 SnpeAccuracyDebugger
 | 整体余弦相似度（Cosine Similarity）偏低（< 0.95） | ① 更换量化算法（如 `entropy` → `kl_divergence`）<br>② 扩充/替换量化校准数据集 |
 | 仅个别层余弦相似度（Cosine Similarity）偏低 | 对该层/子图做**混合量化**（QNN：16-bit 整数子图或 FP16/FP32 浮点子图，RKNN：FP16 子图，详见 [TOOLUSE.md → 3.4 混合量化](./TOOLUSE.md#34-混合量化)） |
 | 某些层欧氏距离（Euclidean Distance）特别大 | 检查该层是否为激活函数层（如 Sigmoid/Softmax），<br>此类层对量化敏感，建议混合量化 |
-| QNN 中某些层 Name 显示为 "lost" | 该层在 Golden 和 Quant 模型间无法匹配，<br>可能是图优化过程中被融合或消除，通常可忽略 |
+| QNN 中实际匹配到的层数远少于预期 | 部分张量在 Golden 与 Quant 输出间无法精确匹配（命名差异 / 图优化被融合消除），<br>通常可忽略；若过少需检查模型转换是否异常 |
 
 ---
 
 
 ## ⚠️ 5. 注意事项
 
-1. **RKNN 和 QNN 相关工具 (如精度分析) 仅支持 Linux 环境** 。
+1. **RKNN 相关工具（含精度分析）仅支持 Linux 环境**；QNN 转换与精度分析在 **Windows 与 Linux 均可运行**（Windows x86 无 HTP 执行后端，量化模型的精度分析自动退化为 CPU 后端，HTP 后端端到端精度建议在 Linux / 目标设备上验证）。
 2. **如果未设置 `accuracy_analysis_picture_list` 或设为 `None`** — 精度分析将被跳过，不影响正常转换流程。
 3. **精度分析会增加转换时间** — 需要对同一输入在未量化和量化模型上分别做一次完整推理，耗时为正常转换的 2~3 倍。
-4. **精度分析结果同时保存在 `utilities/tmp`** — 建议每次分析后保存此图表以便对比不同量化配置的效果。
-5. **所有精度分析结果在调用 `clean()` 前均可查阅** — `clean()` 会清空 `utilities/tmp/` 下的临时文件，如需保留分析结果请在调用前手动备份。
+4. **精度分析结果保存在 `utilities/tmp/<模型名>_to_rknn/` 与 `utilities/tmp/<模型名>_to_qnn/` 工作子目录** — 建议每次分析后保存图表以便对比不同量化配置的效果。
+5. **所有精度分析结果在调用 `clean()` 前均可查阅** — `clean()` 会清空对应工作子目录下的临时文件，如需保留分析结果请在调用前手动备份。

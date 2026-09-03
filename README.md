@@ -29,11 +29,11 @@
 | 转换阶段 | 工具 | 说明 |
 |---------|------|------|
 | **PyTorch/TensorFlow -> ONNX** | 各子模块独立脚本 | 处理算子兼容、动态图固化、模型优化 |
-| **ONNX -> RKNN** | `utilities/onnx_to_rknn.py` | Rockchip NPU（RK3588 / RK3576），支持 INT8 量化、混合精度量化|
-| **ONNX -> QNN** | `utilities/onnx_to_qnn.py` | Qualcomm NPU（HTP），支持 INT8/INT4 量化、混合精度量化 |
+| **ONNX -> RKNN** | `utilities/onnx_to_rknn.py` | Rockchip NPU（RK35xx RV11xx），支持 INT8 / FP16 量化、混合精度量化 |
+| **ONNX -> QNN** | `utilities/onnx_to_qnn.py` | Qualcomm NPU（HTP），跨平台（Windows / Linux）与多目标芯片（QCSxxxx SMxxxx SCxxxx），支持 INT8/INT4 量化、混合精度量化 |
 | **ONNX -> QDQ-ONNX（AIMET）** | `utilities/onnx_aimet_quant.py` | 独立 PTQ 量化器（Qualcomm AIMET），导出 QDQ ONNX + encodings，可作为 QNN 外置量化器 |
 | **数据集生成** | `utilities/dataset_preprocess.py` | 基于 YOLO 检测自动裁剪量化校准数据集 |
-| **量化精度分析** | `utilities/accuracy_debugger.py` | 逐层对比浮点/量化模型中间张量，定位精度损失层；含统计图表与 **Netron 风格可视化计算图**（RKNN / QNN 共用） |
+| **量化精度分析** | `utilities/accuracy_debugger.py` | 逐层对比浮点/量化模型中间张量，定位精度损失层；含统计图表与 **Netron 风格可视化计算图**（RKNN / QNN 共用；QNN 侧当前仅累计精度指标） |
 
 > **工具链是核心资产** — 每个子模块（AVTrack、NanoTrackV3、RetinaFace 等）都复用同一套 `utilities/` 转换工具，只需编写模型特有的 PyTorch -> ONNX 导出脚本即可。
 
@@ -72,7 +72,7 @@ Edge_ModelDeploy/
 
 | 子模块 | 模型类型 | 来源 |
 |--------|---------|------------|
-| [yolo26_ModelDeploy](https://github.com/YeWenxuan64/yolo26_ModelDeploy/)                       | 物体检测     | ultralytics-YOLO26 |
+| [yolo26_ModelDeploy](https://github.com/YeWenxuan64/yolo26_ModelDeploy/) | 物体检测 | ultralytics-YOLO26 |
 
 每个模块独立维护，包含该模型的预训练权重获取方式与完整转换流程
 > 目前 (Pre-Release) 仅开源 `yolo26_ModelDeploy` 作为示例
@@ -81,12 +81,12 @@ Edge_ModelDeploy/
 ## 📦 工具链部署
 ### 0. 环境要求
 
-| 工作流           | Windows   | Linux | Python 版本 |
-|-----------------|------------|------|-------------|
-| 训练框架 to ONNX | 支持       | 支持 | 3.10+ |
-| ONNX to RKNN    | 不支持     | 支持 | 3.10 - 3.12 |
-| ONNX to QNN     | 目前不支持 | 支持 | 3.10 |
-| ONNX to QDQ-ONNX（AIMET） | 支持 | 支持 | 3.10 |
+| 工作流                    | Windows | Linux | Python 版本 |
+|--------------------------|----------|------|-------------|
+| 训练框架 to ONNX          | 支持    | 支持 | 3.10+ |
+| ONNX to RKNN             | 不支持  | 支持 | 3.10 - 3.12 |
+| ONNX to QNN              | 部分支持 | 支持 | 3.10 |
+| ONNX to QDQ-ONNX (AIMET) | 不支持  | 支持 | 3.10 |
 
 
 ### 1. 克隆项目（含子模块）
@@ -146,6 +146,7 @@ pip install rknn-toolkit2 --no-deps
 链接下载: [Qualcomm_AI_Runtime_SDK_2.38.0.250901.zip](https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/2.38.0.250901/v2.38.0.250901.zip)
 
 > 转换模型所使用的SDK版本建议**低于等于**推理时所用的SDK版本
+> 工具会自动选取 `utilities/qairt/` 下**字典序最大**的目录作为当前使用的 SDK 版本
 
 ```
 Edge_ModelDeploy/
@@ -155,7 +156,7 @@ Edge_ModelDeploy/
 │   ├── dataset_preprocess.py
 │   ├── utils.py
 │   └── qairt/                       # Qualcomm AI Runtime SDK # 需自行下载并放入
-│       └── 2.38.0.250901/           # SDK 版本                # 可自行挑选
+│       └── 2.38.0.250901/           # SDK 版本                # 当前被自动选中（字典序最大）
 │           ├── bin/
 │           └── ...
 └── ...                              
@@ -291,9 +292,9 @@ python yolo26_onnx2qnn.py
 | 目标平台        | AI处理器    | 芯片     | 转换工具 | 量化格式 |
 |----------------|-------------|---------|---------|---------|
 | Rockchip       | NPU         | RK3588 RK3576 RK3566 ... | `onnx_to_rknn.py` | INT8 / FP16 / 混合量化 |
-| Qualcomm (HTP) | Hexagon DSP | QCS6490 QCS8550 QCS9075 ... | `onnx_to_qnn.py` | INT8 / INT4 / FP16 / 混合量化 |
+| Qualcomm (HTP) | Hexagon DSP | QCS6490 QCS8550 QCS9075 SC8280X ... | `onnx_to_qnn.py` | INT8 / INT4 / FP16 / 混合量化 |
 
-> 提issues时请附上想要硬件信息，小女子可以适配喵~ 🐾
+> 高通平台支持更多芯片，只是暂时没写上去。可以提issues附上想要硬件信息，小女子可以适配喵~ 🐾
 
 
 ### 局限性
@@ -314,7 +315,10 @@ python yolo26_onnx2qnn.py
 
 - [x] **QNN 精度分析** — 由于小女子太笨了，QNN 的精度分析还不会用喵
     - 支持基于 `snpe-accuracy-debugger` 的精度分析，混合量化场景下自动使用纯浮点 DLC 作为 Golden 参考
-    - 🛠️ 测试性支持（完成于 2026-06-22）
+    - 🛠️ 实验性支持（完成于 2026-06-22）（已弃用）
+    - 支持基于 `qnn-net-run --debug` 的**双 DLC** 精度对比：FP32 Golden DLC（CPU 后端） vs 量化 DLC（Linux 走 HTP 后端；Windows x86 无 HTP 时退化为 CPU 后端），混合量化场景自动使用纯浮点 DLC 作为 Golden
+    - 目前仅提供**累计（entire）** 指标（逐张量 Cosine / 欧氏距离 / MSE），暂不支持逐层「单层」归因
+    - 🛠️ 测试性支持（重构于 2026-09-03）
 
 ## 📄 License
 

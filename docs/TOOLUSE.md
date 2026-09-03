@@ -1,7 +1,7 @@
 # 工具链使用指南
 
 ## 0. 安装依赖与准备量化校准数据集
-已在[README.md](README.md)中介绍
+已在[README.md](../README.md)中介绍
 
 #### 使用 `collect_image_paths` 生成数据集索引文件
 
@@ -101,12 +101,13 @@ converter = OnnxToRKNN(
     target_platform=TARGET_PLATFORM        # 'rk3588' / 'rk3576' / 'rk3566'
 )
 
-# 可选：高级优化配置
-converter.extra_optimize(
-    quantized_algorithm='kl_divergence',   # 'normal' / 'kl_divergence' / 'mmse'
-    flash_attention=True,
-    compress_weight=False,
-    model_pruning=False
+# 可选：量化配置（各参数均有默认值，按需修改）
+converter.set_quantization_method(
+    quant_method='kl_divergence',   # 量化算法 'normal' / 'kl_divergence' / 'mmse'
+    bitwidth='w8a8',                # 'w4a16' / 'w8a8' / 'w8a16' / 'w16a16i' / 'w16a16i_dfp'（受目标芯片支持限制）
+    compress_weight=False,          # 是否压缩权重以降低内存占用
+    model_pruning=False,            # 是否做模型剪枝
+    flash_attention=True            # 是否启用 Flash Attention
 )
 
 # 可选：混合量化（部分子图 FP16，其余 INT8）
@@ -158,7 +159,7 @@ converter = OnnxToQNN(
     model_path=MODEL_PATH,
     qnn_model_path=QNN_MODEL,
     dataset_path=DATASET,
-    target_platform='qcs6490'             # 'qcs6490' / 'qcs8550' / 'qcs9075'
+    target_platform='qcs6490'             # 'qcs6490' / 'qcs8550' / 'qcs9075' / 'SC8280X'
 )
 
 # 可选：量化配置（各参数均有默认值，按需修改）
@@ -294,7 +295,7 @@ converter.set_use_aimet(
     bitwidth='w8a8',                 # AIMET 全局位宽 'w<W>a<A>'
     param_quant_schema='symmetric',  # 权重对称性 'asymmetric'/'symmetric'/'unsignedsymmetric'
     act_quant_schema='asymmetric',   # 激活对称性 'asymmetric'/'symmetric'/'unsignedsymmetric'
-    encoding_version='2.0.0',        # encodings 版本 '0.6.1'/'1.0.0'/'2.0.0'
+    # use_cle_algorithm=False,       # 是否启用跨层均衡（CLE），默认关闭
 )
 
 converter.convert(
@@ -309,6 +310,7 @@ converter.convert(
 说明：
 - `set_use_aimet` 会自动按 `target_platform` 的 DSP 架构选用对应的 HTP quantsim config（如 `htp_v68` / `htp_v73`），无需手动指定。
 - 子图混合精度仍通过 `do_hybrid_quantization()` 配置，AIMET 路径会自动读取。
+- 编码版本固定导出为 encodings **v2.0.0**（接口已移除 `encoding_version` 参数）。
 
 ## 3.4 混合量化
 

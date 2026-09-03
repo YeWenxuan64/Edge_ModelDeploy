@@ -8,7 +8,6 @@ fast-histogram>=0.11
 
 numpy<2.0
 scipy
-pandas
 matplotlib
 
 
@@ -19,12 +18,13 @@ onnxslim
 opencv-python>=4.5.5
 
 #snpe_accuracy_analysis
-paramiko
-plotly
-pathlib2
-xlsxwriter
-pydantic
-aenum
-onnxsim
+# pandas
+# paramiko
+# plotly
+# pathlib2
+# xlsxwriter
+# pydantic
+# aenum
+# onnxsim
 
 aimet-onnx
