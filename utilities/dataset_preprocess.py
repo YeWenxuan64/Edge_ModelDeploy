@@ -192,7 +192,7 @@ class ProcessDatasetByModel:
                 output_path_pair_list.append(str(output_path))
                 write_buffer.append((output_tensor, output_path))
 
-                if len(write_buffer) >= 16:
+                if len(write_buffer) >= 8:
                     NumpySaver.save_numpy_array(write_buffer, output_format)
                     write_buffer.clear()
 
@@ -200,9 +200,9 @@ class ProcessDatasetByModel:
 
         # 刷新剩余的缓存
         NumpySaver.save_numpy_array(write_buffer, output_format)
-
         # 等待后台线程把剩余写入任务全部落盘
         NumpySaver.flush_writes_and_close()
+        write_buffer.clear()
 
         cv2.destroyAllWindows()
         onnx_executor.release()
@@ -424,6 +424,7 @@ class GenYoloCroppedDataset:
         # 刷新剩余的缓存
         NumpySaver.save_numpy_array(write_buffer, output_format)
         NumpySaver.flush_writes_and_close()
+        write_buffer.clear()
 
         onnx_executor.release()
         return output_path_list
@@ -560,6 +561,7 @@ class GenYoloCroppedDataset:
 
         NumpySaver.save_numpy_array(write_buffer, output_format="image")
         NumpySaver.flush_writes_and_close()
+        write_buffer.clear()
 
         cv2.destroyWindow("Detection Results")
         onnx_executor.release()

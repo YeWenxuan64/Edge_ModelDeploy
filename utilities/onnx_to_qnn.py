@@ -58,11 +58,6 @@ class QAIRTScript:
             'x86_64-linux-clang': 'bin/x86_64-linux-clang/qairt-quantizer',
             'aarch64-oe-linux-gcc11.2': 'bin/aarch64-oe-linux-gcc11.2/qairt-quantizer',
         },
-        "qnn-context-binary-generator": {
-            'x86_64-windows-msvc': 'bin/x86_64-windows-msvc/qnn-context-binary-generator.exe',
-            'x86_64-linux-clang': 'bin/x86_64-linux-clang/qnn-context-binary-generator',
-            'aarch64-oe-linux-gcc11.2': 'bin/aarch64-oe-linux-gcc11.2/qnn-context-binary-generator',
-        }
     }
 
     # 类级 SDK 根目录（由 set_sdk_root() 设置；get() 无显式参数时使用）
@@ -513,6 +508,7 @@ class OnnxToQNN:
             'act_quant_schema': 'asymmetric',
             'use_cle_algorithm': False
         }
+        self.convert_layout_args:str = ""
 
         self.custom_calibration_data_path = None
 
@@ -786,7 +782,7 @@ class OnnxToQNN:
             quantized_dlc_model_path = Path(quantized_dlc_model_path)
 
             # QAIRTAccuracyDebugger：直接用两个 DLC（FP32 golden + 量化 target）对比
-            self.accuracy_analyzer.set_model_info(onnx_model_info)
+            self.accuracy_analyzer.set_model_info(onnx_model_info, self.convert_layout_args)
             
             return_code = self.accuracy_analyzer.accuracy_analysis(
                 golden_dlc_path=golden_dlc_path,
@@ -935,6 +931,8 @@ class OnnxToQNN:
                 layout_args += f' --source_model_input_layout "{input_name}" NCHW --desired_input_layout "{input_name}" NHWC'
                 
             layout_args += f' --desired_input_color_encoding "{input_name}" rgb rgb'
+
+        self.convert_layout_args = layout_args
         
         # quantization
         quant_args = ""
@@ -1172,8 +1170,7 @@ class OnnxToQNN:
             model_lib, backend_lib = 'libQnnModelDlc.so', 'libQnnHtp.so'
 
         # build command
-        exe_qnn_context_binary_generator = QAIRTScript.get_tool('qnn-context-binary-generator')
-        command = f'{exe_qnn_context_binary_generator} --model {model_lib} --backend {backend_lib} --config_file {config_path}'
+        command = f'qnn-context-binary-generator --model {model_lib} --backend {backend_lib} --config_file {config_path}'
         command += f' --dlc_path {quantized_dlc_model_path} --output_dir {self.qnn_model_path.parent} --binary_file {self.qnn_model_path.stem}'
 
         with temporary_chdir(self.tmp_work_dir):

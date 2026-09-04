@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 from typing import Callable
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
 
 import numpy as np
 import cv2
@@ -993,24 +993,32 @@ class NumpySaver:
 
 
 
-def run_command(command: str, signature: str = "") -> int:
-    """在 shell 中执行命令并实时打印输出，返回进程返回码。
+def run_command(command: str, signature: str = "", print_output: bool = True) -> int:
+    """在 shell 中执行命令，返回进程返回码。
 
     Args:
         command: 要执行的 shell 命令字符串。
         signature: 日志前缀（如 "[OnnxToQNN]"），用于区分调用来源。
+        print_output: True（默认）逐行实时打印子进程输出；
+            False 静默执行（不打印 Running 行与输出），仅当返回码非 0 时打印输出尾部，
+            便于失败诊断且不刷屏（配合并行阶段 tqdm 进度条使用）。
 
     Returns:
         int: 进程返回码（0 表示成功）。
 
     平台适配：Windows 用 cmd（shell=True 默认），Linux/Unix 用 bash。
     """
-    print(f"{signature} Running command: {command}")
+    if print_output:
+        print(f"{signature} Running command: {command}")
 
     popen_kwargs = dict(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,  # 将 stderr 重定向到 stdout
         universal_newlines=True,
+        # 子进程输出按 UTF-8 解码，非法字节以替换符处理，避免 Windows locale
+        # （如 GBK）遇到非本编码字节抛 UnicodeDecodeError 中断整条流程。
+        encoding='utf-8',
+        errors='replace',
         env=os.environ,
     )
     if sys.platform.startswith('win'):
@@ -1018,26 +1026,40 @@ def run_command(command: str, signature: str = "") -> int:
     else:
         process = subprocess.Popen(command, shell=True, executable='/bin/bash', **popen_kwargs)
 
-    # 实时打印输出
+    tail_lines: list[str] = []
+    # 实时打印输出（或静默收集尾部，失败时展示）
     while True:
         output = process.stdout.readline()
         if output == '' and process.poll() is not None:
             break
         if output:
-            print(output.strip())
+            if print_output:
+                print(output.strip())
+            else:
+                tail_lines.append(output.rstrip('\n'))
 
     return_code = process.poll()
+    if not print_output and return_code != 0 and tail_lines:
+        print(f"{signature} command failed (code {return_code}), last output:")
+        for ln in tail_lines[-30:]:
+            print(ln)
+        tail_lines.clear()
     return return_code
 
 
 class MultThreadExetutor:
     threadpool = None
+    max_workers = 8
     future_list:list[Future] = []
+
+    @classmethod
+    def set_max_workers(cls, max_workers:int=8):
+        cls.max_workers = max_workers
 
     @classmethod
     def run_exetutor(cls, exetutor:Callable, *args, **kwargs):
         if cls.threadpool is None:
-            cls.threadpool = ThreadPoolExecutor(max_workers=8)
+            cls.threadpool = ThreadPoolExecutor(max_workers=cls.max_workers)
             cls.future_list.clear()
 
         future = cls.threadpool.submit(exetutor, *args, **kwargs)
@@ -1052,5 +1074,39 @@ class MultThreadExetutor:
             return_code_list.extend([future.result() for future in cls.future_list])
 
         cls.threadpool = None
+        cls.max_workers = 8
 
+        return return_code_list
+
+class MultProcessExetutor:
+    """类级进程池执行器（并行执行 CPU 密集 / 子进程密集任务，fork 语义）。
+
+    API 与 MultThreadExetutor 对齐：set_max_workers / run_exetutor / future_list /
+    wait_and_close。限制：任务函数必须为模块级可 pickle 函数，参数与返回值
+    必须可 pickle（Linux fork 下无需 __main__ guard；spawn 环境需 guard）。
+    """
+    processpool = None
+    max_workers = 8
+    future_list: list[Future] = []
+
+    @classmethod
+    def set_max_workers(cls, max_workers: int = 8):
+        cls.max_workers = max_workers
+
+    @classmethod
+    def run_exetutor(cls, exetutor: Callable, *args, **kwargs):
+        if cls.processpool is None:
+            cls.processpool = ProcessPoolExecutor(max_workers=cls.max_workers)
+            cls.future_list.clear()
+        future = cls.processpool.submit(exetutor, *args, **kwargs)
+        cls.future_list.append(future)
+
+    @classmethod
+    def wait_and_close(cls) -> list:
+        return_code_list: list = []
+        if cls.processpool is not None:
+            cls.processpool.shutdown(wait=True)
+            return_code_list.extend([future.result() for future in cls.future_list])
+        cls.processpool = None
+        cls.max_workers = 8
         return return_code_list

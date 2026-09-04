@@ -1,6 +1,7 @@
 import re
 import os
 import sys
+import json
 import shutil
 
 from pathlib import Path
@@ -9,6 +10,8 @@ from collections import defaultdict, deque
 
 import numpy as np
 import cv2
+import onnx
+from onnx import helper, TensorProto
 
 
 current_dir = Path(__file__).parent.resolve()
@@ -727,6 +730,8 @@ class RknnAccuracyDebugger:
         clean_files_or_dirs(self.file_or_dir_to_clean)
 
 
+
+
 class QnnAccuracyDebugger:
     """基于 qnn-net-run --dlc_path --debug 的双 DLC 精度对比分析器（独立类）。
 
@@ -749,6 +754,8 @@ class QnnAccuracyDebugger:
         self.debugger_picture_list = [Path(p).resolve() for p in (debugger_picture_list or []) if Path(p).exists()]
         
         if sys.platform.startswith('win'):
+            # golden(FP32 全层 dump)走 CPU;量化推理/context-binary 只能走 HTP
+            # (CPU 后端拒绝量化图且禁止 offline prepare)
             self.backend_lib_golden = "QnnCpu.dll"
             self.backend_lib_target = "QnnCpu.dll"
         else:
@@ -756,16 +763,18 @@ class QnnAccuracyDebugger:
             self.backend_lib_target = "libQnnHtp.so"
 
         self.onnx_info: dict = {}
+        self.convert_layout_args:str = ""
+        self.exe_qairt_converter:str|None = None
         self.file_or_dir_to_clean: list[str] = [str(self.working_dir)]
 
     # ------------------------------------------------------------------
     # 模型信息 / 通用工具
     # ------------------------------------------------------------------
 
-    def set_model_info(self, onnx_info: dict):
+    def set_model_info(self, onnx_info:dict, convert_layout_args:str):
         """设置模型输入/输出信息（prepare_input_data 需要 inputs 的名称与形状）。"""
         self.onnx_info = onnx_info or {}
-
+        self.convert_layout_args = convert_layout_args
 
     def prepare_input_data(self, mean_rgb: list = [[0, 0, 0]], std_rgb: list = [[1, 1, 1]],
                            set_input_order: str = 'nchw') -> str:
@@ -815,56 +824,70 @@ class QnnAccuracyDebugger:
         print(f"[QAIRTAccuracyDebugger] input_list: {input_list}")
         return str(input_list)
 
-    def run_qnn_net_run(self, dlc_path:str, backend_lib:str, input_list:str, output_dir: str) -> int:
+
+    def run_qnn_net_run(self, dlc_path:str, backend_lib:str, input_list:str, output_dir:str, output_tensors:str="all") -> int:
         """执行 qnn-net-run --dlc_path <dlc> --backend <lib> --input_list --output_dir [--debug]。"""
 
-        cmd = f'qnn-net-run --backend {backend_lib} --debug --log_level warn'
+        if sys.platform.startswith('win'):
+            model_lib = 'QnnModelDlc.dll'
+        else:
+            model_lib = 'libQnnModelDlc.so'
+
+        cmd = f'qnn-net-run --backend {backend_lib} --model {model_lib}'
+
+        if output_tensors == "all":
+            cmd += f' --debug --log_level warn'
+        else:
+            cmd += f' --set_output_tensors {output_tensors} --log_level warn'
+
         cmd += f' --dlc_path {dlc_path} --input_list {input_list} --output_dir {output_dir}'
 
         return run_command(cmd, signature="[QAIRTAccuracyDebugger]")
 
-    # ------------------------------------------------------------------
-    # 主入口：双 DLC 对比
-    # ------------------------------------------------------------------
-
     def accuracy_analysis(self, golden_dlc_path: str, target_dlc_path: str,
                           mean_rgb: list = [[0, 0, 0]], std_rgb: list = [[1, 1, 1]],
                           set_input_order: str = 'nchw') -> int:
-        """双 DLC 精度对比主入口：
-        1) qnn-net-run 跑 FP32 DLC（CPU 后端）拿每层输出；
-        2) qnn-net-run 跑量化 DLC（HTP 后端）拿每层输出；
-        3) 逐层计算 cosine / 欧氏距离 / mse；
-        4) 渲染 PNG + (可选 HTML) + CSV。
+        """双 DLC 精度对比主入口（entire 累积 + single 单层同图显示）：
+
+        1) entire：golden vs 量化 DLC 一次全量推理，逐层比较（累积误差）；
+        2) single：手动逐层（全层、并行）——每层单独生成半量化 DLC
+           （其余层 fp16 fallback）再推理，误差仅反映该层自身量化误差；
+        3) 统计图 PNG：single 柱状 + entire 折线 + MSE；
+        4) 网络图 HTML：节点按 entire_cos 着色，悬停显示 single/entire。
 
         Args:
             golden_dlc_path: FP32（未量化）DLC 路径。
-            target_dlc_path: 量化 DLC 路径。
-            backend_golden / backend_target: 覆盖默认后端 lib 名。
+            target_dlc_path: 量化 DLC 路径（同时作为 single 的层结构反射源）。
         """
         self.working_dir.mkdir(parents=True, exist_ok=True)
-
         input_list = self.prepare_input_data(mean_rgb, std_rgb, set_input_order)
 
-        names, entire_cos, entire_euc, mse_vals = self.entire_accuracy_analysis(golden_dlc_path, target_dlc_path, input_list)
+        # 1) entire（累积）
+        names_e, entire_cos, entire_euc, mse_e = self.entire_accuracy_analysis(
+            golden_dlc_path, target_dlc_path, input_list)
 
-        # 统计显示 1：PNG 双子图（欧氏距离柱状 + 余弦折线）
-        plt_path = self.tmp_dir / 'qnn_accuracy_analysis_summary.png'
-        plot_accuracy_summary(
-            names=names,
-            entire_euc=entire_euc,
-            entire_cos=entire_cos,
-            mse_vals=mse_vals,
-            entire_val_color="blue",
-            save_path=plt_path,
+        # 2) single（单层）——失败时退回 entire-only 渲染（不阻断既有流程）
+        names_s, single_cos, single_euc, mse_s = None, None, None, None
+        fallback_entire_only = False
+        if sys.platform.startswith('win'):
+            fallback_entire_only = True
+
+        if not fallback_entire_only:
+            try:
+                names_s, single_cos, single_euc, mse_s = self.single_accuracy_analysis(
+                    golden_dlc_path, target_dlc_path, input_list)
+            except Exception as exc:
+                fallback_entire_only = True
+                print(f"[QAIRTAccuracyDebugger] single-layer analysis skipped ({type(exc).__name__}: {exc}); "
+                    f"fallback to entire-only report")
+
+
+        # 3) 渲染：single 数据可用时输出 entire+single 联合图；
+        #    fallback(Windows 或 single 失败)时 single=None -> entire-only 图。
+        self._render_combined_report(
+            names_e, entire_cos, entire_euc, mse_e,
+            names_s, single_cos, single_euc,
         )
-        self.file_or_dir_to_clean.append(plt_path)
-
-        # 统计显示 2：AccuracyGraph HTML（若有 ONNX 可建图结构）
-        if self.onnx_path is not None:
-            self._plot_network_analysis_entire_only(
-                names=names, entire_cos=entire_cos, entire_euc=entire_euc, mse_vals=mse_vals,
-            )
-
         return 0
 
     def clean(self):
@@ -891,19 +914,8 @@ class QnnAccuracyDebugger:
                 raise RuntimeError(f"[QnnAccuracyDebugger] qnn-net-run target DLC failed with code {ret_list[1]}")
         else:
             raise RuntimeError(f"[QnnAccuracyDebugger] qnn-net-run failed")
-        # ret = self.run_qnn_net_run(golden_dlc_path, self.backend_lib_golden, input_list, str(golden_dir))
-        # if ret != 0:
-        #     raise RuntimeError(f"qnn-net-run golden DLC failed with code {ret}")
-        
-        # ret = self.run_qnn_net_run(target_dlc_path, self.backend_lib_target, input_list, str(target_dir))
-        # if ret != 0:
-        #     raise RuntimeError(f"qnn-net-run target DLC failed with code {ret}")
 
-        names, entire_cos, entire_euc, mse_vals = self._compare_dlc_outputs(golden_dir, target_dir)
-        return names, entire_cos, entire_euc, mse_vals
-
-    def _compare_dlc_outputs(self, golden_dir: Path, target_dir: Path):
-        """读两个 Result_0 目录，按张量名（sanitized 文件名）匹配，算 cos/euc/mse。"""
+        # 读两个 Result_0 目录，按张量名（sanitized 文件名）匹配，算 cos/euc/mse
         def load(d):
             out = {}
             for p in Path(d).rglob('*.raw'):
@@ -929,14 +941,138 @@ class QnnAccuracyDebugger:
             cos.append(float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12)))
             euc.append(float(np.linalg.norm(a - b)))
             mse.append(float(np.mean((a - b) ** 2)))
-        return names, np.asarray(cos), np.asarray(euc), np.asarray(mse)
 
+        entire_cos, entire_euc, mse_vals = np.asarray(cos), np.asarray(euc), np.asarray(mse)
+
+        return names, entire_cos, entire_euc, mse_vals
+
+    # ------------------------------------------------------------------
+    # single：截断单算子实现（详见 QnnTruncatedAccuracyAnalysis）
+    # ------------------------------------------------------------------
+
+    def single_accuracy_analysis(self, golden_dlc_path: str, target_dlc_path: str,
+                                 input_list: str, only_tensor_prefix=None,
+                                 ) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray]:
+        """手动逐层（layerwise == single）精度分析（默认全层、并行）。
+
+        误差语义 = 官方 layerwise：整图其余部分浮点，仅该层量化 -> 误差仅反映
+        该层自身的量化误差（非累积），对应报告的 single_euc / single_cos。
+
+        实现 = QnnTruncatedAccuracyAnalysis（截断单算子管线；本类组合持有该
+        分析器并复用 golden/候选/encodings/converter/ctx/net-run 工具）。
+
+        整体失败（抛异常）时不自动退回整图半量化实现；accuracy_analysis 捕获
+        后跳过 single，只输出 entire 报告。
+        （旧整图半量化实现已抽为 QnnSingleAccuracyAnalysisFull，供对照。）
+
+        Args:
+            golden_dlc_path: FP32（未量化）DLC 路径（golden dump 缺则自动补跑）。
+            target_dlc_path: 量化 DLC 路径（反射层结构 + 自动导出 v2 encodings）。
+            input_list: qnn-net-run 输入列表。
+            only_tensor_prefix: 只分析张量名以此前缀开头的层（str 或 tuple）。
+
+        Returns:
+            (names, single_cos, single_euc, mse)：names 为 sanitized 张量名。
+        """
+        return QnnTruncatedAccuracyAnalysis(self, self.onnx_path).run(
+            golden_dlc_path, target_dlc_path, input_list, only_tensor_prefix)
     # ------------------------------------------------------------------
     # 渲染：AccuracyGraph（HTML）与结果组织
     # ------------------------------------------------------------------
 
-    def _plot_network_analysis_entire_only(self, names, entire_cos, entire_euc, mse_vals=None):
-        """仅基于 entire（累积）数据渲染 AccuracyGraph：single_cos/single_euc 置 None。"""
+    def _render_combined_report(self, names_e, entire_cos, entire_euc, mse_e,
+                                names_s, single_cos, single_euc) -> None:
+        """渲染 entire+single 联合报告：统计图（single 柱 + entire 折线）+ 网络图。
+
+        single_* 参数可为 None（或长度为 0）：此时退化为 entire-only 渲染——
+        统计图只画 entire 折线(+MSE)，网络图不带 single 数据。
+
+        层对齐：有 single 时以 entire（ONNX 拓扑序）全集为 x 轴，single 按 sanitized 名
+        匹配填入对应位置；single 缺失的层置 nan（折线断开/柱留空，表示无该层数据）。
+        网络图用 entire 全集，single 缺失层保持 None（tooltip 显示 n/a）。
+        """
+        has_single = (names_s is not None and single_cos is not None
+                      and single_euc is not None and len(names_s) > 0)
+
+        plt_path = Path(self.tmp_dir / 'qnn_accuracy_analysis_summary.png')
+        if not has_single:
+            plot_accuracy_summary(
+                names=names_e,
+                entire_euc=entire_euc,
+                entire_cos=entire_cos,
+                mse_vals=mse_e,
+                entire_val_color="blue",
+                save_path=plt_path,
+            )
+            self.file_or_dir_to_clean.append(str(plt_path))
+            if self.onnx_path is not None:
+                self.draw_network_analysis(
+                    names=names_e, entire_cos=entire_cos, entire_euc=entire_euc, mse_vals=mse_e)
+            return
+
+        # 以 entire 全集为 x 轴；single 缺失层置 nan（不参与连线/柱体）
+        set_s = set(names_s)
+        idx_s = {n: i for i, n in enumerate(names_s)}
+        single_euc_arr = np.full(len(names_e), np.nan, dtype=np.float64)
+        single_cos_arr = np.full(len(names_e), np.nan, dtype=np.float64)
+        for pos, n in enumerate(names_e):
+            if n in set_s:
+                j = idx_s[n]
+                single_euc_arr[pos] = single_euc[j]
+                single_cos_arr[pos] = single_cos[j]
+
+        plot_accuracy_summary(
+            names=names_e,
+            single_euc=single_euc_arr,
+            single_cos=single_cos_arr,
+            entire_euc=entire_euc,
+            entire_cos=entire_cos,
+            mse_vals=mse_e,
+            entire_val_color="blue",
+            save_path=plt_path,
+        )
+        self.file_or_dir_to_clean.append(str(plt_path))
+
+        if self.onnx_path is not None:
+            self.draw_network_analysis(
+                names=names_e, entire_cos=entire_cos, entire_euc=entire_euc, mse_vals=mse_e,
+                single_names=names_s, single_cos=single_cos, single_euc=single_euc,
+            )
+
+        # csv_path = save_csv or str(self.tmp_dir / 'layerwise_single_results.csv')
+        # import csv as _csv
+        # with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        #     w = _csv.writer(f)
+        #     w.writerow(['name', 'single_cos', 'single_euc', 'single_mse'])
+        #     for i, n in enumerate(names_s):
+        #         w.writerow([n, f'{single_cos[i]:.6f}', f'{single_euc[i]:.6f}',
+        #                     f'{mse_s[i]:.6f}'])
+        # self.file_or_dir_to_clean.append(csv_path)
+        # print(f"[QAIRTAccuracyDebugger] report saved: {plt_path}, {csv_path}")
+
+    def draw_network_analysis(self, names, entire_cos, entire_euc, mse_vals=None,
+                              single_names=None, single_cos=None, single_euc=None,
+                              show: bool = True) -> dict:
+        """基于 entire + single 精度数组渲染 AccuracyGraph（Netron 风格 HTML）。
+
+        内部流程：build_onnx_tensor_graph -> 构造 results（每个节点带 entire/single
+        精度，single 按 sanitized 张量名匹配，缺失层保留 None）-> build_layer_graph ->
+        build_terminal_nodes（输入/输出示意节点）-> AccuracyGraph.render。
+
+        Args:
+            names: 层名列表（sanitized，ONNX 拓扑序，entire 全集）。
+            entire_cos / entire_euc: 整模型（累积）逐层精度数组，与 names 对齐。
+            mse_vals: 可选逐层 MSE。
+            single_names / single_cos / single_euc: 手动逐层（单层）结果；
+                single 缺失的层在 tooltip 显示 n/a，不阻塞渲染。
+            show: 渲染后是否自动打开浏览器。
+
+        Returns:
+            data: AccuracyGraph 内部数据结构（rows/inputs/outputs）。
+        """
+        single_cos_map = dict(zip(single_names, single_cos)) if single_names else {}
+        single_euc_map = dict(zip(single_names, single_euc)) if single_names else {}
+
         graph = build_onnx_tensor_graph(self.onnx_path, sanitize=True)
         node_info = graph['node_info']
 
@@ -952,21 +1088,18 @@ class QnnAccuracyDebugger:
                 'op_type': node_info.get(tensor)[0] if tensor is not None and tensor in node_info else 'Unknown',
                 'entire_cos': float(entire_cos[i]),
                 'entire_euc': float(entire_euc[i]),
-                'single_cos': None, 'single_euc': None,
+                'single_cos': single_cos_map.get(str(name)),
+                'single_euc': single_euc_map.get(str(name)),
                 'mse': float(mse_vals[i]) if mse_vals is not None else None,
             })
 
-        children, parents, tensor_layers = build_layer_graph(results, graph)
-        self.draw_network_analysis(results, children, parents, graph, show=True)
-
-    def draw_network_analysis(self, results: list, children: dict, parents: dict,
-                              graph: dict, show: bool = True) -> dict:
-        """接入 AccuracyGraph 渲染 Netron 风格网络图（HTML）。"""
         real_rows = [{
             'layer_name': r['layer_name'], 'op_type': r['op_type'],
             'entire_cos': r['entire_cos'], 'entire_euc': r['entire_euc'],
             'single_cos': r['single_cos'], 'single_euc': r['single_euc'],
         } for r in results]
+
+        children, parents, tensor_layers = build_layer_graph(results, graph)
 
         (input_rows, output_rows, input_layers, output_layers,
          aug_children, aug_parents) = build_terminal_nodes(
@@ -981,10 +1114,1010 @@ class QnnAccuracyDebugger:
         output_path = self.tmp_dir / 'qnn_graph_accuracy_analysis.html'
         viz = AccuracyGraph(data=data, children=aug_children, parents=aug_parents,
                             output_path=output_path, title='QNN Graph Accuracy Analysis')
-        
+
         html_path = viz.render(show=show)
         self.file_or_dir_to_clean.append(html_path)
         return data
+
+
+def ensure_sdk_pythonpath() -> None:
+    """主进程内使用 qti 前，把 SDK 的 python 目录并入 sys.path。
+
+    os.environ 里的 PYTHONPATH 只在解释器启动时读取；run_env_script / setup_sdk
+    运行时注入的环境不会自动更新已运行解释器的 sys.path，此处显式并入，
+    使 encodings/layers/tinydlc 等读取可在主进程直接完成（不再递归子进程）。
+    """
+    for entry in os.environ.get('PYTHONPATH', '').split(os.pathsep):
+        if entry and entry not in sys.path:
+            sys.path.insert(0, entry)
+
+
+
+_CONV_SCRIPT_CACHE = None
+
+
+def _qairt_converter_script() -> str:
+    """qairt-converter 脚本绝对路径（去掉 get_tool 的引号包装）。"""
+    global _CONV_SCRIPT_CACHE
+    if _CONV_SCRIPT_CACHE is None:
+        from onnx_to_qnn import QAIRTScript
+        _CONV_SCRIPT_CACHE = QAIRTScript.get_tool('qairt-converter').strip().strip('"')
+    return _CONV_SCRIPT_CACHE
+
+
+def _conv_argv(cut_onnx: str, out_dlc: str, ov_json: str, layout: str) -> list:
+    import shlex
+    args = ['--input_network', cut_onnx, '--output_path', out_dlc,
+            '--quantization_overrides', ov_json]
+    args += shlex.split(layout)          # 去引号，与 shell 语义一致
+    args += ['--onnx_skip_simplification']
+    return args
+
+
+def _trunc_conv_slice(jobs) -> list:
+    """进程池 worker：在本进程内（引擎只 import 一次）连续转换 jobs。
+
+    jobs: [(cut_onnx, ov_json, layout, out_dlc)]（均为 str 路径）。
+    输出静默（stdout/stderr 捕获后丢弃），失败时返回尾部便于诊断。
+    Returns: 与 jobs 对齐的 [(rc, tail), ...]。
+    """
+    ensure_sdk_pythonpath()
+    script = _qairt_converter_script()
+    import runpy
+    import tempfile
+    import contextlib
+    results = []
+    for cut, ov, layout, out_dlc in jobs:
+        argv = [script] + _conv_argv(cut, out_dlc, ov, layout)
+        old_argv = sys.argv
+        sys.argv = argv
+        txt = ''
+        # fd 级捕获（dup2 到临时文件）：converter 内 faulthandler / C 层输出
+        # 直接写 fd1/fd2，只重定向 sys.stdout/stderr 会漏
+        try:
+            import os as _os
+            with tempfile.TemporaryFile(mode='w+', encoding='utf-8',
+                                        errors='replace') as tf:
+                saved_out, saved_err = _os.dup(1), _os.dup(2)
+                _os.dup2(tf.fileno(), 1)
+                _os.dup2(tf.fileno(), 2)
+                try:
+                    runpy.run_path(script, run_name='__main__')
+                finally:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    _os.dup2(saved_out, 1)
+                    _os.dup2(saved_err, 2)
+                    _os.close(saved_out)
+                    _os.close(saved_err)
+                tf.flush()
+                tf.seek(0)
+                txt = tf.read()
+            results.append((0, ''))
+        except SystemExit as e:
+            rc = int(e.code or 0)
+            results.append((rc, txt[-1500:]))
+        except Exception as exc:
+            results.append((-1, f'{type(exc).__name__}: {exc}\n' + txt[-1500:]))
+        finally:
+            sys.argv = old_argv
+    return results
+
+
+# 惰性导入：仅创建 DlcV2EncodingExporter 实例时才需要 QAIRT SDK 环境。
+# 需要 SDK python 路径可用（QAIRT_SDK_ROOT/lib/python 等）：由 onnx_to_qnn.run_env_script
+# 注入环境（ensure_sdk_pythonpath 把 SDK python 目录并入 sys.path）；两个单层分析类
+# （QnnTruncatedAccuracyAnalysis / QnnSingleAccuracyAnalysisFull）主进程直接调用
+# export_dlc_encodings / list_dlc_layer_candidates / dump_tinydlc_meta 完成
+# encodings/layers/tinydlc 读取（不再递归子进程）。本导出器也可被直接实例化
+# （前提：当前解释器已具备 SDK 的 sys.path / LD_LIBRARY_PATH）。
+modeltools = None
+ir_graph = None
+
+class DlcV2EncodingExporter:
+    """从量化 DLC 提取张量量化编码并导出为 AIMET 2.0.0 格式。"""
+
+    def __init__(self, dlc_path: str, reader=None):
+        """初始化导出器。
+
+        Args:
+            dlc_path: 量化 DLC 文件路径。
+            reader: 可选的 DLC 读取器实例（用于测试注入）；默认创建
+                    modeltools.IrDlcReader。
+        """
+        global modeltools, ir_graph
+        if ir_graph is None:  # 首次实例化时导入 SDK 模块
+            ensure_sdk_pythonpath()
+            from qti.aisw.dlc_utils import modeltools as _mt
+            from qti.aisw.converters.common import ir_graph as _ig
+            modeltools, ir_graph = _mt, _ig
+
+        self.dlc_path = dlc_path
+        self._reader = reader or modeltools.IrDlcReader()
+        self._reader.open(str(dlc_path))   # qti pybind 只收 str，不接受 Path
+        self._ir_graph = self._reader.get_ir_graph()
+        if self._ir_graph is None:
+            raise ValueError(f"Failed to read IR graph from DLC: {dlc_path}")
+
+    @property
+    def ir_graph(self):
+        """底层 IR 图对象（libPyIrGraph）。"""
+        return self._ir_graph
+
+    @staticmethod
+    def _dtype_of(data_type) -> str:
+        """QNN_DATATYPE_* -> 'uint8' / 'int16' / 'float32' 等字符串。"""
+        name = getattr(data_type, 'name', None) or str(data_type)
+        m = re.search(r'UFIXED_POINT_(\d+)', name)
+        if m:
+            return 'uint' + m.group(1)
+        m = re.search(r'SFIXED_POINT_(\d+)', name)
+        if m:
+            return 'int' + m.group(1)
+        m = re.search(r'FLOAT_(\d+)', name)
+        if m:
+            return 'float' + m.group(1)
+        return name
+
+    @classmethod
+    def _tensor_encoding_v2(cls, ir_tensor) -> dict:
+        """单个 IR 张量 -> AIMET 2.0.0 条目（对齐 TensorEncoding.V2）。"""
+        out = {'output_dtype': cls._dtype_of(ir_tensor.data_type()),
+               'name': ir_tensor.name()}
+        enc = ir_tensor.get_encoding()
+        et = enc.type
+        if et in (ir_graph.QNN_QUANTIZATION_ENCODING_SCALE_OFFSET,
+                  ir_graph.QNN_QUANTIZATION_ENCODING_BW_SCALE_OFFSET):
+            e = enc.encInfo
+            out['y_scale'] = e.scale
+            if e.offset != 0:
+                out['y_zero_point'] = e.offset
+        elif et in (ir_graph.QNN_QUANTIZATION_ENCODING_AXIS_SCALE_OFFSET,
+                    ir_graph.QNN_QUANTIZATION_ENCODING_BW_AXIS_SCALE_OFFSET):
+            es = enc.axisEncInfo.encInfos
+            out['y_scale'] = [x.scale for x in es]
+            out['axis'] = enc.axisEncInfo.axis
+            if not all(x.offset == 0 for x in es):
+                out['y_zero_point'] = [x.offset for x in es]
+        else:
+            raise ValueError(f"unsupported encoding type: {et}")
+        return out
+
+    def extract(self) -> list:
+        """遍历图中所有可量化张量，返回 AIMET 2.0.0 条目列表。"""
+        encs = []
+        for _name, ir_t in self.ir_graph.get_tensor_map().items():
+            if ir_t.is_quantizable():
+                encs.append(self._tensor_encoding_v2(ir_t))
+        return encs
+
+    def to_dict(self) -> dict:
+        """返回 {"version": "2.0.0", "encodings": [...]} 字典。"""
+        return {'version': '2.0.0', 'encodings': self.extract()}
+
+    def dump(self, out_json: str) -> None:
+        """写出 encodings json（格式与官方 ModelEncoding.dump 一致：indent=4, ensure_ascii=False）。"""
+        data = self.to_dict()
+        with open(out_json, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        print(f"exported {len(data['encodings'])} encodings -> {out_json}")
+
+# ----------------------------------------------------------------------
+# 需 QAIRT SDK（qti）的纯函数：供本文件 CLI 子命令在子进程执行
+# ----------------------------------------------------------------------
+
+def export_dlc_encodings(dlc_path: str, out_json: str) -> str:
+    """把量化 DLC 导出为 v2.0.0 encodings json（CLI: encodings <dlc> <out>）。"""
+    exporter = DlcV2EncodingExporter(dlc_path)
+    exporter.dump(out_json)
+    return out_json
+
+def list_dlc_layer_candidates(dlc_path: str) -> list[dict]:
+    """遍历量化 DLC 图，产出层候选（CLI: layers <dlc> <out_json>）。
+
+    每个候选 = {"tensor": <层输出张量名>, "op_type": <op类型>,
+                "io_tensors": [op 输入+输出张量名...]}。
+    """
+    exporter = DlcV2EncodingExporter(dlc_path)
+    g = exporter.ir_graph
+    candidates = []
+    for op in g.get_ops():
+        outs = [t.name() for t in op.outputs()]
+        if not outs:
+            continue
+        candidates.append({
+            'tensor': outs[0],
+            'op_type': str(op.type.name if hasattr(op.type, 'name') else op.type),
+            'io_tensors': [t.name() for t in op.inputs()] + outs,
+        })
+    return candidates
+
+
+class QnnTruncatedAccuracyAnalysis:
+    """截断单算子（truncated layerwise）精度分析：从整图里逐层切单算子小图执行。
+
+    与 QnnAccuracyDebugger 的关系：组合（composition）——持有 dbg 实例复用其
+    工具方法（golden net-run / 层候选 / encodings / converter / ctx / net-run /
+    进度条线程池），本体只负责截断特有的逻辑：
+      - ONNX 切图（保留目标层前 2 层浮点上界，量化边界由 converter 图内 Convert 产生）;
+      - 仅量化目标层 io 张量;
+      - fp32 feed（input0 原样 / 中间激活按 tiny-DLC dims 排）;
+      - 输出 best-match 比对（含量化张量反量化）。
+
+    golden 侧仍是一次 fp32 全图 --debug dump（不截断），供喂数与比对共用。
+    数值与整图半量化 single 一致（验证 114/118 层，cos 差 <= 1e-5）。
+    """
+
+    def __init__(self, dbg, onnx_path):
+        self.dbg = dbg
+        self.onnx_path = Path(onnx_path) if onnx_path else None
+
+    # ------------------------------------------------------------------
+    # 纯函数（无实例状态）：ONNX 切图 / 布局重排 / tiny-DLC meta
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def onnx_graph_dims_nchw(onnx_path: str) -> dict:
+        """ONNX 模型内 rank-4 张量的 NCHW dims（截断喂数/比对布局用）。"""
+        m = onnx.load(onnx_path)
+        dims = {}
+        for v in list(m.graph.value_info) + list(m.graph.input) + list(m.graph.output):
+            tt = v.type.tensor_type
+            if not tt.HasField('shape'):
+                continue
+            d = [x.dim_value if x.HasField('dim_value') else None for x in tt.shape.dim]
+            if len(d) == 4 and all(x is not None for x in d):
+                dims[v.name] = d
+        return dims
+
+    @staticmethod
+    def trunc_perm_nhwc(nchw_dims: list) -> list:
+        return [nchw_dims[0], nchw_dims[2], nchw_dims[3], nchw_dims[1]]
+
+    @classmethod
+    def trunc_arrange(cls, flat: np.ndarray, src_order: str, dst_order: str,
+                      nchw_dims: list | None) -> np.ndarray:
+        """flat fp32 张量在 'nchw'/'nhwc' 间重排（仅 rank-4）。"""
+        if nchw_dims is None or len(nchw_dims) != 4 or src_order == dst_order:
+            return flat
+        if src_order == 'nhwc' and dst_order == 'nchw':
+            return flat.reshape(cls.trunc_perm_nhwc(nchw_dims)).transpose(0, 3, 1, 2).reshape(-1)
+        if src_order == 'nchw' and dst_order == 'nhwc':
+            return flat.reshape(nchw_dims).transpose(0, 2, 3, 1).reshape(-1)
+        return flat
+
+    @classmethod
+    def trunc_order_of(cls, dims: list, nchw_dims: list | None) -> str | None:
+        if nchw_dims is None or len(nchw_dims) != 4 or len(dims) != 4:
+            return None
+        if list(dims) == list(nchw_dims):
+            return 'nchw'
+        if list(dims) == cls.trunc_perm_nhwc(nchw_dims):
+            return 'nhwc'
+        return None
+
+    @staticmethod
+    def derive_activation_inputs(graph, candidate: dict) -> list:
+        """DLC 候选 io_tensors -> 该算子 ONNX 侧的激活输入张量名。"""
+        init = {i.name for i in graph.initializer}
+        known = (init | {i.name for i in graph.input} | {o.name for o in graph.output}
+                 | {v.name for v in graph.value_info}
+                 | {o for n in graph.node for o in n.output})
+        acts = []
+        for t in candidate['io_tensors'][:-1]:          # 去掉算子输出（最后一个）
+            if t in init:                                # 权重/偏置 initializer
+                continue
+            if t not in known:                           # DLC-only（converter 生成）
+                continue
+            acts.append(t)
+        return acts
+
+    @staticmethod
+    def extend_boundary_inputs(graph, start_inputs: list, n_back: int = 2) -> list:
+        """把截断边界再往上游扩 n_back 层算子（这些层保持浮点，使目标层量化
+        输入由图内 float->int 边界产生——与可用的整图半量化结构一致）。"""
+        producer = {}
+        for n in graph.node:
+            for o in n.output:
+                producer[o] = n
+        graph_in = {i.name for i in graph.input}
+        init = {i.name for i in graph.initializer}
+
+        def act_inputs_of(node):
+            return [i for i in node.input
+                    if i and i not in init and (i in producer or i in graph_in)]
+
+        cur = list(dict.fromkeys(start_inputs))
+        for _ in range(n_back):
+            nxt = []
+            changed = False
+            for t in cur:
+                node = producer.get(t)
+                if node is None:
+                    nxt.append(t)
+                    continue
+                ai = act_inputs_of(node)
+                if len(node.output) == 1 and len(ai) == 1 and ai[0] not in cur:
+                    nxt.append(ai[0])
+                    changed = True
+                else:
+                    nxt.append(t)
+            if not changed:
+                break
+            cur = list(dict.fromkeys(nxt))
+        return cur
+
+    @staticmethod
+    def build_cut_onnx(onnx_path: str, out_onnx: Path, act_inputs: list,
+                       out_tensor: str) -> None:
+        """从完整 ONNX 切出 [act_inputs -> out_tensor] 子图（张量名保留）。"""
+        m = onnx.load(onnx_path)
+        g = m.graph
+        init_names = {i.name for i in g.initializer}
+
+        producer = {}
+        for n in g.node:
+            for o in n.output:
+                producer[o] = n
+        if out_tensor not in producer:
+            raise KeyError(f'output tensor {out_tensor!r} not produced by any ONNX node')
+
+        boundary = set(act_inputs)
+        needed = set()
+        queue = [out_tensor]
+        while queue:
+            t = queue.pop(0)
+            node = producer.get(t)
+            if node is None:
+                continue
+            nid = id(node)
+            if nid in needed:
+                continue
+            needed.add(nid)
+            for it in node.input:
+                if it and it not in boundary and it not in init_names and it in producer:
+                    queue.append(it)
+
+        keep = [n for n in g.node if id(n) in needed]
+
+        dims_of = {}
+        for v in list(g.value_info) + list(g.input) + list(g.output):
+            tt = v.type.tensor_type
+            if tt.HasField('shape'):
+                dims_of[v.name] = [d.dim_value if d.HasField('dim_value') else None
+                                   for d in tt.shape.dim]
+
+        def vi_proto(name: str):
+            dims = dims_of.get(name)
+            if dims is None:
+                return helper.make_tensor_value_info(name, TensorProto.FLOAT, None)
+            return helper.make_tensor_value_info(
+                name, TensorProto.FLOAT, [d if d is not None else 1 for d in dims])
+
+        need_init = sorted({it for n in keep for it in n.input if it in init_names})
+        init_by_name = {i.name: i for i in g.initializer}
+
+        new_graph = helper.make_graph(
+            keep, 'trunc',
+            [vi_proto(a) for a in act_inputs],
+            [vi_proto(out_tensor)],
+            [init_by_name[x] for x in need_init])
+        nm = helper.make_model(new_graph, opset_imports=list(m.opset_import))
+        nm.ir_version = m.ir_version
+        out_onnx.parent.mkdir(parents=True, exist_ok=True)
+        onnx.save(nm, str(out_onnx))
+
+    @staticmethod
+    def dump_tinydlc_meta(dlc_path: str, out_json: str) -> str:
+        """tiny DLC -> {inputs/outputs/tensors(+量化参数)} json（CLI: tinydlc）。"""
+        ensure_sdk_pythonpath()
+        from qti.aisw.dlc_utils import modeltools as _mt
+        reader = _mt.IrDlcReader()
+        reader.open(dlc_path)
+        g = reader.get_ir_graph()
+
+        def dt(t):
+            n = getattr(t.data_type(), 'name', None) or str(t.data_type())
+            m = re.search(r'UFIXED_POINT_(\d+)', n)
+            if m:
+                return 'uint' + m.group(1)
+            m = re.search(r'SFIXED_POINT_(\d+)', n)
+            if m:
+                return 'int' + m.group(1)
+            m = re.search(r'FLOAT_(\d+)', n)
+            if m:
+                return 'float' + m.group(1)
+            return n
+
+        def tensors_of(fn):
+            try:
+                return [{'name': t.name(), 'dims': list(t.dims()), 'dtype': dt(t)}
+                        for t in getattr(g, fn)()]
+            except Exception:
+                return []
+
+        inputs = tensors_of('get_input_tensors_to_graph') or tensors_of('get_input_tensors')
+        outputs = tensors_of('get_output_tensors_of_graph') or tensors_of('get_output_tensors')
+        tensors = {}
+        for name, t in g.get_tensor_map().items():
+            entry = {'dtype': dt(t), 'dims': list(t.dims())}
+            try:
+                enc = t.get_encoding()
+                if enc is not None:
+                    en = getattr(getattr(enc, 'type', None), 'name', None) or str(getattr(enc, 'type', ''))
+                    if 'AXIS_SCALE_OFFSET' in en:
+                        es = enc.axisEncInfo.encInfos
+                        entry['scale'] = [x.scale for x in es]
+                        entry['axis'] = enc.axisEncInfo.axis
+                        if not all(x.offset == 0 for x in es):
+                            entry['zp'] = [x.offset for x in es]
+                    elif 'SCALE_OFFSET' in en:
+                        info = enc.encInfo
+                        entry['scale'] = info.scale
+                        if info.offset != 0:
+                            entry['zp'] = info.offset          # QNN 约定（负）
+            except Exception:
+                pass
+            tensors[name] = entry
+        with open(out_json, 'w', encoding='utf-8') as f:
+            json.dump({'inputs': inputs, 'outputs': outputs, 'tensors': tensors},
+                      f, indent=1)
+        return out_json
+
+    # ------------------------------------------------------------------
+    # 手动逐层（layerwise）管线：converter -> context-binary -> net-run
+    # ------------------------------------------------------------------
+
+    def run_qairt_context_binary_generator(self, dlc_path: str, bin_path: str, output_dir: str,
+                                           output_tensors: str = None, graph_name: str = None,
+                                           print_output: bool = True) -> int:
+        """qnn-context-binary-generator --dlc_path <半量化DLC> -> context binary (.bin)。
+
+        混合精度 DLC（目标层量化 + 其余 fp16 fallback）含 Convert 节点，qnn-net-run
+        直接 --dlc_path 会在 composeGraphs 阶段报
+        "QNN_DEFINITION_IMPL_GENERATED tensor not supported as output for Convert"；
+        必须先离线编译成 context binary，再 qnn-net-run --retrieve_context 执行。
+
+        Args:
+            dlc_path: 半量化 DLC（converter 产物）。
+            bin_path: 输出的 context binary 路径（.bin）。
+            output_dir: 工具输出目录（也放 binary_file 的同级默认位置）。
+            backend_lib: HTP backend 库路径（默认 self.backend_lib_target）。
+            output_tensors: 要额外导出的中间张量名（逗号分隔，不带 graph 前缀）。
+            graph_name: DLC 中的 graph 名（如 "RetinaFace_mobile_1_3_320_320"）。
+                        --set_output_tensors 需 "graph:tensor" 语法；为 None 时只传张量名。
+        """
+        # qnn-context-binary-generator 的输出文件名 = --binary_file 参数值 + ".bin"
+        # （实测:传 layer -> layer.bin;传 layer.bin -> layer.bin.bin）。
+        # 因此去掉 .bin 后缀,最终产物路径 = bin_path 本身。
+
+        # model, backend
+        if sys.platform.startswith('win'):
+            model_lib, backend_lib = 'QnnModelDlc.dll', 'QnnHtp.dll'
+        else:
+            model_lib, backend_lib = 'libQnnModelDlc.so', 'libQnnHtp.so'
+
+        bin_stem = bin_path[:-4] if bin_path.endswith('.bin') else bin_path
+
+        cmd = f'qnn-context-binary-generator --model {model_lib} --backend {backend_lib} --log_level error'
+        cmd += f' --dlc_path {dlc_path} --binary_file {bin_stem} --output_dir {output_dir}'
+        if output_tensors:
+            if graph_name:
+                cmd += f' --set_output_tensors "{graph_name}:{output_tensors}"'
+            else:
+                cmd += f' --set_output_tensors "{output_tensors}"'
+
+        return run_command(cmd, signature="[QAIRTAccuracyDebugger]", print_output=print_output)
+
+    def run_qnn_net_run_bin(self, bin_path:str, backend_lib:str, input_list:str, output_dir: str, print_output: bool = True) -> int:
+        """执行 qnn-net-run --retrieve_context <bin>（context binary 加载执行）。"""
+        
+        cmd = f'qnn-net-run --retrieve_context {bin_path} --backend {backend_lib}'
+        cmd += f' --input_list {input_list} --output_dir {output_dir} --log_level error'
+
+        return run_command(cmd, signature="[QAIRTAccuracyDebugger]", print_output=print_output)
+
+    def extract_dlc_encoding(self, model_path:str) -> str:
+        """量化 DLC -> v2.0.0 encodings json（主进程直接读，不递归子进程）。
+
+        需 SDK 环境已注入 os.environ（run_env_script / setup_sdk），qti 在该
+        进程内可导入。
+        """
+        self.dbg.working_dir.mkdir(parents=True, exist_ok=True)
+        encoding_path = self.dbg.working_dir / f"{Path(model_path).stem}_encoding.json"
+        export_dlc_encodings(model_path, str(encoding_path))
+        return str(encoding_path)
+
+
+
+    def _sanitize_name(self, name: str) -> str:
+        """张量名 -> 输出 raw 文件名（qnn-net-run: 非字母数字下划线统一替换为 '_'）。"""
+        return re.sub(r'[^A-Za-z0-9_]', '_', name)
+
+
+    def extract_layer_candidates(self, quantized_dlc_path: str) -> list[dict]:
+        """遍历量化 DLC 图，为每个可量化 op 产出层候选（主进程直接读）。
+
+        每个候选 = {"tensor": <该层输出张量名>, "op_type": <op类型>,
+                    "io_tensors": [op 输入+输出张量名...]}。
+        与官方 subgraph_snooper 的 overrides 范围一致：
+        Conv2d -> input+weight+bias+output（4个）；Prelu -> input+coeff+output（3个）；
+        Concat -> 各输入激活+output（4个）。
+        """
+        return list_dlc_layer_candidates(quantized_dlc_path)
+
+
+    def make_layer_override_json(self, io_tensor_names: list, v2_encodings_path: str,
+                                 out_json_path: str) -> str:
+        """按张量名从全量 v2 encodings 中筛出子集，生成单层 quantization_overrides json。
+
+        Args:
+            io_tensor_names: 该层 producer op 的输入+输出张量名。
+            v2_encodings_path: 全量化 DLC 导出的 v2.0.0 encodings json。
+            out_json_path: 输出的 overrides json 路径（AIMET 2.0.0 格式）。
+        """
+        with open(v2_encodings_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        encodings = data.get('encodings', data if isinstance(data, list) else [])
+        by_name = {e.get('name'): e for e in encodings}
+        want = [n for n in io_tensor_names if n in by_name]
+
+        # y_zero_point 符号：AIMET 2.0.0 overrides 约定为正 offset（AIMET: Positive,
+        # QNN: Negative），量化 DLC 直接导出的是 QNN 负值，需取反后才能喂 converter。
+        def flip_zp(v):
+            if isinstance(v, list):
+                return [-1.0 * x for x in v]
+            return -1.0 * v
+
+        out_encs = []
+        for e in (by_name[n] for n in want):
+            e = dict(e)
+            if 'y_zero_point' in e:
+                e['y_zero_point'] = flip_zp(e['y_zero_point'])
+            out_encs.append(e)
+        out = {'version': '2.0.0', 'encodings': out_encs}
+        with open(out_json_path, 'w', encoding='utf-8') as f:
+            json.dump(out, f, ensure_ascii=False, indent=4)
+        return out_json_path
+
+    # 外部调用 accuracy_analysis() clean()
+
+    def _run_batch_progress(self, fn, items, desc) -> list:
+        """并行提交一批任务并显示 tqdm 进度条，返回与 items 顺序一致的返回码。
+
+        items: [(args_tuple, kwargs_dict), ...]；每个任务经 MultThreadExetutor 线程池执行。
+        子进程输出在调用方以 print_output=False 静默，终端只保留进度条。
+        """
+        from concurrent.futures import as_completed
+        import tqdm
+
+        if not items:
+            return []  # 空批次(如前面阶段全部失败)：直接返回，不闪 0 层进度条
+
+        for args, kw in items:
+            MultThreadExetutor.run_exetutor(fn, *args, **kw)
+        n = len(items)
+        idx_of = {id(f): i for i, f in enumerate(MultThreadExetutor.future_list)}
+        codes = [None] * n
+        with tqdm.tqdm(total=n, desc=desc, unit='it', ncols=110, file=sys.stderr) as bar:
+            for fut in as_completed(MultThreadExetutor.future_list):
+                i = idx_of[id(fut)]
+                codes[i] = fut.result()
+                bar.update(1)
+        MultThreadExetutor.wait_and_close()  # 收尾并重置线程池供下一阶段
+        return codes
+
+
+    @staticmethod
+    def dump_tinydlc_meta_batch(dlcs_json: str) -> int:
+        """批量读取多个 tiny DLC 的图信息（一次 python 进程，CLI: tinydlc-batch）。
+
+        dlcs_json: {"dlcs": [<dlc 绝对路径>...]}；每个 dlc 的 meta 写到
+        <dlc 同目录>/<stem>.tiny_meta.json（与单文件 tinydlc 一致）。
+        """
+        import json as _json
+        from pathlib import Path as _P
+        ensure_sdk_pythonpath()
+        from qti.aisw.dlc_utils import modeltools as _mt
+        with open(dlcs_json, 'r', encoding='utf-8') as f:
+            dlc_list = _json.load(f)['dlcs']
+        def one(dlc: str) -> None:
+            # 每文件新建 reader：复用同一 reader 重复 open 会返回旧图导致串数据
+            reader = _mt.IrDlcReader()
+            reader.open(str(dlc))
+            g = reader.get_ir_graph()
+
+            def dt(t):
+                n = getattr(t.data_type(), 'name', None) or str(t.data_type())
+                m = re.search(r'UFIXED_POINT_(\d+)', n)
+                if m:
+                    return 'uint' + m.group(1)
+                m = re.search(r'SFIXED_POINT_(\d+)', n)
+                if m:
+                    return 'int' + m.group(1)
+                m = re.search(r'FLOAT_(\d+)', n)
+                if m:
+                    return 'float' + m.group(1)
+                return n
+
+            def tensors_of(fn):
+                try:
+                    return [{'name': t.name(), 'dims': list(t.dims()), 'dtype': dt(t)}
+                            for t in getattr(g, fn)()]
+                except Exception:
+                    return []
+
+            inputs = tensors_of('get_input_tensors_to_graph') or tensors_of('get_input_tensors')
+            outputs = tensors_of('get_output_tensors_of_graph') or tensors_of('get_output_tensors')
+            tensors = {}
+            for name, t in g.get_tensor_map().items():
+                entry = {'dtype': dt(t), 'dims': list(t.dims())}
+                try:
+                    enc = t.get_encoding()
+                    if enc is not None:
+                        en = getattr(getattr(enc, 'type', None), 'name', None) or str(getattr(enc, 'type', ''))
+                        if 'AXIS_SCALE_OFFSET' in en:
+                            es = enc.axisEncInfo.encInfos
+                            entry['scale'] = [x.scale for x in es]
+                            entry['axis'] = enc.axisEncInfo.axis
+                            if not all(x.offset == 0 for x in es):
+                                entry['zp'] = [x.offset for x in es]
+                        elif 'SCALE_OFFSET' in en:
+                            info = enc.encInfo
+                            entry['scale'] = info.scale
+                            if info.offset != 0:
+                                entry['zp'] = info.offset          # QNN 约定（负）
+                except Exception:
+                    pass
+                tensors[name] = entry
+            out = _P(dlc).with_suffix('.tiny_meta.json')
+            with open(out, 'w', encoding='utf-8') as f:
+                _json.dump({'inputs': inputs, 'outputs': outputs, 'tensors': tensors},
+                           f, indent=1)
+
+        for dlc in dlc_list:
+            try:
+                one(dlc)
+            except Exception as exc:
+                print(f'[tinydlc-batch] failed {dlc}: {type(exc).__name__}: {exc}')
+        return 0
+
+    def query_tiny_dlc_batch(self, dlc_paths: list) -> list:
+        """主进程直接批量读多个 tiny DLC meta（不再递归子进程/自执行 CLI）。
+
+        每个文件新建 qti reader 读取（复用 reader 会串数据）；单个失败不拖累
+        其余，返回与 dlc_paths 对齐的列表（失败元素为 None）。
+        """
+        import tqdm
+        if not dlc_paths:
+            return []
+        out = []
+        with tqdm.tqdm(total=len(dlc_paths), desc='single[trunc meta]', unit='it',
+                       ncols=110, file=sys.stderr) as bar:
+            for p in dlc_paths:
+                try:
+                    out.append(self.query_tiny_dlc(p))
+                except Exception as exc:
+                    print(f"[QAIRTAccuracyDebugger] tinydlc failed {p}: "
+                          f"{type(exc).__name__}: {exc}")
+                    out.append(None)
+                bar.update(1)
+        return out
+
+    # ------------------------------------------------------------------
+    # 入口
+    # ------------------------------------------------------------------
+
+    def run(self, golden_dlc_path: str, target_dlc_path: str, input_list: str,
+            only_tensor_prefix=None) -> tuple[list[str], np.ndarray,
+                                               np.ndarray, np.ndarray]:
+        """执行截断单算子逐层分析。整体失败（抛异常）不自动降级；
+        由调用方（accuracy_analysis）捕获后只输出 entire。"""
+        dbg = self.dbg
+        if self.onnx_path is None:
+            raise RuntimeError("QnnTruncatedAccuracyAnalysis needs onnx_path "
+                               "(QnnAccuracyDebugger(..., onnx_path=...))")
+
+        # golden dump：复用 dbg.working_dir/golden_output，缺则自动补跑一次
+        golden_dir = dbg.working_dir / 'golden_output'
+        if not (golden_dir / 'Result_0').exists():
+            print(f"[QAIRTAccuracyDebugger] golden dump not found, running golden once ...")
+            golden_dir.mkdir(parents=True, exist_ok=True)
+            ret = dbg.run_qnn_net_run(golden_dlc_path, dbg.backend_lib_golden,
+                                      input_list, str(golden_dir))
+            if ret != 0:
+                raise RuntimeError(f"[QAIRTAccuracyDebugger] golden net-run failed: {ret}")
+
+        golden = self._load_golden_dumps(golden_dir)
+        if not golden:
+            raise RuntimeError(f"[QAIRTAccuracyDebugger] golden dir empty: {golden_dir}")
+        print(f"[QAIRTAccuracyDebugger] golden layers: {len(golden)}")
+
+        layers = self.extract_layer_candidates(target_dlc_path)
+        if only_tensor_prefix:
+            layers = [c for c in layers if c['tensor'].startswith(only_tensor_prefix)]
+        layers = [c for c in layers if self._sanitize_name(c['tensor']) in golden]
+        print(f"[QAIRTAccuracyDebugger] candidate layers to analyze: {len(layers)}")
+
+        v2_encodings_path = self.extract_dlc_encoding(target_dlc_path)
+        image_raw = self._first_input_raw(input_list)
+        dims_nchw = self.onnx_graph_dims_nchw(str(self.onnx_path))
+
+        samples_dir = dbg.working_dir / 'truncated'   # 001/002/... 直接放这里
+        samples_dir.mkdir(parents=True, exist_ok=True)
+
+        # ---- prepare：cut ONNX + overrides（逐层独立）。
+        # 样本目录只用序号（NNN），张量名只出现在输出 raw 文件名——避免
+        # 绝对路径超 ~260 字符（深层长名层写文件失败）。
+        infos = []
+        for i, layer in enumerate(layers):
+            tag = f"{i + 1:03d}"
+            sdir = samples_dir / tag
+            sdir.mkdir(parents=True, exist_ok=True)
+            info = self._trunc_prepare_layer(sdir, layer, v2_encodings_path, dims_nchw)
+            if info is not None:
+                infos.append(info)
+        print(f"[QAIRTAccuracyDebugger] truncated prepared layers: {len(infos)}")
+        if not infos:
+            raise RuntimeError("[QAIRTAccuracyDebugger] truncated: no layer prepared")
+
+        # 各阶段并发 worker 数（2 的次方）。12 核 x86 实测：converter 8、ctx 8、
+        # meta 8 达饱和，继续加大无增益/变慢；net-run 8。
+        WORKERS = dict(converter=4, ctx=8, feed=8, net_run=8)
+
+        # ---- 阶段A：converter（进程池：每进程内复用 qairt-converter 引擎，
+        #     连续转换本片各层，避免每层一次 python 启动；输出静默）
+        from utils import MultProcessExetutor
+        w = WORKERS['converter']
+        conv_jobs = [(str(info['cut_onnx']), str(info['ov_json']), info['layout'],
+                      str(info['dlc_q'])) for info in infos]
+        chunks = [conv_jobs[k::w] for k in range(w)]
+        chunks = [c for c in chunks if c]          # 去掉空片
+        MultProcessExetutor.set_max_workers(w)
+        entries = []
+        for ch in chunks:
+            MultProcessExetutor.run_exetutor(_trunc_conv_slice, ch)
+            entries.append((len(entries), MultProcessExetutor.future_list[-1]))
+        import tqdm as _tqdm
+        conv_codes = [None] * len(conv_jobs)
+        conv_tails = [''] * len(conv_jobs)
+        with _tqdm.tqdm(total=len(conv_jobs), desc='single[trunc 1/3 converter]',
+                        unit='it', ncols=110, file=sys.stderr) as bar:
+            for k, fut in entries:
+                res = fut.result()
+                for j, (rc, tail) in enumerate(res):
+                    pos = k + j * w
+                    conv_codes[pos] = rc
+                    conv_tails[pos] = tail
+                bar.update(len(res))
+        MultProcessExetutor.wait_and_close()
+        conv_ok = [info for info, c in zip(infos, conv_codes) if c == 0]
+        n_fail = len(infos) - len(conv_ok)
+        if n_fail:
+            print(f"[QAIRTAccuracyDebugger] truncated converter failures: {n_fail}")
+            for info, rc, tail in zip(infos, conv_codes, conv_tails):
+                if rc != 0 and tail:
+                    print(f"  [conv fail] {info['tensor']}: {tail.strip()[-600:]}")
+
+        # ---- 阶段B：tiny DLC meta（主进程内一次性直读，几乎瞬时，无进度条）
+        metas = self.query_tiny_dlc_batch([info['dlc_q'] for info in conv_ok])
+        meta_ok = [(info, qm) for info, qm in zip(conv_ok, metas) if qm]
+        print(f"[QAIRTAccuracyDebugger] truncated meta ok: "
+              f"{len(meta_ok)}/{len(conv_ok)} (in-process)")
+
+        # ---- 阶段C：ctx binary（并行）
+        def _ctx(item):
+            info, _qm = item
+            return self.run_qairt_context_binary_generator(
+                str(info['dlc_q']), str(info['sdir'] / 'quant.bin'),
+                str(info['sdir']), print_output=False)
+
+        MultThreadExetutor.set_max_workers(WORKERS['ctx'])
+        ctx_items = [((item,), {}) for item in meta_ok]
+        ctx_codes = self._run_batch_progress(_ctx, ctx_items,
+                                            'single[trunc 2/3 ctx]')
+        ctx_ok = [item for item, c in zip(meta_ok, ctx_codes) if c == 0]
+
+        # ---- 阶段D：feed + net-run（并行）
+        def _feed(item):
+            info, qm = item
+            return self._trunc_write_feed(info, qm, golden, image_raw, dims_nchw)
+
+        MultThreadExetutor.set_max_workers(WORKERS['feed'])
+        feed_items = [((item,), {}) for item in ctx_ok]
+        ils = self._run_batch_progress(_feed, feed_items,
+                                      'single[trunc feeds]')
+        ready = [(item, il) for item, il in zip(ctx_ok, ils) if il]
+
+        def _net(item):
+            (info, _qm), il = item
+            return self.run_qnn_net_run_bin(
+                str(info['sdir'] / 'quant.bin'), dbg.backend_lib_target,
+                il, str(info['sdir'] / 'quant_run'), print_output=False)
+
+        MultThreadExetutor.set_max_workers(WORKERS['net_run'])
+        net_items = [((item,), {}) for item in ready]
+        net_codes = self._run_batch_progress(_net, net_items,
+                                            'single[trunc 3/3 net-run]')
+        net_ok = [item for item, c in zip(ready, net_codes) if c == 0]
+
+        # ---- compare（best-match vs golden）
+        names, cos, euc, mse = [], [], [], []
+        for (info, qm), _il in net_ok:
+            r = self._trunc_compare(info, qm, golden, dims_nchw)
+            if r is None:
+                continue
+            names.append(r['name'])
+            cos.append(r['cos'])
+            euc.append(r['euc'])
+            mse.append(r['mse'])
+        if not names:
+            raise RuntimeError("[QAIRTAccuracyDebugger] truncated: no layer succeeded")
+        print(f"[QAIRTAccuracyDebugger] single(truncated) succeeded: "
+              f"{len(names)}/{len(layers)}")
+        return names, np.asarray(cos), np.asarray(euc), np.asarray(mse)
+
+    # ------------------------------------------------------------------
+    # 内部工具
+    # ------------------------------------------------------------------
+
+    def query_tiny_dlc(self, dlc_path) -> dict:
+        """读取 tiny DLC 图输入顺序/输出/张量量化参数（主进程直接读，不递归子进程）。"""
+        dlc_path = Path(dlc_path)
+        out_json = dlc_path.with_suffix('.tiny_meta.json')
+        self.dump_tinydlc_meta(str(dlc_path), str(out_json))
+        with open(out_json, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def _load_golden_dumps(self, golden_dir) -> dict:
+        """golden dump（fp32 全图 --debug）：sanitized 张量名 -> fp32 ndarray。"""
+        out = {}
+        for p in Path(golden_dir).rglob('*.raw'):
+            a32 = np.fromfile(str(p), dtype=np.float32)
+            if not np.isfinite(a32).all() and p.stat().st_size % 2 == 0:
+                out[p.stem] = np.fromfile(str(p), dtype=np.float16).astype(np.float32)
+            else:
+                out[p.stem] = a32
+        return out
+
+    def _first_input_raw(self, input_list: str) -> str:
+        """input_list 第一行第一个 raw = 图像输入（input0 原样喂）。"""
+        with open(input_list, 'r', encoding='utf-8') as f:
+            first = f.readline().strip()
+        if not first:
+            raise RuntimeError(f"[QAIRTAccuracyDebugger] input_list empty: {input_list}")
+        return first.split()[0]
+
+    def _trunc_layout_args(self, acts: list) -> str:
+        args = ''
+        for a in acts:
+            args += (f' --source_model_input_layout "{a}" NCHW'
+                     f' --desired_input_layout "{a}" NHWC')
+            if a == 'input0':
+                args += f' --desired_input_color_encoding "{a}" rgb rgb'
+        return args
+
+    def _trunc_convert(self, info: dict) -> int:
+        from onnx_to_qnn import QAIRTScript
+        exe = QAIRTScript.get_tool('qairt-converter')
+        if not sys.platform.startswith('win'):
+            # Linux：SDK 脚本 shebang 指向系统 python3（无 onnx），显式用当前解释器
+            exe = f'"{sys.executable}" {exe}'
+        cmd = (f'{exe} --input_network {info["cut_onnx"]} --output_path {info["dlc_q"]}'
+               f' --quantization_overrides {info["ov_json"]} {info["layout"]}'
+               f' --onnx_skip_simplification')
+        return run_command(cmd, signature="[QAIRTAccuracyDebugger]", print_output=False)
+
+    def _trunc_prepare_layer(self, sdir: Path, layer: dict, v2_encodings_path: str,
+                             dims_nchw: dict) -> dict | None:
+        """单层准备：切 ONNX + 生成 override json；不可截断返回 None。"""
+        tensor = layer['tensor']
+        try:
+            graph = onnx.load(str(self.onnx_path)).graph
+        except Exception as exc:
+            print(f"[QAIRTAccuracyDebugger] onnx load failed ({exc})")
+            return None
+        acts0 = self.derive_activation_inputs(graph, layer)
+        if not acts0:
+            print(f"[QAIRTAccuracyDebugger] skip (no activation input): {tensor}")
+            return None
+        if tensor not in {o for n in graph.node for o in n.output}:
+            print(f"[QAIRTAccuracyDebugger] skip (not an onnx output): {tensor}")
+            return None
+        acts = self.extend_boundary_inputs(graph, acts0, n_back=2)
+        cut_onnx = sdir / 'cut.onnx'
+        try:
+            self.build_cut_onnx(str(self.onnx_path), cut_onnx, acts, tensor)
+        except Exception as exc:
+            print(f"[QAIRTAccuracyDebugger] cut failed for {tensor}: {type(exc).__name__}")
+            return None
+        ov_json = sdir / 'overrides.json'
+        self.make_layer_override_json(layer['io_tensors'], v2_encodings_path,
+                                          str(ov_json))
+        return {
+            'tensor': tensor, 'act_inputs': acts, 'sdir': sdir,
+            'cut_onnx': cut_onnx, 'ov_json': ov_json,
+            'layout': self._trunc_layout_args(acts),
+            'dlc_q': sdir / 'quant.dlc',
+        }
+
+    def _trunc_write_feed(self, info: dict, qmeta: dict, golden: dict,
+                          image_raw: str, dims_nchw: dict) -> str | None:
+        """按 tiny DLC 图输入顺序写 fp32 feed；input0 原样、激活按 dims 排。"""
+        try:
+            feed_dir = info['sdir'] / 'feed'
+            feed_dir.mkdir(parents=True, exist_ok=True)
+            raws = []
+            for i, mi in enumerate(qmeta['inputs']):
+                name = mi['name']
+                if name == 'input0':
+                    data = np.fromfile(image_raw, dtype=np.float32)
+                else:
+                    key = self._sanitize_name(name)
+                    if key not in golden:
+                        raise KeyError(f'golden dump missing for input tensor {name!r}')
+                    data = golden[key].astype(np.float32)
+                    dst = self.trunc_order_of(mi['dims'], dims_nchw.get(name))
+                    if dst == 'nchw':
+                        data = self.trunc_arrange(data, 'nhwc', 'nchw', dims_nchw.get(name))
+                p = feed_dir / f'in{i}_{self._sanitize_name(name)}.raw'
+                data.astype(np.float32).tofile(str(p))
+                raws.append(str(p))
+            il = info['sdir'] / 'input_list.txt'
+            il.write_text(' '.join(str(p) for p in raws) + '\n', encoding='utf-8')
+            return str(il)
+        except Exception as exc:
+            print(f"[QAIRTAccuracyDebugger] feed failed for {info['tensor']}: "
+                  f"{type(exc).__name__}: {exc}")
+            return None
+
+    def _trunc_compare(self, info: dict, qmeta: dict, golden: dict,
+                       dims_nchw: dict) -> dict | None:
+        """best-match dump 输出 vs golden（两种布局试，量化输出按编码反量化）。"""
+        tensor = info['tensor']
+        key = self._sanitize_name(tensor)
+        gold = golden[key]
+        out_dims = dims_nchw.get(tensor)
+        refs = {'direct': gold}
+        if out_dims is not None and len(out_dims) == 4:
+            refs['arr'] = self.trunc_arrange(gold, 'nhwc', 'nchw', out_dims)
+
+        def load_arr(path: Path):
+            L = path.stat().st_size
+            if L == 4 * gold.size:
+                return np.fromfile(str(path), dtype=np.float32)
+            if L == gold.size:
+                tname = next((n for n in qmeta['tensors']
+                              if self._sanitize_name(n) == path.stem), None)
+                te = qmeta['tensors'].get(tname, {}) if tname else {}
+                s = te.get('scale')
+                if s is None:
+                    return None
+                z = te.get('zp', 0)
+                dt = np.int8 if te.get('dtype') == 'int8' else np.uint8
+                q = np.fromfile(str(path), dtype=dt)
+                return ((q.astype(np.float64) + z) * s).astype(np.float32)
+            return None
+
+        out_dir = info['sdir'] / 'quant_run'
+        best = (-2.0, None, None)
+        for p in Path(out_dir).rglob('*.raw'):
+            arr = load_arr(p)
+            if arr is None:
+                continue
+            for _mode, gref in refs.items():
+                if arr.size != gref.size:
+                    continue
+                c = float(np.dot(gref, arr) / (np.linalg.norm(gref) * np.linalg.norm(arr) + 1e-12))
+                if c > best[0]:
+                    best = (c, float(np.linalg.norm(gref - arr)), p.name)
+        if best[0] < -1.5:
+            print(f"[QAIRTAccuracyDebugger] output missing for {tensor}")
+            return None
+        return {'name': key, 'cos': best[0], 'euc': best[1],
+                'mse': float(best[1] * best[1] / gold.size)}
+
+
 
 
 class AccuracyGraph:
@@ -2183,4 +3316,370 @@ class AccuracyGraph:
             webbrowser.open(self.output_path.as_uri())
         return str(self.output_path)
 
+# ----------------------------------------------------------------------
+# CLI：需 SDK 的纯函数子命令，供 QnnAccuracyDebugger 以子进程调用
+#   python accuracy_debugger.py encodings <dlc> <out_json>
+#   python accuracy_debugger.py layers    <dlc> <out_json>
+# ----------------------------------------------------------------------
 
+def _main(argv=None) -> int:
+    import sys as _s
+    argv = list(_s.argv[1:] if argv is None else argv)
+    if not argv:
+        print('usage: accuracy_debugger.py encodings|layers <dlc> <out_json>'
+              '| tinydlc <dlc> <out_json> | tinydlc-batch <dlcs_list_json>',
+              file=_s.stderr)
+        return 2
+    subcmd = argv[0]
+    if subcmd == 'tinydlc-batch':
+        try:
+            QnnTruncatedAccuracyAnalysis.dump_tinydlc_meta_batch(argv[1])
+            print('tinydlc-batch done')
+            return 0
+        except Exception as exc:
+            print(f'[accuracy_debugger CLI] tinydlc-batch failed: {type(exc).__name__}: {exc}',
+                  file=_s.stderr)
+            return 1
+    if len(argv) < 3:
+        print('usage: accuracy_debugger.py encodings|layers <dlc> <out_json>'
+              '| tinydlc <dlc> <out_json>', file=_s.stderr)
+        return 2
+    dlc, out_json = argv[1], argv[2]
+    try:
+        if subcmd == 'encodings':
+            export_dlc_encodings(dlc, out_json)
+        elif subcmd == 'layers':
+            with open(out_json, 'w', encoding='utf-8') as f:
+                json.dump(list_dlc_layer_candidates(dlc), f, ensure_ascii=False, indent=1)
+            print(f"layers -> {out_json}")
+        elif subcmd == 'tinydlc':
+            QnnTruncatedAccuracyAnalysis.dump_tinydlc_meta(dlc, out_json)
+            print(f"tinydlc -> {out_json}")
+        else:
+            print(f'unknown subcommand: {subcmd}', file=_s.stderr)
+            return 2
+    except Exception as exc:  # 子进程内失败：非零退出即可（父进程看返回码）
+        print(f'[accuracy_debugger CLI] {subcmd} failed: {type(exc).__name__}: {exc}',
+              file=_s.stderr)
+        return 1
+    return 0
+
+
+
+
+class QnnSingleAccuracyAnalysisFull:
+    """整图半量化（layerwise）精度分析：每层把整个模型再转一次，仅量化该层。
+
+    与 QnnAccuracyDebugger 的关系：组合（composition）——持有 dbg 实例复用其
+    工具（golden net-run / 层候选 / encodings / converter / ctx / net-run /
+    进度条线程池）。这是单层分析的旧实现（每层整图转换+执行），保留作对照；
+    新实现见 QnnTruncatedAccuracyAnalysis（截断单算子，快得多）。
+    """
+
+    def __init__(self, dbg, onnx_path=None):
+        self.dbg = dbg
+        self.onnx_path = Path(onnx_path) if onnx_path else dbg.onnx_path
+
+    # ------------------------------------------------------------------
+    # 手动逐层（layerwise）管线：converter -> context-binary -> net-run
+    # ------------------------------------------------------------------
+
+    def run_qairt_context_binary_generator(self, dlc_path: str, bin_path: str, output_dir: str,
+                                           output_tensors: str = None, graph_name: str = None,
+                                           print_output: bool = True) -> int:
+        """qnn-context-binary-generator --dlc_path <半量化DLC> -> context binary (.bin)。
+
+        混合精度 DLC（目标层量化 + 其余 fp16 fallback）含 Convert 节点，qnn-net-run
+        直接 --dlc_path 会在 composeGraphs 阶段报
+        "QNN_DEFINITION_IMPL_GENERATED tensor not supported as output for Convert"；
+        必须先离线编译成 context binary，再 qnn-net-run --retrieve_context 执行。
+
+        Args:
+            dlc_path: 半量化 DLC（converter 产物）。
+            bin_path: 输出的 context binary 路径（.bin）。
+            output_dir: 工具输出目录（也放 binary_file 的同级默认位置）。
+            backend_lib: HTP backend 库路径（默认 self.backend_lib_target）。
+            output_tensors: 要额外导出的中间张量名（逗号分隔，不带 graph 前缀）。
+            graph_name: DLC 中的 graph 名（如 "RetinaFace_mobile_1_3_320_320"）。
+                        --set_output_tensors 需 "graph:tensor" 语法；为 None 时只传张量名。
+        """
+        # qnn-context-binary-generator 的输出文件名 = --binary_file 参数值 + ".bin"
+        # （实测:传 layer -> layer.bin;传 layer.bin -> layer.bin.bin）。
+        # 因此去掉 .bin 后缀,最终产物路径 = bin_path 本身。
+
+        # model, backend
+        if sys.platform.startswith('win'):
+            model_lib, backend_lib = 'QnnModelDlc.dll', 'QnnHtp.dll'
+        else:
+            model_lib, backend_lib = 'libQnnModelDlc.so', 'libQnnHtp.so'
+
+        bin_stem = bin_path[:-4] if bin_path.endswith('.bin') else bin_path
+
+        cmd = f'qnn-context-binary-generator --model {model_lib} --backend {backend_lib} --log_level error'
+        cmd += f' --dlc_path {dlc_path} --binary_file {bin_stem} --output_dir {output_dir}'
+        if output_tensors:
+            if graph_name:
+                cmd += f' --set_output_tensors "{graph_name}:{output_tensors}"'
+            else:
+                cmd += f' --set_output_tensors "{output_tensors}"'
+
+        return run_command(cmd, signature="[QAIRTAccuracyDebugger]", print_output=print_output)
+
+    def run_qnn_net_run_bin(self, bin_path:str, backend_lib:str, input_list:str, output_dir: str, print_output: bool = True) -> int:
+        """执行 qnn-net-run --retrieve_context <bin>（context binary 加载执行）。"""
+        
+        cmd = f'qnn-net-run --retrieve_context {bin_path} --backend {backend_lib}'
+        cmd += f' --input_list {input_list} --output_dir {output_dir} --log_level error'
+
+        return run_command(cmd, signature="[QAIRTAccuracyDebugger]", print_output=print_output)
+
+    def run_qairt_converter(self, onnx_path:str, output_dlc_path:str, encoding_path:str,
+    print_output: bool = True) -> int:
+        dbg = self.dbg
+        if not dbg.convert_layout_args:
+            layout_args = ""
+            for input_info in dbg.onnx_info.get("inputs"): 
+                input_name = input_info["name"]
+                
+                layout_args += f' --source_model_input_layout "{input_name}" NCHW --desired_input_layout "{input_name}" NHWC'
+                layout_args += f' --desired_input_color_encoding "{input_name}" rgb rgb'
+
+            dbg.convert_layout_args = layout_args
+
+        if not dbg.exe_qairt_converter:
+            from onnx_to_qnn import QAIRTScript
+            dbg.exe_qairt_converter = QAIRTScript.get_tool('qairt-converter')
+
+        command = f'{dbg.exe_qairt_converter} --input_network {onnx_path} --output_path {output_dlc_path}'
+        command += f' --quantization_overrides {encoding_path} {dbg.convert_layout_args} --onnx_skip_simplification'
+        return run_command(command, signature="[QAIRTAccuracyDebugger]", print_output=print_output)
+
+    def extract_dlc_encoding(self, model_path:str) -> str:
+        """量化 DLC -> v2.0.0 encodings json（主进程直接读，不递归子进程）。
+
+        需 SDK 环境已注入 os.environ（run_env_script / setup_sdk），qti 在该
+        进程内可导入。
+        """
+        self.dbg.working_dir.mkdir(parents=True, exist_ok=True)
+        encoding_path = self.dbg.working_dir / f"{Path(model_path).stem}_encoding.json"
+        export_dlc_encodings(model_path, str(encoding_path))
+        return str(encoding_path)
+
+
+
+    def _sanitize_name(self, name: str) -> str:
+        """张量名 -> 输出 raw 文件名（qnn-net-run: 非字母数字下划线统一替换为 '_'）。"""
+        return re.sub(r'[^A-Za-z0-9_]', '_', name)
+
+
+    def extract_layer_candidates(self, quantized_dlc_path: str) -> list[dict]:
+        """遍历量化 DLC 图，为每个可量化 op 产出层候选（主进程直接读）。
+
+        每个候选 = {"tensor": <该层输出张量名>, "op_type": <op类型>,
+                    "io_tensors": [op 输入+输出张量名...]}。
+        与官方 subgraph_snooper 的 overrides 范围一致：
+        Conv2d -> input+weight+bias+output（4个）；Prelu -> input+coeff+output（3个）；
+        Concat -> 各输入激活+output（4个）。
+        """
+        return list_dlc_layer_candidates(quantized_dlc_path)
+
+
+    def make_layer_override_json(self, io_tensor_names: list, v2_encodings_path: str,
+                                 out_json_path: str) -> str:
+        """按张量名从全量 v2 encodings 中筛出子集，生成单层 quantization_overrides json。
+
+        Args:
+            io_tensor_names: 该层 producer op 的输入+输出张量名。
+            v2_encodings_path: 全量化 DLC 导出的 v2.0.0 encodings json。
+            out_json_path: 输出的 overrides json 路径（AIMET 2.0.0 格式）。
+        """
+        with open(v2_encodings_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        encodings = data.get('encodings', data if isinstance(data, list) else [])
+        by_name = {e.get('name'): e for e in encodings}
+        want = [n for n in io_tensor_names if n in by_name]
+
+        # y_zero_point 符号：AIMET 2.0.0 overrides 约定为正 offset（AIMET: Positive,
+        # QNN: Negative），量化 DLC 直接导出的是 QNN 负值，需取反后才能喂 converter。
+        def flip_zp(v):
+            if isinstance(v, list):
+                return [-1.0 * x for x in v]
+            return -1.0 * v
+
+        out_encs = []
+        for e in (by_name[n] for n in want):
+            e = dict(e)
+            if 'y_zero_point' in e:
+                e['y_zero_point'] = flip_zp(e['y_zero_point'])
+            out_encs.append(e)
+        out = {'version': '2.0.0', 'encodings': out_encs}
+        with open(out_json_path, 'w', encoding='utf-8') as f:
+            json.dump(out, f, ensure_ascii=False, indent=4)
+        return out_json_path
+
+    # 外部调用 accuracy_analysis() clean()
+
+    def _run_batch_progress(self, fn, items, desc) -> list:
+        """并行提交一批任务并显示 tqdm 进度条，返回与 items 顺序一致的返回码。
+
+        items: [(args_tuple, kwargs_dict), ...]；每个任务经 MultThreadExetutor 线程池执行。
+        子进程输出在调用方以 print_output=False 静默，终端只保留进度条。
+        """
+        from concurrent.futures import as_completed
+        import tqdm
+
+        if not items:
+            return []  # 空批次(如前面阶段全部失败)：直接返回，不闪 0 层进度条
+
+        for args, kw in items:
+            MultThreadExetutor.run_exetutor(fn, *args, **kw)
+        n = len(items)
+        idx_of = {id(f): i for i, f in enumerate(MultThreadExetutor.future_list)}
+        codes = [None] * n
+        with tqdm.tqdm(total=n, desc=desc, unit='it', ncols=110, file=sys.stderr) as bar:
+            for fut in as_completed(MultThreadExetutor.future_list):
+                i = idx_of[id(fut)]
+                codes[i] = fut.result()
+                bar.update(1)
+        MultThreadExetutor.wait_and_close()  # 收尾并重置线程池供下一阶段
+        return codes
+
+
+    def run(self, golden_dlc_path: str, target_dlc_path: str,
+            input_list: str, only_tensor_prefix=None,
+            ) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray]:
+        """整图半量化逐层实现（原 QnnAccuracyDebugger._single_accuracy_analysis_full）。
+
+        Args:
+            golden_dlc_path: FP32（未量化）DLC 路径（golden dump 不存在时自动补跑一次）。
+            target_dlc_path: 量化 DLC 路径（反射层结构 + 自动导出 v2 encodings）。
+            input_list: qnn-net-run 输入列表。
+            only_tensor_prefix: 只分析张量名以此前缀开头的层（str 或 tuple，用于局部验证；
+                默认 None 分析全部候选层）。
+
+        Returns:
+            (names, single_cos, single_euc, mse)：names 为 sanitized 张量名。
+        """
+        dbg = self.dbg
+
+        # 0) golden dump：复用 dbg.working_dir/golden_output，不存在则自动跑一次
+        golden_dir = dbg.working_dir / 'golden_output'
+        if not (golden_dir / 'Result_0').exists():
+            print(f"[QAIRTAccuracyDebugger] golden dump not found, running golden once ...")
+            golden_dir.mkdir(parents=True, exist_ok=True)
+            ret = dbg.run_qnn_net_run(golden_dlc_path, dbg.backend_lib_golden,
+                                      input_list, str(golden_dir))
+            if ret != 0:
+                raise RuntimeError(f"[QAIRTAccuracyDebugger] golden net-run failed: {ret}")
+
+        def load_dir(d):
+            out = {}
+            for p in Path(d).rglob('*.raw'):
+                out[p.stem] = np.fromfile(p, dtype=np.float32)
+            return out
+        golden = load_dir(str(golden_dir))
+        if not golden:
+            raise RuntimeError(f"[QAIRTAccuracyDebugger] golden dir empty: {golden_dir}")
+        print(f"[QAIRTAccuracyDebugger] golden layers: {len(golden)}")
+
+        # 1) 反射全部候选层；only_tensor_prefix 仅用于局部验证/测试时截取层
+        layers = self.extract_layer_candidates(target_dlc_path)
+        if only_tensor_prefix:
+            layers = [c for c in layers if c['tensor'].startswith(only_tensor_prefix)]
+        layers = [c for c in layers if self._sanitize_name(c['tensor']) in golden]
+        print(f"[QAIRTAccuracyDebugger] candidate layers to analyze: {len(layers)}")
+
+        # 2) 自动导出 v2 encodings（overrides 素材）
+        v2_encodings_path = self.extract_dlc_encoding(target_dlc_path)
+
+        work_root = dbg.working_dir / 'layerwise'
+        work_root.mkdir(parents=True, exist_ok=True)
+        overrides_dir = work_root / 'overrides'
+        dlc_dir = work_root / 'dlc'
+        bin_dir = work_root / 'bin'
+        out_dir = work_root / 'out'
+        for d in (overrides_dir, dlc_dir, bin_dir, out_dir):
+            d.mkdir(exist_ok=True)
+
+        # 3) 每层 tag 与 override json
+        tags = []
+        for i, layer in enumerate(layers):
+            tag = f"{i+1:03d}_{self._sanitize_name(layer['tensor'])}"
+            tags.append(tag)
+            self.make_layer_override_json(layer['io_tensors'], v2_encodings_path,
+                                         str(overrides_dir / f'{tag}.json'))
+
+        # 4) 阶段A：converter（并行、静默子进程输出，tqdm 进度条）
+        MultThreadExetutor.set_max_workers(32)
+        conv_items = [
+            ((str(self.onnx_path), str(dlc_dir / f'{tag}.dlc'),
+              str(overrides_dir / f'{tag}.json')), {'print_output': False})
+            for tag in tags
+        ]
+        conv_codes = self._run_batch_progress(self.run_qairt_converter, conv_items,
+                                             'single-full[1/3 converter]')
+        ok_conv = [i for i, c in enumerate(conv_codes) if c == 0]
+        if len(ok_conv) != len(tags):
+            print(f"[QAIRTAccuracyDebugger] converter failures: "
+                  f"{[layers[i]['tensor'] for i in range(len(tags)) if conv_codes[i] != 0]}")
+
+        # 5) 阶段B：context binary（并行、静默，tqdm 进度条）
+        MultThreadExetutor.set_max_workers(32)
+        ctx_items = [
+            ((str(dlc_dir / f'{tags[i]}.dlc'), str(bin_dir / f'{tags[i]}.bin'), str(bin_dir)),
+             {'output_tensors': layers[i]['tensor'], 'graph_name': None, 'print_output': False})
+            for i in ok_conv
+        ]
+        ctx_codes = self._run_batch_progress(self.run_qairt_context_binary_generator, ctx_items,
+                                            'single-full[2/3 ctx]')
+        ok_ctx = [i for j, i in enumerate(ok_conv) if ctx_codes[j] == 0]
+        if len(ok_ctx) != len(ok_conv):
+            print(f"[QAIRTAccuracyDebugger] context-binary failures: "
+                  f"{[layers[i]['tensor'] for i in ok_conv if ctx_codes[ok_conv.index(i)] != 0]}")
+
+        # 6) 阶段C：net-run retrieve_context（并行、静默，tqdm 进度条）。
+        #    每层输出目录用层序号 layerwise/out/<layer_num>/Result_0/*.raw。
+        MultThreadExetutor.set_max_workers(16)
+        run_items = []
+        for i in ok_ctx:
+            tag = tags[i]
+            layer_num = f"{i+1:03d}"
+            (out_dir / layer_num).mkdir(parents=True, exist_ok=True)
+            run_items.append(
+                ((str(bin_dir / f'{tag}.bin'), dbg.backend_lib_target, input_list,
+                  str(out_dir / layer_num)), {'print_output': False}))
+        run_codes = self._run_batch_progress(self.run_qnn_net_run_bin, run_items,
+                                            'single-full[3/3 net-run]')
+        ok_run = [i for j, i in enumerate(ok_ctx) if run_codes[j] == 0]
+        if len(ok_run) != len(ok_ctx):
+            print(f"[QAIRTAccuracyDebugger] net-run failures: "
+                  f"{[layers[i]['tensor'] for i in ok_ctx if run_codes[ok_ctx.index(i)] != 0]}")
+
+        # 7) 收集比较（单层语义：该层输出 vs golden）
+        names, cos, euc, mse = [], [], [], []
+        for i in ok_run:
+            safe = self._sanitize_name(layers[i]['tensor'])
+            layer_num = f"{i+1:03d}"
+            raw_path = out_dir / layer_num / 'Result_0' / f'{safe}.raw'
+            if not raw_path.exists():
+                print(f"[QAIRTAccuracyDebugger] output missing: {raw_path} (skip)")
+                continue
+            targ = np.fromfile(str(raw_path), dtype=np.float32)
+            gold = golden[safe]
+            if gold.size != targ.size:
+                print(f"[QAIRTAccuracyDebugger] size mismatch {gold.size} vs {targ.size} (skip)")
+                continue
+            names.append(safe)
+            cos.append(float(np.dot(gold, targ) / (np.linalg.norm(gold) * np.linalg.norm(targ) + 1e-12)))
+            euc.append(float(np.linalg.norm(gold - targ)))
+            mse.append(float(np.mean((gold - targ) ** 2)))
+
+        if not names:
+            raise RuntimeError("[QAIRTAccuracyDebugger] no layer succeeded")
+        print(f"[QAIRTAccuracyDebugger] single-full(layerwise) succeeded: "
+              f"{len(names)}/{len(layers)}")
+        return names, np.asarray(cos), np.asarray(euc), np.asarray(mse)
+
+
+if __name__ == '__main__':
+    raise SystemExit(_main())
