@@ -137,25 +137,70 @@ class QAIRTScript:
 
 
 class QnnHybridQuantGen:
-    def __init__(self, custom_hybrid:list[list[str]], weights_bitwidth:int=8, act_bitwidth:int=16, bias_bitwidth:int=8, float_bitwidth:int|None=None):
+    # v1.0.0 quantization_overrides 对称性取值（字段 is_sym: bool）：
+    # v1 schema 每项只有 {name, bw, dtype(int/float), is_sym}，只能表达 signed
+    # 的对称/非对称；'unsignedsymmetric'（unsigned）无法在 v1 overrides 中表达，
+    # 需要走 AIMET/QDQ 或 v2.0.0（output_dtype=uint8）路线，这里直接拒绝。
+    SUPPORTED_SCHEMAS = ('asymmetric', 'symmetric')
+
+    def __init__(self, custom_hybrid:list[list[str]], bitwidth:str='w8a16',
+                 bias_bitwidth:int|None=None, float_bitwidth:int|None=None,
+                 param_quant_schema:str|None=None, act_quant_schema:str|None=None):
+        """
+        生成 QAIRT v1.0.0 混合量化 overrides（只标记位宽/类型，scale 由后续
+        qairt-quantizer 校准计算）。未指定的可选参数不写入 encoding，避免污染：
+        - 对称性未指定(schema=None)：encoding 项不写 is_sym 字段；
+        - 整数模式 bias_bitwidth 未指定(None)：不把 bias 写入 param_encodings，
+          交由全局量化(默认 --bias_bitwidth 8)处理。
+
+        Args:
+            custom_hybrid: [输入张量, 输出张量] 对列表（节点名亦可，取输出张量）。
+            bitwidth: 量化位宽字符串 'w<W>a<A>'，默认 'w8a16'。整数模式由它决定
+                区域内权重(W)/激活(A) 位宽（可选 'w4a8'/'w4a16'/'w8a8'/'w8a16'/
+                'w16a16'），内部 parse_bitwidth 解析并做范围校验。
+            bias_bitwidth: 整数模式下区域内偏置位宽，可选 8/32。默认 None 表示不
+                override 区域内 bias（不写入 encoding）。
+            float_bitwidth: 若设置(16/32)，区域保持浮点(FP16/FP32)，dtype 用
+                'float'，忽略 bitwidth/bias_bitwidth/对称性；区域内 bias 随子图
+                保持浮点一并写入。
+            param_quant_schema: 区域内权重对称性，'asymmetric'/'symmetric'。
+                None(默认) 表示不写 is_sym；仅在整数模式生效。
+            act_quant_schema: 区域内激活对称性，同上。
+        """
         if float_bitwidth is not None:
             if float_bitwidth not in (16, 32):
                 raise ValueError('float_bitwidth must be 16 or 32')
             dtype = 'float'
             weights_bitwidth = float_bitwidth
             act_bitwidth = float_bitwidth
+            # float 模式：子图整体浮点，bias 随之写入 float；对称性无意义
             bias_bitwidth = float_bitwidth
+            param_quant_schema = None
+            act_quant_schema = None
         else:
             dtype = 'int'
+            # bitwidth 字符串 'w<W>a<A>' 在内部解析（复用 utils.parse_bitwidth）。
+            try:
+                weights_bitwidth, act_bitwidth = parse_bitwidth(bitwidth)
+            except AttributeError:
+                raise ValueError(
+                    f"bitwidth must be in 'w<W>a<A>' format like 'w8a16', got {bitwidth!r}") from None
             if weights_bitwidth not in (4, 8, 16):
                 raise ValueError('weights_bitwidth must be 4, 8 or 16')
             if act_bitwidth not in (8, 16):
                 raise ValueError('act_bitwidth must be 8 or 16')
-            if bias_bitwidth not in (8, 32):
-                raise ValueError('bias_bitwidth must be 8 or 32')
+            if bias_bitwidth is not None and bias_bitwidth not in (8, 32):
+                raise ValueError('bias_bitwidth must be 8 or 32 (or None to not override bias)')
 
         if not isinstance(custom_hybrid, list) or not custom_hybrid:
             raise ValueError('custom_hybrid must be a non-empty list of [input_tensor, output_tensor] pairs')
+
+        if param_quant_schema is not None and param_quant_schema not in self.SUPPORTED_SCHEMAS:
+            raise ValueError(f"param_quant_schema must be one of {self.SUPPORTED_SCHEMAS} or None, got {param_quant_schema!r}; "
+                             "'unsignedsymmetric' is not representable in v1.0.0 overrides (use AIMET/QDQ path)")
+        if act_quant_schema is not None and act_quant_schema not in self.SUPPORTED_SCHEMAS:
+            raise ValueError(f"act_quant_schema must be one of {self.SUPPORTED_SCHEMAS} or None, got {act_quant_schema!r}; "
+                             "'unsignedsymmetric' is not representable in v1.0.0 overrides (use AIMET/QDQ path)")
 
         self.hybrid_quantization = {
             "custom_hybrid": custom_hybrid,
@@ -163,15 +208,24 @@ class QnnHybridQuantGen:
             "weights_bitwidth": weights_bitwidth,
             "act_bitwidth": act_bitwidth,
             "bias_bitwidth": bias_bitwidth,
+            "param_quant_schema": param_quant_schema,
+            "act_quant_schema": act_quant_schema,
         }
-        print(f"[QnnHybridQuantGen] Hybrid quantization is set: {len(custom_hybrid)} subgraph(s) dtype={dtype} "
-              f"w{weights_bitwidth}a{act_bitwidth}b{bias_bitwidth}, rest quantized by global settings")
+        print(f"[QnnHybridQuantGen] Hybrid quantization is set: {self.hybrid_quantization}")
 
     def generate_hybrid_quantization_overrides(self, tmp_onnx_path:str) -> str|None:
         """
-        根据子图的输入/输出张量生成 QAIRT 混合量化的 quantization_overrides JSON。
+        根据子图的输入/输出张量生成 QAIRT v1.0.0 混合量化的 quantization_overrides JSON。
         每个 [输入张量, 输出张量] 对之间的所有节点按 do_hybrid_quantization 指定的
         精度标记，转换器会在子图边界自动插入 Convert 节点。
+
+        v1.0.0 schema（QAIRT converter 按 'version' 分支解析）：
+            activation_encodings / param_encodings 为 list，每项含
+            "name" / "bw"(位宽) / "dtype"("int"|"float")，仅当显式指定对称性时
+            才附加 "is_sym"(bool)，未指定则省略该键以免污染。
+            QAIRT 校验只强制 "bw"，允许缺 scale/offset（scale 留待 qairt-quantizer
+            用校准数据计算），故只指定位宽的混合量化语义成立。
+            整数模式未指定 bias_bitwidth 时，区域内 bias 不写入（交由全局量化）。
 
         Returns:
             str | None: overrides JSON 文件路径；失败返回 None。
@@ -200,11 +254,23 @@ class QnnHybridQuantGen:
         dtype = hq["dtype"]
         act_bw = hq["act_bitwidth"]
         weight_bw = hq["weights_bitwidth"]
-        bias_bw = hq["bias_bitwidth"]
+        bias_bw = hq["bias_bitwidth"]          # float 模式=float bw；int 模式 None(不写) 或 8/32
+        act_schema = hq["act_quant_schema"]    # None 或 'asymmetric'/'symmetric'（int 模式）
+        param_schema = hq["param_quant_schema"]
+
+        # v1.0.0 encoding 项 {name, bw, dtype}；仅当对称性显式指定(int 模式 schema
+        # 非 None)才附加 is_sym；float 模式无对称性概念，不写。
+        def make_encoding(name:str, bw:int, schema:str|None) -> dict:
+            enc = {"name": name, "bw": bw, "dtype": dtype}
+            if dtype == 'int' and schema is not None:
+                enc["is_sym"] = (schema == 'symmetric')
+            return enc
 
         initializer_names = {init.name for init in model.graph.initializer}
-        activation_encodings: dict[str, list[dict]] = {}
-        param_encodings: dict[str, list[dict]] = {}
+        activation_encodings: list[dict] = []
+        param_encodings: list[dict] = []
+        seen_activations: set[str] = set()
+        seen_params: set[str] = set()
 
         # 识别 bias: 作为 Conv/ConvTranspose/Gemm 第3个输入(index 2)的 initializer
         bias_names = set()
@@ -215,17 +281,24 @@ class QnnHybridQuantGen:
         for idx in middle:
             n = nodes[idx]
             for out in n.output:
-                if out and out not in activation_encodings:
-                    activation_encodings[out] = [{"bitwidth": act_bw, "dtype": dtype}]
+                if out and out not in seen_activations:
+                    seen_activations.add(out)
+                    activation_encodings.append(make_encoding(out, act_bw, act_schema))
             for inp in n.input:
-                if inp in initializer_names and inp not in param_encodings:
-                    param_bw = bias_bw if inp in bias_names else weight_bw
-                    param_encodings[inp] = [{"bitwidth": param_bw, "dtype": dtype}]
+                if inp in initializer_names and inp not in seen_params:
+                    is_bias = inp in bias_names
+                    # int 模式未指定 bias_bitwidth(None) 时不 override bias，
+                    # 由全局量化处理（避免默认位宽污染 encoding）。
+                    if is_bias and dtype == 'int' and bias_bw is None:
+                        continue
+                    seen_params.add(inp)
+                    param_bw = bias_bw if is_bias else weight_bw
+                    param_encodings.append(make_encoding(inp, param_bw, param_schema))
 
         overrides = {
             "activation_encodings": activation_encodings,
             "param_encodings": param_encodings,
-            "version": "0.5.0",
+            "version": "1.0.0",
         }
 
         overrides_path = Path(tmp_onnx_path).parent / "quantization_overrides.json"
@@ -394,11 +467,11 @@ class QnnAimetConnector:
                                                            input_network_path=str(tmp_onnx_path),
                                                            output_dlc_name=f"{tmp_onnx_path.stem}_golden")
 
-            converter.accuracy_analyzer.set_model_info(onnx_model_info)
+            converter.accuracy_analyzer.set_model_info(onnx_model_info, set_input_order)
             return_code = converter.accuracy_analyzer.accuracy_analysis(
                 golden_dlc_path=golden_dlc_path,
                 target_dlc_path=dlc_model_path,
-                mean_rgb=mean_rgb, std_rgb=std_rgb, set_input_order=set_input_order,
+                mean_rgb=mean_rgb, std_rgb=std_rgb,
             )
 
             if return_code == 0:
@@ -499,16 +572,15 @@ class OnnxToQNN:
         tmp_onnx_path = self.tmp_work_dir / sanitize_model_name
         self.tmp_onnx_path = tmp_onnx_path.with_suffix('.onnx')
 
-        self.quantize_args:dict[str, str|int|bool] = {
+        self.quantize_args:dict[str, str|int|bool|None] = {
             'param_quant_method': 'min-max',
             'act_quant_method': 'min-max',
             'bitwidth': 'w8a8',
-            'bias_bitwidth': 8,
-            'param_quant_schema': 'asymmetric',
-            'act_quant_schema': 'asymmetric',
+            'bias_bitwidth': None,
+            'param_quant_schema': None,
+            'act_quant_schema': None,
             'use_cle_algorithm': False
         }
-        self.convert_layout_args:str = ""
 
         self.custom_calibration_data_path = None
 
@@ -517,11 +589,12 @@ class OnnxToQNN:
         self.hybrid_quantizer = None
         self.aimet_connector = None
 
-    def set_quantization_method(self, param_quant_method:str='min-max', act_quant_method:str='min-max', bitwidth:str='w8a8', bias_bitwidth:int=8,
-                                param_quant_schema:str='asymmetric', act_quant_schema:str='asymmetric', use_cle_algorithm:bool=False):
+    def set_quantization_method(self, param_quant_method:str='min-max', act_quant_method:str='min-max', bitwidth:str='w8a8',
+                                bias_bitwidth:int|None=None, param_quant_schema:str|None=None, act_quant_schema:str|None=None,
+                                use_cle_algorithm:bool=False):
         """
         Configure quantization parameters for the model.
-        
+
         Args:
             param_quant_method (str): Quantization method for model parameters (weights).
                 - Available options: 'min-max', 'sqnr', 'percentile', 'mse', 'entropy'.
@@ -536,17 +609,18 @@ class OnnxToQNN:
                 - Available options: 'w4a8', 'w4a16', 'w8a8', 'w8a16', 'w16a16'.
                 - Default: 'w8a8'.
 
-            bias_bitwidth (int): Bitwidth for bias quantization.
+            bias_bitwidth (int | None): Bitwidth for bias quantization.
                 - Available options: 8, 32.
-                - Default: 8.
+                - Default: None (qairt-quantizer default).
 
-            param_quant_schema (str): Parameter(weight) quantization schema
+            param_quant_schema (str | None): Parameter(weight) quantization schema.
                 - Available options: 'asymmetric', 'symmetric', 'unsignedsymmetric'.
-                - Default: 'asymmetric'.
+                - Default: None (qairt-quantizer default).
 
-            act_quant_schema (str): Activation quantization schema
+            act_quant_schema (str | None): Activation quantization schema.
                 - Available options: 'asymmetric', 'symmetric', 'unsignedsymmetric'.
-                - Default: 'asymmetric'.
+                - Default: None (qairt-quantizer default).
+                
             use_cle_algorithm (bool): Whether to use the Cross Layer Equalization algorithm for quantization.
         """
 
@@ -559,14 +633,14 @@ class OnnxToQNN:
         if bitwidth not in ['w4a8', 'w4a16', 'w8a8', 'w8a16', 'w16a16']:
             raise ValueError('bitwidth must be one of w4a8, w4a16, w8a8, w8a16, w16a16')
         
-        if bias_bitwidth not in [8, 32]:
-            raise ValueError('bias_bitwidth must be 8 or 32')
+        if bias_bitwidth is not None and bias_bitwidth not in [8, 32]:
+            raise ValueError('bias_bitwidth must be 8 or 32 (or None to not pass --bias_bitwidth)')
 
-        if param_quant_schema not in ['asymmetric', 'symmetric', 'unsignedsymmetric']:
-            raise ValueError('param_quant_schema must be one of asymmetric, symmetric, unsignedsymmetric')
+        if param_quant_schema is not None and param_quant_schema not in ['asymmetric', 'symmetric', 'unsignedsymmetric']:
+            raise ValueError('param_quant_schema must be one of asymmetric, symmetric, unsignedsymmetric or None')
         
-        if act_quant_schema not in ['asymmetric', 'symmetric', 'unsignedsymmetric']:
-            raise ValueError('act_quant_schema must be one of asymmetric, symmetric, unsignedsymmetric')
+        if act_quant_schema is not None and act_quant_schema not in ['asymmetric', 'symmetric', 'unsignedsymmetric']:
+            raise ValueError('act_quant_schema must be one of asymmetric, symmetric, unsignedsymmetric or None')
         
         self.quantize_args['param_quant_method'] = param_quant_method
         self.quantize_args['act_quant_method'] = act_quant_method
@@ -605,7 +679,9 @@ class OnnxToQNN:
 
         print(f"[OnnxToQNN] Custom calibration dataset path set to: {self.custom_calibration_data_path}")
 
-    def do_hybrid_quantization(self, custom_hybrid:list[list[str, str]], bitwidth:str="w8a16", bias_bitwidth:int=8, float_bitwidth:int|None=None):
+    def do_hybrid_quantization(self, custom_hybrid:list[list[str, str]], bitwidth:str='w8a16',
+                               bias_bitwidth:int|None=None, float_bitwidth:int|None=None,
+                               param_quant_schema:str|None=None, act_quant_schema:str|None=None):
         """
         设置混合量化(与 onnx_to_rknn.py 的 do_hybrid_quantization 一致)：
         通过子图的输入张量与输出张量指定区域，自动识别两者之间的所有节点，
@@ -613,10 +689,15 @@ class OnnxToQNN:
         的全局设置(默认 w8a8)量化为 INT8。
 
         两种模式(二选一)：
-        1. 整数混合量化(默认)：weights_bitwidth / act_bitwidth / bias_bitwidth
-           指定区域内权重 / 激活 / 偏置的整数位宽。
-           例如全局 w8a8、区域 w8a16：weights_bitwidth=8, act_bitwidth=16。
+        1. 整数混合量化(默认)：bitwidth 指定区域内权重/激活位宽。
+           例如全局 w8a8、区域 w8a16：bitwidth='w8a16'。
         2. 浮点保留：float_bitwidth 指定区域保持浮点精度，16=FP16，32=FP32。
+
+        说明：生成的 overrides 使用 QAIRT v1.0.0 schema（activation_encodings /
+        param_encodings 为 list + name，位宽键 bw），只标记用户显式指定的内容：
+        schema 未指定时不写 is_sym；整数模式 bias_bitwidth 未指定时不把 bias
+        写入 overrides（交由全局量化），避免默认值污染 encoding。真实 scale 由
+        后续 qairt-quantizer 校准计算。
 
         Args:
             custom_hybrid (list[list[str]]): 每个内层列表为 [输入张量名, 输出张量名]，
@@ -629,15 +710,21 @@ class OnnxToQNN:
                 - Available options: 'w4a8', 'w4a16', 'w8a8', 'w8a16', 'w16a16'.
                 - Default: 'w8a16'.
 
-            bias_bitwidth (int): 整数模式下区域内的偏置位宽，可选 8/32。默认 8。
+            bias_bitwidth (int | None): 整数模式下区域内的偏置位宽，可选 8/32。
+                None(默认) 表示不 override 区域内 bias（不写入 encoding，交由
+                全局量化处理）。仅在整数模式生效。
             float_bitwidth (int | None): 若设置(16/32)，区域保持浮点(FP16/FP32)，
-                此时忽略三个整数位宽参数。默认 None 表示使用整数混合量化。
+                忽略 bitwidth/bias_bitwidth/对称性。默认 None 表示整数混合量化。
+            param_quant_schema (str | None): 区域内权重对称性，'asymmetric'/
+                'symmetric'。None(默认) 表示不写 is_sym 字段。
+                v1.0.0 overrides 仅支持这两者（unsignedsymmetric 需走 AIMET/QDQ 路径）。
+                仅在整数模式生效。
+            act_quant_schema (str | None): 区域内激活对称性，'asymmetric'/'symmetric'。
+                None(默认) 表示不写 is_sym 字段。同上。
         """
 
-        weights_bitwidth, act_bitwidth = parse_bitwidth(bitwidth)
-        self.hybrid_quantizer = QnnHybridQuantGen(custom_hybrid, weights_bitwidth, act_bitwidth, bias_bitwidth, float_bitwidth)
-
-        print(f"[OnnxToQNN] Hybrid quantization set to: {custom_hybrid}, bitwidth={bitwidth}, bias_bitwidth={bias_bitwidth}, float_bitwidth={float_bitwidth}")
+        self.hybrid_quantizer = QnnHybridQuantGen(custom_hybrid, bitwidth, bias_bitwidth,
+                                                  float_bitwidth, param_quant_schema, act_quant_schema)
 
     def set_use_aimet(self, quant_method:str='tf_enhanced', bitwidth:str="w8a8", param_quant_schema:str='symmetric', act_quant_schema:str='asymmetric',
                       use_cle_algorithm:bool=False):
@@ -782,12 +869,12 @@ class OnnxToQNN:
             quantized_dlc_model_path = Path(quantized_dlc_model_path)
 
             # QAIRTAccuracyDebugger：直接用两个 DLC（FP32 golden + 量化 target）对比
-            self.accuracy_analyzer.set_model_info(onnx_model_info, self.convert_layout_args)
+            self.accuracy_analyzer.set_model_info(onnx_model_info, set_input_order)
             
             return_code = self.accuracy_analyzer.accuracy_analysis(
                 golden_dlc_path=golden_dlc_path,
                 target_dlc_path=quantized_dlc_model_path,
-                mean_rgb=mean_rgb, std_rgb=std_rgb, set_input_order=set_input_order,
+                mean_rgb=mean_rgb, std_rgb=std_rgb,
             )
 
             if return_code == 0:
@@ -932,7 +1019,6 @@ class OnnxToQNN:
                 
             layout_args += f' --desired_input_color_encoding "{input_name}" rgb rgb'
 
-        self.convert_layout_args = layout_args
         
         # quantization
         quant_args = ""
@@ -1082,11 +1168,15 @@ class OnnxToQNN:
         weights_bitwidth, act_bitwidth = parse_bitwidth(self.quantize_args['bitwidth'])
 
         quantize_args = f'--weights_bitwidth {weights_bitwidth} --act_bitwidth {act_bitwidth}'
-        quantize_args += f' --bias_bitwidth {self.quantize_args["bias_bitwidth"]}'
         quantize_args += f' --param_quantizer_calibration {self.quantize_args["param_quant_method"]}'
         quantize_args += f' --act_quantizer_calibration {self.quantize_args["act_quant_method"]}'
-        quantize_args += f" --param_quantizer_schema {self.quantize_args['param_quant_schema']}"
-        quantize_args += f" --act_quantizer_schema {self.quantize_args['act_quant_schema']}"
+        # 以下参数仅在显式指定(非 None)时追加，未指定使用 qairt-quantizer 默认值
+        if self.quantize_args['bias_bitwidth'] is not None:
+            quantize_args += f' --bias_bitwidth {self.quantize_args["bias_bitwidth"]}'
+        if self.quantize_args['param_quant_schema'] is not None:
+            quantize_args += f" --param_quantizer_schema {self.quantize_args['param_quant_schema']}"
+        if self.quantize_args['act_quant_schema'] is not None:
+            quantize_args += f" --act_quantizer_schema {self.quantize_args['act_quant_schema']}"
         quantize_args += f' --use_per_channel_quantization'
         if self.quantize_args["use_cle_algorithm"]:
             quantize_args += " --use_cle_algorithm"
@@ -1199,12 +1289,17 @@ if __name__ == "__main__":
     # 可选: 混合量化 —— 与 onnx_to_rknn.py 的 do_hybrid_quantization 一致,
     # 通过子图输入/输出张量指定区域(自动识别两者之间的节点), 可指定多个子图,
     # 子图之外仍按全局 w8a8 量化。张量名可以是节点名(自动取该节点输出张量)。
+    # 生成 QAIRT v1.0.0 quantization_overrides (只标位宽/对称性, scale 由校准算)。
     # 1) 整数混合量化: 区域 w8a16 (权重8bit, 激活16bit), 全局默认 w8a8
-    # onnx_to_qnn.do_hybrid_quantization([['/model.0/conv/Conv', '/model.10/conv/Conv']], weights_bitwidth=8, act_bitwidth=16)
-    # 2) 浮点保留: 区域保持 FP16
+    # onnx_to_qnn.do_hybrid_quantization([['/model.0/conv/Conv', '/model.10/conv/Conv']], bitwidth='w8a16')
+    # 2) 整数混合量化 + 对称性: 区域内权重 symmetric / 激活 asymmetric (v1 overrides 仅支持这两者)
+    # onnx_to_qnn.do_hybrid_quantization([['/model.0/conv/Conv', '/model.10/conv/Conv']], bitwidth='w8a16',
+    #                                     param_quant_schema='symmetric', act_quant_schema='asymmetric')
+    # 3) 浮点保留: 区域保持 FP16
     # onnx_to_qnn.do_hybrid_quantization([['/model.0/conv/Conv', '/model.10/conv/Conv']], float_bitwidth=16)
-    # 3) 多个子图
-    # onnx_to_qnn.do_hybrid_quantization([['in1', 'out1'], ['in2', 'out2']], float_bitwidth=16)
+    # 4) 多个子图
+    # onnx_to_qnn.do_hybrid_quantization([['in1', 'out1'], ['in2', 'out2']], bitwidth='w16a16',
+    #                                     param_quant_schema='symmetric', act_quant_schema='asymmetric')
 
     onnx_to_qnn.convert(mean_rgb, std_rgb)
 
