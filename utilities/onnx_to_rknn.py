@@ -261,8 +261,10 @@ if __name__ == '__main__':
 
     # MODEL_PATH = 'avtrack_ModelDeploy/models_convert/onnx/avtrack_[[1,3,112,112][1,3,224,224]].onnx'
     # RKNN_MODEL = 'avtrack_ModelDeploy/models_convert/rknn/avtrack_i8[[1,112,112,3][1,224,224,3]].rknn'
-    MODEL_PATH = 'retinaface_mobile_ModelDeploy/models_convert/onnx/RetinaFace_mobile_[1,3,320,320].onnx'
-    RKNN_MODEL = 'retinaface_mobile_ModelDeploy/models_convert/rknn/RetinaFace_mobile_i8[1,320,320,3].rknn'
+    # MODEL_PATH = 'retinaface_mobile_ModelDeploy/models_convert/onnx/RetinaFace_mobile_[1,3,320,320].onnx'
+    # RKNN_MODEL = 'retinaface_mobile_ModelDeploy/models_convert/rknn/RetinaFace_mobile_i8[1,320,320,3].rknn'
+    MODEL_PATH = 'unisal_ModelDeploy/models_convert/onnx/unisal_[[1,3,160,320][1,256,5,10]].onnx'
+    RKNN_MODEL = 'unisal_ModelDeploy/models_convert/rknn/unisal_i8[[1,3,160,320][1,256,5,10]].rknn'
     DATASET_PATH = str(parent_dir / 'datasets/datasets.txt')
 
 
@@ -278,4 +280,4 @@ if __name__ == '__main__':
     # debugger.plot_accuracy_analysis()
 
     # 带路径追踪的精度分析（Netron 风格网络图，多输入 -> 多输出 排列组合路径）
-    debugger.draw_network_analysis(show=True)
+    debugger.draw_network_analysis(show=False)

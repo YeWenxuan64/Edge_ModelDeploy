@@ -178,7 +178,10 @@ def build_onnx_tensor_graph(model_path, *, sanitize: bool = False) -> dict:
     g = model.graph
 
     def _norm(name: str) -> str:
-        return re.sub(r'[/.]+', '_', name) if sanitize else name
+        # 与 qnn-net-run 的 raw 文件名清洗一致（_sanitize_name：任意非字母数字/
+        # 下划线字符 -> '_'）。TF 转的 ONNX 用 'name:0' 作输出索引，qnn 会清洗
+        # 成 'name_0'，这里必须同样处理 ':'，否则张量匹配失败、层图连不成边。
+        return re.sub(r'[^A-Za-z0-9_]', '_', name) if sanitize else name
 
     tensors: dict[str, str] = {}
     for t in list(g.input) + list(g.output):
@@ -2270,9 +2273,9 @@ class QnnTruncatedAccuracyAnalysis:
 
 class AccuracyGraph:
     """
-    基于 pyvis 的 RKNN 精度分析网络图（Netron 风格）。
+    精度分析网络图（Netron 风格）。
 
-    将 RKNN 快照层以"方框节点 + 箭头连线"呈现为从左到右分层的 DAG，
+    将 RKNN/QNN 快照层以"方框节点 + 箭头连线"呈现为从左到右分层的 DAG，
     节点填充色按累积精度 entire_cos 着色（红=差, 绿=良），悬停显示
     单层精度与欧氏距离等详细信息。
 
@@ -2399,15 +2402,24 @@ class AccuracyGraph:
         return '#333333' if lum > 140 else '#fff'
 
     def _layers(self) -> dict[str, int]:
-        """计算每层的拓扑深度（从各源点出发的最长路径），用作纵向分层坐标。
+        """dagre.js `rank()` 的 network-simplex 排名：longestPath + networkSimplex。
 
-        采用 Kahn 拓扑排序，对边方向不依赖快照顺序（node_order），
-        即便存在逆序边或环也能给出确定结果（环上节点兜底为深度 0）。
+        1) longestPath：`rank(v)=max_dist - dist_to_sink(v)`，会把汇入同一个
+           消费者（如 Concat）的所有分支输出对齐到消费者的前一层；
+        2) networkSimplex（见 _network_simplex）：在最长路径初始排名上迭代
+           换边改进，权衡"merge 输入深度 / 最终输出深度"，使 FPN 级联的多个
+           SSH head 按深度对角错开，而非全部挤到同一层；
+        3) 规范化：assignRankMinMax（平移使最小 rank=0）+ removeEmptyRanks
+           （合并空层，使 rank 从 0 连续递增）。
+
+        实现采用迭代逆拓扑（非递归，避免层深过深），环上节点兜底为 0。
         """
         from collections import deque
 
         layer_row = self.layer_row
-        depth: dict[str, int] = {}
+        children = self.children
+
+        # ---- Kahn 拓扑（源 -> 汇）----
         in_degree: dict[str, int] = {n: 0 for n in layer_row}
         for n in layer_row:
             for p in self.parents.get(n, []):
@@ -2415,23 +2427,277 @@ class AccuracyGraph:
                     in_degree[n] += 1
 
         queue = deque(n for n in layer_row if in_degree[n] == 0)
-        for n in queue:
-            depth[n] = 0
-
+        topo: list[str] = []
         while queue:
             n = queue.popleft()
-            for c in self.children.get(n, []):
-                if c in layer_row and c not in depth:
+            topo.append(n)
+            for c in children.get(n, []):
+                if c in layer_row:
                     in_degree[c] -= 1
                     if in_degree[c] == 0:
-                        depth[c] = depth[n] + 1
                         queue.append(c)
 
-        # 环上的节点不会被拓扑排序访问到，兜底置为 0
-        for n in layer_row:
-            if n not in depth:
-                depth[n] = 0
-        return depth
+        # ---- dist_to_sink（逆拓扑：先算汇）→ longestPath rank ----
+        dist: dict[str, int] = {}
+        for n in reversed(topo):
+            ch = [c for c in children.get(n, []) if c in layer_row]
+            if not ch:
+                dist[n] = 0
+            else:
+                dist[n] = 1 + max(dist[c] for c in ch)
+        for n in layer_row:  # 环上节点兜底 0
+            if n not in dist:
+                dist[n] = 0
+        max_dist = max(dist.values(), default=0)
+        rank = {n: max_dist - dist[n] for n in layer_row}
+
+        # ---- networkSimplex：在最长路径初始排名上迭代改进 ----
+        rank = self._network_simplex(rank)
+
+        # ---- assignRankMinMax：平移使最小 rank = 0（dagre）----
+        min_rank = min(rank.values(), default=0)
+        rank = {n: r - min_rank for n, r in rank.items()}
+
+        # ---- removeEmptyRanks：合并空 rank，使 rank 从 0 连续（dagre）----
+        present_ranks = sorted(set(rank.values()))
+        compact = {r: i for i, r in enumerate(present_ranks)}
+        return {n: compact[r] for n, r in rank.items()}
+
+    def _network_simplex(self, rank: dict[str, int]) -> dict[str, int]:
+        """dagre.js `rank()` 的 networkSimplex：在最长路径初始排名上迭代改进。
+
+        在 `feasibleTree`（紧树）基础上增加：
+          - initLowLimValues：给树节点赋 low/lim/parent（DFS 区间，判断 ancestor）；
+          - initCutValues：计算每条树边的割值（cutvalue）；
+          - 循环 leaveEdge（cutvalue<0 的树边）→ enterEdge（跨割的最小平 slack
+            非树边）→ exchangeEdges（换边并更新 rank），直到没有可换的负割边。
+
+        相比 tight-tree，它会同时权衡"merge 输入深度 / 最终输出深度"，从而让 FPN
+        级联的三个 SSH head 按深度对角错开，而不再是全挤到同一层。
+
+        本图所有边 weight=1、minlen=1（简单图），故 simplify 为恒等。
+        返回更新后的 rank dict（可能为负，调用方再 assignRankMinMax / removeEmptyRanks）。
+        """
+        from collections import defaultdict
+
+        layer_row = self.layer_row
+        children = self.children
+        node_set = set(layer_row)
+        nodes = list(layer_row)
+
+        # 有向边 (v=父, w=子)，minlen=1, weight=1
+        edge_list = []
+        succs: dict[str, list[str]] = defaultdict(list)
+        preds: dict[str, list[str]] = defaultdict(list)
+        for p in layer_row:
+            for c in children.get(p, []):
+                if c in layer_row:
+                    edge_list.append((p, c))
+                    succs[p].append(c)
+                    preds[c].append(p)
+        edge_set = set(edge_list)
+
+        def slack(e):
+            v, w = e
+            return rank[w] - rank[v] - 1
+
+        # ---- feasibleTree：返回树边集合，并调整 rank ----
+        tree_edges: set[frozenset] = set()
+        in_tree: dict[str, bool] = {}
+        start = next(iter(nodes))
+        in_tree[start] = True
+        while True:
+            changed = True
+            while changed:
+                changed = False
+                for (v, w) in edge_list:
+                    if (v in in_tree) != (w in in_tree) and slack((v, w)) == 0:
+                        nm = w if v in in_tree else v
+                        if nm not in in_tree:
+                            in_tree[nm] = True
+                            tree_edges.add(frozenset((v, w)))
+                            changed = True
+            if len(in_tree) >= len(node_set):
+                break
+            min_key = float('inf')
+            edge = None
+            for (v, w) in edge_list:
+                if (v in in_tree) != (w in in_tree):
+                    key = slack((v, w))
+                    if key < min_key:
+                        min_key = key
+                        edge = (v, w)
+            if edge is None:
+                break
+            v, w = edge
+            delta = slack((v, w)) if v in in_tree else -slack((v, w))
+            for n in list(in_tree):
+                rank[n] += delta
+
+        # ---- initLowLimValues：DFS 给树节点赋 low/lim/parent ----
+        def build_tree_adj():
+            adj: dict[str, set[str]] = defaultdict(set)
+            for e in tree_edges:
+                a, b = tuple(e)
+                adj[a].add(b)
+                adj[b].add(a)
+            return adj
+
+        # tree_edges 是 set，必须按固定序扫描；否则字符串哈希随机化
+        # （PYTHONHASHSEED）会让不同进程选到不同的负割边，布局结果不稳定。
+        def tree_edges_sorted():
+            return sorted(tree_edges, key=lambda e: tuple(sorted(e)))
+
+        def init_low_lim():
+            adj = build_tree_adj()
+            if not adj:
+                return {}, {}, {}, {}
+            parent: dict[str, str | None] = {}
+            pre: dict[str, int] = {}
+            seen: set[str] = set()
+            order_counter = 1
+            # 每个连通块各取一个根，DFS 赋 pre/parent
+            for root in sorted(adj.keys()):
+                if root in seen:
+                    continue
+                stack = [(root, None, 0)]
+                while stack:
+                    v, p, state = stack.pop()
+                    if state == 0:
+                        if v in seen:
+                            continue
+                        seen.add(v)
+                        parent[v] = p
+                        pre[v] = order_counter
+                        order_counter += 1
+                        stack.append((v, p, 1))
+                        for w in sorted(adj.get(v, ())):
+                            if w not in seen:
+                                stack.append((w, v, 0))
+            # lim = 子树内最大 pre 下标
+            lim: dict[str, int] = {}
+            for v in sorted(seen, key=lambda x: -pre[x]):
+                max_p = pre[v]
+                for w in adj.get(v, ()):
+                    if parent.get(w) == v:
+                        max_p = max(max_p, lim.get(w, pre[w]))
+                lim[v] = max_p
+            low = {v: pre[v] for v in seen}
+            return parent, low, lim, pre
+
+        parent, low, lim, pre = init_low_lim()
+
+        # ---- initCutValues：计算每条树边的割值 ----
+        def init_cut_values():
+            cutvalue: dict[frozenset, float] = {}
+            adj = build_tree_adj()
+            if not adj:
+                return cutvalue
+            # 叶子优先（按 pre 从大到小）——树边方向 child->parent
+            edge_order = []
+            for e in tree_edges_sorted():
+                a, b = tuple(e)
+                child = b if parent.get(b) == a else a
+                par = a if child == b else b
+                edge_order.append((e, child, par))
+            edge_order.sort(key=lambda x: -pre[x[1]])
+            for e, child, par in edge_order:
+                cutvalue[e] = 1.0  # graphEdge weight（简单图 weight=1）
+                childIsTail = (child, par) in edge_set
+                incident = [(n, True) for n in succs.get(child, [])] + \
+                           [(n, False) for n in preds.get(child, [])]
+                for other, isOut in incident:
+                    if other == par:
+                        continue
+                    pointsToHead = (isOut == childIsTail)
+                    cutvalue[e] += 1.0 if pointsToHead else -1.0
+                    te = frozenset((child, other))
+                    if te in tree_edges:
+                        otherCut = cutvalue.get(te, 1.0)
+                        cutvalue[e] += -otherCut if pointsToHead else otherCut
+            return cutvalue
+
+        cutvalue = init_cut_values()
+
+        # ---- leaveEdge：找 cutvalue<0 的树边 ----
+        def leave_edge():
+            for e in tree_edges_sorted():
+                if cutvalue.get(e, 0) < 0:
+                    return e
+            return None
+
+        def is_descendant(v_lowlim, root_lowlim):
+            root_low, root_lim = root_lowlim
+            _, v_lim = v_lowlim
+            return root_low <= v_lim <= root_lim
+
+        # ---- enterEdge：跨割且 slack 最小的非树边 ----
+        def enter_edge(e):
+            a, b = tuple(e)
+            if (a, b) in edge_set:
+                v, w = a, b
+            else:
+                v, w = b, a
+            vLabel = (low.get(v, 0), lim.get(v, 0))
+            wLabel = (low.get(w, 0), lim.get(w, 0))
+            tailLabel = vLabel
+            flip = False
+            if vLabel[1] > wLabel[1]:
+                tailLabel = wLabel
+                flip = True
+            min_key = float('inf')
+            min_edge = None
+            for (ev, ew) in edge_list:
+                # 只允许换入"非树边"；否则 exchange 会变成 no-op 使树断开
+                if frozenset((ev, ew)) in tree_edges:
+                    continue
+                if (flip == is_descendant((low.get(ev, 0), lim.get(ev, 0)), tailLabel)) and \
+                   (flip != is_descendant((low.get(ew, 0), lim.get(ew, 0)), tailLabel)):
+                    key = slack((ev, ew))
+                    if key < min_key:
+                        min_key = key
+                        min_edge = (ev, ew)
+            return min_edge
+
+        def exchange_edges(e, f):
+            nonlocal tree_edges, parent, low, lim, pre, cutvalue
+            tree_edges.discard(e)
+            tree_edges.add(frozenset(f))
+            parent, low, lim, pre = init_low_lim()
+            # 从根 BFS，按树边方向更新 rank（minlen=1）
+            adj = build_tree_adj()
+            if adj:
+                root = next((n for n in nodes if parent.get(n) is None), nodes[0])
+                stack = [root]
+                seen = {root}
+                while stack:
+                    v = stack.pop()
+                    for w in sorted(adj.get(v, ())):
+                        if w in seen:
+                            continue
+                        seen.add(w)
+                        if (v, w) in edge_set:
+                            rank[w] = rank[v] + 1
+                        elif (w, v) in edge_set:
+                            rank[w] = rank[v] - 1
+                        else:
+                            rank[w] = rank[v]
+                        stack.append(w)
+            cutvalue = init_cut_values()
+
+        # ---- 主循环 ----
+        guard = 0
+        while guard < 1000:
+            e = leave_edge()
+            if e is None:
+                break
+            f = enter_edge(e)
+            if f is None:
+                break
+            exchange_edges(e, f)
+            guard += 1
+
+        return rank
 
     def _compute_layout(
         self, depth: dict[str, int]
@@ -2464,17 +2730,24 @@ class AccuracyGraph:
         edge_sep = self.edge_sep
         rank_sep = self.rank_sep
 
-        real = set(self.layer_row.keys())
+        # 用确定性的层名序作种子，避免布局依赖框架提供的节点顺序
+        # （RKNN/QNN 因输入行序不同而互为镜像）。rank 仍由 _layers() 计算，
+        # 这里只规范化同 rank 内的相对顺序，供 init_order 与后继遍历作为
+        # 确定性的平局打破。
+        ordered_real = sorted(self.layer_row.keys(), reverse=True)
+        real = ordered_real
+        real_set = set(ordered_real)
+        seq_of = {n: i for i, n in enumerate(ordered_real)}
 
         # ---- 1. normalize：构建增强图（真实节点 + 虚拟节点） ----
         nodes: dict[str, dict] = {}
-        for n in real:
+        for n in ordered_real:
             nodes[n] = {
                 'rank': depth.get(n, 0),
                 'width': node_w,
                 'height': node_h,
                 'dummy': False,
-                'seq': self.node_order.get(n, 0),
+                'seq': seq_of[n],
             }
 
         edge_routes: dict[tuple[str, str], list[str]] = {}
@@ -2494,10 +2767,10 @@ class AccuracyGraph:
             aug_in[v].append(u)
 
         for a, blist in self.children.items():
-            if a not in real:
+            if a not in real_set:
                 continue
             for b in blist:
-                if b not in real:
+                if b not in real_set:
                     continue
                 da = nodes[a]['rank']
                 db = nodes[b]['rank']
@@ -2515,6 +2788,13 @@ class AccuracyGraph:
                     add_edge(prev, b)
                     edge_routes[(a, b)] = chain
 
+        # 规范化后继/前驱遍历顺序（按 seq），使 init_order 的 DFS 遍历与层间
+        # 约束都与框架输入顺序无关，从而消除 RKNN/QNN 的镜像差异。
+        for v in aug_out:
+            aug_out[v].sort(key=lambda u: nodes[u].get('seq', 0))
+        for v in aug_in:
+            aug_in[v].sort(key=lambda u: nodes[u].get('seq', 0))
+
         # ---- 2. order：交叉最小化 ----
         layering = self._dagre_order(nodes, aug_in, aug_out)
 
@@ -2522,6 +2802,23 @@ class AccuracyGraph:
         x_pos, y_pos = self._dagre_position(
             layering, nodes, aug_in, aug_out, node_sep, edge_sep, rank_sep,
         )
+
+        # 收尾：把每条长边的虚拟节点链夹在"源-目标 x 走廊"内，避免残差/跳连
+        # 被顶到远处的高速公路列（如 unisal /cnn/Slice_5 的残差被推到 x=1510，
+        # 而源/目标都在 x=765）。只收紧过大的水平摆幅，不改变真实节点位置，
+        # 也不影响 order/rank（故与镜像/确定性修复无关）。
+        #
+        # 允许的水平摆幅按边跨度（dummy 数）放宽：短边（如残差）仍收紧在
+        # 源-目标附近；横贯模型的长边则允许绕远，避免被硬性拉回同一列。
+        pad = node_sep * 1.5
+        for (a, b), route in edge_routes.items():
+            if not route:
+                continue
+            allow = pad + len(route) * edge_sep
+            lo = min(x_pos[a], x_pos[b]) - allow
+            hi = max(x_pos[a], x_pos[b]) + allow
+            for d in route:
+                x_pos[d] = min(max(x_pos[d], lo), hi)
 
         real_pos = {n: (x_pos[n], y_pos[n]) for n in real}
         dummy_pos = {n: (x_pos[n], y_pos[n]) for n in nodes if nodes[n]['dummy']}
@@ -2535,60 +2832,221 @@ class AccuracyGraph:
         aug_in: dict[str, list[str]],
         aug_out: dict[str, list[str]],
     ) -> list[list[str]]:
-        """重心法 + 交叉计数反馈 + transpose 交换，返回每层有序节点列表。"""
+        """dagre.js `order()` 的忠实移植（非 compound 图）。
+
+        与旧的重心扫描不同，这里对齐 dagre 的做法：
+          - 每个层级边界用"层图"排序（down 用前驱、up 用后继的 barycenter）；
+          - `resolveConflicts`：用约束图把会违反已定顺序的节点合并；
+          - 交替 down/up 多轮扫描 + transpose 收尾，最小化边交叉。
+        这是 SSH 头部三条并行分支（3×3 / 5×5 / 7×7）能整齐排列、不互相交叉的关键。
+
+        Returns:
+            layering: list[list[str]]（按 rank/order 排列）。
+        """
         from functools import cmp_to_key
 
         max_rank = max(nd['rank'] for nd in nodes.values())
-        layering: list[list[str]] = [[] for _ in range(max_rank + 1)]
-        for nid, nd in nodes.items():
-            layering[nd['rank']].append(nid)
-        for layer in layering:
-            layer.sort(key=lambda nid: nodes[nid]['seq'])
+        if max_rank < 0:
+            return []
 
+        def set_order(v: str, o: int) -> None:
+            nodes[v]['order'] = o
+
+        def neighbors_rel(v: str, relationship: bool) -> list[str]:
+            # relationship=True（down）用前驱；False（up）用后继
+            return aug_in.get(v, []) if relationship else aug_out.get(v, [])
+
+        # ---- initOrder（dagre：按 rank 升序遍历起点，对每个起点做后继优先 DFS，
+        #      节点首次被访问时按 rank 归入对应层）----
+        def init_order() -> list[list[str]]:
+            visited: set[str] = set()
+            layers: list[list[str]] = [[] for _ in range(max_rank + 1)]
+            ordered_vs = sorted(nodes.keys(),
+                                 key=lambda n: (nodes[n]['rank'], nodes[n].get('seq', 0)))
+            for start in ordered_vs:
+                if start in visited:
+                    continue
+                stack = [start]
+                while stack:
+                    v = stack.pop()
+                    if v in visited:
+                        continue
+                    visited.add(v)
+                    layers[nodes[v]['rank']].append(v)
+                    # 逆序压栈，使出栈顺序 = aug_out 后继顺序（等价官方递归 dfs）
+                    for w in reversed(aug_out.get(v, [])):
+                        if w not in visited:
+                            stack.append(w)
+            return layers
+
+        layering = init_order()
+
+        def assign_order(layers: list[list[str]]) -> None:
+            for layer in layers:
+                for i, v in enumerate(layer):
+                    set_order(v, i)
+
+        assign_order(layering)
+
+        # ---- crossCount（本图所有边 weight=1 → 等价于逆序对数）----
         def cross_count(layers: list[list[str]]) -> int:
             total = 0
             for r in range(1, len(layers)):
-                south_pos = {v: j for j, v in enumerate(layers[r])}
-                entries = []
+                south_pos = {v: i for i, v in enumerate(layers[r])}
+                entries: list[int] = []
                 for v in layers[r - 1]:
-                    for w in aug_out.get(v, []):
-                        if w in south_pos:
-                            entries.append(south_pos[w])
+                    ws = [south_pos[w] for w in aug_out.get(v, []) if w in south_pos]
+                    ws.sort()
+                    entries.extend(ws)
                 total += self._count_inversions(entries, len(layers[r]))
             return total
 
-        def sort_layer(layer, neighbor_adj, neighbor_pos, bias_right):
-            entries = []
-            for idx, v in enumerate(layer):
-                orders = [neighbor_pos[w] for w in neighbor_adj.get(v, []) if w in neighbor_pos]
-                if orders:
-                    entries.append({'v': v, 'bc': sum(orders) / len(orders), 'i': idx})
-                else:
-                    entries.append({'v': v, 'i': idx})
-            sortable = [e for e in entries if 'bc' in e]
-            unsortable = [e for e in entries if 'bc' not in e]
-            unsortable.sort(key=lambda e: -e['i'])
+        # ---- barycenter ----
+        def barycenter(v: str, relationship: bool) -> dict:
+            nb = neighbors_rel(v, relationship)
+            s = 0.0
+            w = 0.0
+            for u in nb:
+                o = nodes.get(u, {}).get('order')
+                if o is None:
+                    continue
+                s += o
+                w += 1.0
+            if w == 0:
+                return {'v': v}
+            return {'v': v, 'barycenter': s / w, 'weight': w}
 
-            def cmp(a, b):
-                if a['bc'] < b['bc']:
+        # ---- resolveConflicts（约束图冲突合并，改写自 dagre.js）----
+        def resolve_conflicts(entries: list[dict], cg: dict[str, list[str]]) -> list[dict]:
+            mapped: dict[str, dict] = {}
+            for i, entry in enumerate(entries):
+                tmp = {'indegree': 0, 'in': [], 'out': [], 'vs': [entry['v']], 'i': i}
+                if 'barycenter' in entry:
+                    tmp['barycenter'] = entry['barycenter']
+                    tmp['weight'] = entry['weight']
+                mapped[entry['v']] = tmp
+            for frm, tos in cg.items():
+                ev = mapped.get(frm)
+                if not ev:
+                    continue
+                for to in tos:
+                    ew = mapped.get(to)
+                    if ew:
+                        ew['indegree'] += 1
+                        ev['out'].append(ew)
+            source_set = [e for e in mapped.values() if e['indegree'] == 0]
+            results: list[dict] = []
+
+            def handle_in(v_entry: dict):
+                def fn(u_entry: dict) -> None:
+                    if u_entry.get('merged'):
+                        return
+                    if (u_entry.get('barycenter') is None
+                            or v_entry.get('barycenter') is None
+                            or u_entry.get('barycenter', 0) >= v_entry.get('barycenter', 0)):
+                        s = 0.0
+                        w = 0.0
+                        if v_entry.get('weight'):
+                            s += v_entry['barycenter'] * v_entry['weight']
+                            w += v_entry['weight']
+                        if u_entry.get('weight'):
+                            s += u_entry['barycenter'] * u_entry['weight']
+                            w += u_entry['weight']
+                        v_entry['vs'] = u_entry['vs'] + v_entry['vs']
+                        if w:
+                            v_entry['barycenter'] = s / w
+                        else:
+                            v_entry.pop('barycenter', None)
+                        v_entry['weight'] = w
+                        v_entry['i'] = min(u_entry['i'], v_entry['i'])
+                        u_entry['merged'] = True
+                return fn
+
+            def handle_out(v_entry: dict):
+                def fn(w_entry: dict) -> None:
+                    w_entry['in'].append(v_entry)
+                    w_entry['indegree'] -= 1
+                    if w_entry['indegree'] == 0:
+                        source_set.append(w_entry)
+                return fn
+
+            while source_set:
+                entry = source_set.pop()
+                results.append(entry)
+                for u in reversed(entry['in']):
+                    handle_in(entry)(u)
+                for w in entry['out']:
+                    handle_out(entry)(w)
+
+            out: list[dict] = []
+            for e in results:
+                if e.get('merged'):
+                    continue
+                value = {'vs': e['vs'], 'i': e['i']}
+                if 'barycenter' in e:
+                    value['barycenter'] = e['barycenter']
+                    value['weight'] = e['weight']
+                out.append(value)
+            return out
+
+        # ---- sort（带 bias 与 unsortable 吸收，改写自 dagre.js）----
+        def sort(entries: list[dict], bias_right: bool) -> dict:
+            lhs = [e for e in entries if 'barycenter' in e]
+            rhs = [e for e in entries if 'barycenter' not in e]
+            unsortable = sorted(rhs, key=lambda e: -e['i'])
+
+            def compare(a: dict, b: dict) -> int:
+                if a['barycenter'] < b['barycenter']:
                     return -1
-                if a['bc'] > b['bc']:
+                if a['barycenter'] > b['barycenter']:
                     return 1
-                return (a['i'] - b['i']) if not bias_right else (b['i'] - a['i'])
-            sortable.sort(key=cmp_to_key(cmp))
+                return (b['i'] - a['i']) if bias_right else (a['i'] - b['i'])
 
-            result = []
-            idx = 0
-            while unsortable and unsortable[-1]['i'] <= idx:
-                result.append(unsortable.pop()['v'])
-                idx += 1
-            for e in sortable:
-                result.append(e['v'])
-                idx += 1
-                while unsortable and unsortable[-1]['i'] <= idx:
-                    result.append(unsortable.pop()['v'])
-                    idx += 1
+            sortable = sorted(lhs, key=cmp_to_key(compare))
+
+            def consume_unsortable(vs: list, un: list, index: int) -> int:
+                while un and un[-1]['i'] <= index:
+                    last = un.pop()
+                    vs.append(last['vs'])
+                    index += 1
+                return index
+
+            vs: list = []
+            s = 0.0
+            w = 0.0
+            vs_index = consume_unsortable(vs, unsortable, 0)
+            for entry in sortable:
+                vs_index += len(entry['vs'])
+                vs.append(entry['vs'])
+                s += entry['barycenter'] * entry['weight']
+                w += entry['weight']
+                vs_index = consume_unsortable(vs, unsortable, vs_index)
+            result = {'vs': [item for sub in vs for item in sub]}
+            if w:
+                result['barycenter'] = s / w
+                result['weight'] = w
             return result
+
+        # ---- sortSubgraph（非 compound：movable = rank 内全部真实+虚拟节点）----
+        def sort_rank(rank_nodes: list[str], cg: dict[str, list[str]], bias_right: bool,
+                      relationship: bool) -> list[str]:
+            entries = [barycenter(v, relationship) for v in rank_nodes]
+            entries = resolve_conflicts(entries, cg)
+            return sort(entries, bias_right)['vs']
+
+        # ---- sweepLayerGraphs：对一组 rank 边界做一次扫描，并记录层内约束 ----
+        def sweep_ranks(ranks_to_sweep: list[int], bias_right: bool, relationship: bool) -> None:
+            cg: dict[str, list[str]] = {}
+            for r in ranks_to_sweep:
+                vs = sort_rank(list(layering[r]), cg, bias_right, relationship)
+                layering[r] = vs
+                for i, v in enumerate(vs):
+                    set_order(v, i)
+                for i in range(len(vs) - 1):
+                    cg.setdefault(vs[i], []).append(vs[i + 1])
+
+        down_ranks = list(range(1, max_rank + 1))
+        up_ranks = list(range(max_rank - 1, -1, -1))
 
         best = [layer[:] for layer in layering]
         best_cc = cross_count(best)
@@ -2597,13 +3055,9 @@ class AccuracyGraph:
         while last_best < 4 and i < 48:
             bias_right = (i % 4) >= 2
             if i % 2 == 0:
-                for r in range(len(layering) - 2, -1, -1):
-                    child_pos = {v: j for j, v in enumerate(layering[r + 1])}
-                    layering[r] = sort_layer(layering[r], aug_out, child_pos, bias_right)
+                sweep_ranks(up_ranks, bias_right, relationship=False)
             else:
-                for r in range(1, len(layering)):
-                    parent_pos = {v: j for j, v in enumerate(layering[r - 1])}
-                    layering[r] = sort_layer(layering[r], aug_in, parent_pos, bias_right)
+                sweep_ranks(down_ranks, bias_right, relationship=True)
             cc = cross_count(layering)
             if cc < best_cc:
                 best_cc = cc
@@ -2613,7 +3067,9 @@ class AccuracyGraph:
                 last_best += 1
             i += 1
 
-        return self._dagre_transpose(best, aug_in, aug_out)
+        layering = self._dagre_transpose(best, aug_in, aug_out)
+        assign_order(layering)
+        return layering
 
     @staticmethod
     def _count_inversions(entries: list[int], size: int) -> int:
@@ -2708,6 +3164,9 @@ class AccuracyGraph:
             y += max_h + rank_sep
 
         conflicts = self._find_type1_conflicts(layering, nodes, aug_in)
+        # 合并 type-2 冲突：两条相互交叉的长边（虚边）不允许被对齐到同一列
+        for v, ws in self._find_type2_conflicts(layering, nodes, aug_in).items():
+            conflicts.setdefault(v, set()).update(ws)
 
         def has_conflict(v: str, w: str) -> bool:
             if v > w:
@@ -2843,8 +3302,8 @@ class AccuracyGraph:
             for (c, s) in block_out[b]:
                 xs[c] = max(xs[c], xs[b] + s)
         for b in reversed(topo):
-            if nodes[b]['dummy']:
-                continue
+            # 第二遍（对齐 dagre pass2）：对所有块根（含 dummy 块）取
+            # max(自身, 最小出边坐标-间距)，把块向右推以消除右侧空白。
             best = min((xs[c] - s for c, s in block_out[b]), default=None)
             if best is not None:
                 xs[b] = max(xs[b], best)
@@ -2897,6 +3356,54 @@ class AccuracyGraph:
                     scan_pos = i + 1
                     k0 = k1
             prev = layer
+        return conflicts
+
+    @staticmethod
+    def _find_type2_conflicts(
+        layering: list[list[str]],
+        nodes: dict[str, dict],
+        aug_in: dict[str, list[str]],
+    ) -> dict[str, set[str]]:
+        """找出 type-2 冲突（两条虚边在相邻层的内段互相交叉），用于 BK 对齐。
+
+        改写自 dagre.js `findType2Conflicts`（非 compound 分支）：扫描相邻两层
+        north->south，当 south 层的虚节点（长边中间节点）v 的虚前驱 u 落在
+        "上一个内段边界 ~ 当前内段边界"之外时，标记 (u, v) 冲突，避免两条
+        相互交叉的长边被垂直对齐到同一列而重叠。
+        """
+        conflicts: dict[str, set[str]] = {}
+
+        def add_conflict(v: str, w: str) -> None:
+            if v > w:
+                v, w = w, v
+            conflicts.setdefault(v, set()).add(w)
+
+        def scan(south, south_pos, south_end, prev_north_border, next_north_border):
+            for i in range(south_pos, south_end):
+                v = south[i]
+                if nodes[v]['dummy']:
+                    for u in aug_in.get(v, []):
+                        if nodes[u]['dummy']:
+                            u_order = nodes[u]['order']
+                            if u_order < prev_north_border or u_order > next_north_border:
+                                add_conflict(u, v)
+
+        for i in range(len(layering) - 1):
+            north = layering[i]
+            south = layering[i + 1]
+            prev_north_pos = -1
+            next_north_pos = -1
+            south_pos = 0
+            for south_lookahead, v in enumerate(south):
+                if nodes[v]['dummy']:
+                    preds = aug_in.get(v, [])
+                    if preds:
+                        next_north_pos = nodes[preds[0]]['order']
+                        scan(south, south_pos, south_lookahead,
+                             prev_north_pos, next_north_pos)
+                        south_pos = south_lookahead
+                        prev_north_pos = next_north_pos
+            scan(south, south_pos, len(south), next_north_pos, len(north))
         return conflicts
 
     @staticmethod

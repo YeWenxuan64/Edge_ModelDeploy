@@ -953,10 +953,10 @@ class OnnxToQNN:
                 os.environ[key] = value
 
         # QAIRT 工具需要可写临时目录（受限环境系统 TEMP 不可写），指向模型工作子目录
-        qairt_tmp_dir = self.tmp_work_dir / 'qairt_tmp'
-        qairt_tmp_dir.mkdir(parents=True, exist_ok=True)
-        os.environ['QAIRT_TMP_DIR'] = str(qairt_tmp_dir)
-        self.file_or_dir_to_clean.append(qairt_tmp_dir)
+        # qairt_tmp_dir = self.tmp_work_dir / 'qairt_tmp'
+        # qairt_tmp_dir.mkdir(parents=True, exist_ok=True)
+        # os.environ['QAIRT_TMP_DIR'] = str(qairt_tmp_dir)
+        # self.file_or_dir_to_clean.append(qairt_tmp_dir)
 
         return True
 
@@ -1179,7 +1179,7 @@ class OnnxToQNN:
             quantize_args += f" --act_quantizer_schema {self.quantize_args['act_quant_schema']}"
         quantize_args += f' --use_per_channel_quantization'
         if self.quantize_args["use_cle_algorithm"]:
-            quantize_args += " --use_cle_algorithm"
+            quantize_args += " --apply_algorithms cle"
 
         extra_args = f'--target_backend HTP'
 
