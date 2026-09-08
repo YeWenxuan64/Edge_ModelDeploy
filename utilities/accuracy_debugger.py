@@ -1,6 +1,7 @@
 import re
 import os
 import sys
+import csv
 import json
 import shutil
 
@@ -21,75 +22,111 @@ from utils import clean_files_or_dirs, run_command, MultThreadExetutor
 
 
 
-def plot_accuracy_summary(names:list[str]=None, single_euc:np.ndarray=None, single_cos:np.ndarray=None, 
-                            entire_euc:np.ndarray=None, entire_cos:np.ndarray=None, mse_vals=None, 
-                            entire_val_color:str="blue", save_path=None):
-    """统一的逐层精度可视化：欧氏距离柱状图 + 余弦相似度折线图（两个子图始终保留）。
+# 统一"层精度"schema：内存 dict 与 CSV 共用同一套键。
+# dict 形态：{层名(sanitized): {'entire_cos': float|None, 'entire_euc': float|None,
+#                               'entire_mse': float|None, 'single_cos': float|None,
+#                               'single_euc': float|None}}
+#   - entire 侧有值 = 该层在累积(entire)分析中有结果；
+#   - single 侧有值 = 该层在单层(single/truncated)分析中有结果；
+#   - 无结果侧一律 None（CSV 空列读回亦为 None），由下游自行解析。
+#   - 单层分析不产出 single_mse（统一 schema 无此键）。
+# LAYER_ACC_KEYS = ('entire_cos', 'entire_euc', 'entire_mse',
+#                   'single_cos', 'single_euc')
+# 内存可选附加键（非 CSV 列）：op_type 算子类型 —— Rknn 侧由 error_analysis
+# 自带类型带入；Qnn 侧缺失时 AccuracyGraph 回退 onnx node_info 推断。
+# LAYER_ACC_EXTRA = ('op_type',)
+# CSV 列：name + LAYER_ACC_KEYS（顺序即骨架序/渲染 x 轴序）
+# CSV_ACC_FIELDNAMES = ('name',) + LAYER_ACC_KEYS
 
-    使用分支按传入数据绘制：只画实际存在的数据（None 则跳过该部分），
-    即使某子图没有任何数据也会保留该子图（显示标题、坐标轴与网格，不报错）。
+
+def _acc_col(accuracy: dict, key: str) -> list:
+    """从统一 dict 按层序取某指标列（缺失 None -> 原样保留，绘图处再转 nan）。"""
+    return [row.get(key) if isinstance(row, dict) else None for row in accuracy.values()]
+
+
+def plot_accuracy_summary(accuracy: dict = None, entire_val_color: str = "blue",
+                          save_path=None):
+    """统一的逐层精度可视化（欧氏距离柱状图 + 余弦相似度折线图）。
+
+    入参为统一"层精度" dict（schema 见模块顶部 LAYER_ACC_KEYS）：
+        {层名: {'entire_cos': float|None, 'entire_euc': float|None,
+                'entire_mse': float|None, 'single_cos': float|None,
+                'single_euc': float|None}}
+    内部按层序(names = accuracy.keys())拆列并绘图：
+      - entire 侧任意层有值 -> 画 entire 折线（累积）；
+      - single 侧任意层有值 -> 画 single 柱状（单层）；
+      - 该列全为 None/空 dict -> 跳过该部分（两个子图始终保留）。
+    层名即 x 轴标签；层顺序 = dict 键序（调用方保证为骨架序）。
 
     Args:
-        names: x 轴刻度标签（可为 None）。
-        single_euc: 欧氏距离柱状数据（逐层单层误差，可为 None）。
-        single_cos: 余弦相似度折线数据（逐层单层余弦，可为 None）。
-        entire_euc: 可选累积欧氏距离（entire，自输入累计），以折线叠加在上图。
-        entire_cos: 可选累积余弦相似度（entire），以折线叠加在下图。
-        mse_vals: 可选 MSE 右轴折线数据。
-        save_path: 保存路径。
-    """
-    from matplotlib import axes
-    import matplotlib.pyplot as plt
+        accuracy: 统一层精度 dict（可为空/None -> 只建空图）。
+        entire_val_color: entire 折线颜色（QNN 蓝 / RKNN 橙）。
+        save_path: 保存 PNG 路径（None 不保存）。
 
-    # 数据长度：从任一可用数组推断（names 优先），用于 x 轴范围与刻度
-    n = 0
-    for arr in (names, single_euc, single_cos, entire_euc, entire_cos, mse_vals):
-        if arr is not None:
-            n = len(arr)
-            break
+    Returns:
+        save_path（同 plot_accuracy_summary 旧语义）。
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib import axes
+
+    accuracy = accuracy or {}
+    names = list(accuracy.keys())
+    n = len(names)
     layer_index = np.arange(n)
+
+    def col(key):
+        """某指标列 -> np.ndarray；无值(None) -> nan（plot 自动断开/跳过）。"""
+        return np.array([v if v is not None else np.nan for v in _acc_col(accuracy, key)],
+                       dtype=np.float64)
+
+    single_euc = col('single_euc')
+    single_cos = col('single_cos')
+    entire_euc = col('entire_euc')
+    entire_cos = col('entire_cos')
+    mse_vals = col('entire_mse')
+
+    has_single = bool(np.isfinite(single_cos).any())
+    has_entire = bool(np.isfinite(entire_cos).any())
 
     # 两个子图始终创建（即使无数据也保留）
     fig, (ax_euc, ax_cos) = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
-    ax_euc:axes.Axes
-    ax_cos:axes.Axes
+    ax_euc: axes.Axes
+    ax_cos: axes.Axes
 
     # ---- 上图：欧氏距离（分支：只画有数据的部分）----
     extra_axes: list[axes.Axes] = []
     has_euc_data = False
 
-    if single_euc is not None:
-        single_euc = np.asarray(single_euc, dtype=np.float64)
-        # 数据清洗：避免 log(0) 报错，将绝对的 0 值替换为极小值
+    if has_single:
         euc_plot = single_euc.copy()
+        euc_plot[~np.isfinite(euc_plot)] = np.nan      # 缺值不画柱
         euc_plot[euc_plot == 0] = 1e-10
         ax_euc.set_yscale('linear')
         ax_euc.bar(layer_index, euc_plot, color='skyblue', edgecolor='black',
-                    linewidth=0.5, alpha=0.7, label='Euc (single)')
+                   linewidth=0.5, alpha=0.7, label='Euc (single)')
         has_euc_data = True
 
-    if entire_euc is not None:
-        # 累积欧氏距离与单层欧氏距离使用同一坐标刻度
-        entire_euc_plot = np.asarray(entire_euc, dtype=np.float64).copy()
+    if has_entire:
+        entire_euc_plot = entire_euc.copy()
+        entire_euc_plot[~np.isfinite(entire_euc_plot)] = np.nan
         entire_euc_plot[entire_euc_plot == 0] = 1e-10
         ax_euc.plot(layer_index, entire_euc_plot, color=entire_val_color, marker='.',
                     linestyle='-', linewidth=1.5, markersize=2, label='Euc (entire)')
         has_euc_data = True
 
-    if mse_vals is not None:
+    if np.isfinite(mse_vals).any():
         # 右侧纵轴：MSE（量级可能千分之一~个位，与欧氏距离的几十上百分离显示）
         ax_mse = ax_euc.twinx()
-        ax_mse.plot(layer_index, mse_vals, color=(0.0, 0.8, 0.6), marker='.', linestyle='-',
-                    linewidth=1, markersize=2, label='MSE')
+        ax_mse.plot(layer_index, mse_vals, color=(0.0, 0.8, 0.6), marker='.',
+                    linestyle='-', linewidth=1, markersize=2, label='MSE')
         ax_mse.set_ylabel('MSE', fontsize=12)
         extra_axes.append(ax_mse)
         has_euc_data = True
 
-    ax_euc.set_title(f'Euclidean Distance', fontsize=14, fontweight='bold')
+    ax_euc.set_title('Euclidean Distance', fontsize=14, fontweight='bold')
     ax_euc.set_ylabel('Euclidean Distance', fontsize=12)
     ax_euc.grid(True, which="both", ls="--", alpha=0.5)
     if has_euc_data:
-        # 合并右轴（MSE）与左轴（柱状 / entire）的图例
         lines, labels = ax_euc.get_legend_handles_labels()
         for ax in extra_axes:
             l, lab = ax.get_legend_handles_labels()
@@ -101,18 +138,17 @@ def plot_accuracy_summary(names:list[str]=None, single_euc:np.ndarray=None, sing
     # ---- 下图：余弦相似度（分支：只画有数据的部分）----
     has_cos_data = False
 
-    if single_cos is not None:
-        single_cos = np.asarray(single_cos, dtype=np.float64)
-        # 数据清洗：将恰好等于 0 的余弦值置为 NaN，matplotlib 会跳过这些点且不连线，
-        # 避免异常的 0 值把 y 轴显示范围压扁（正常余弦值集中在 0.98~1.0 附近）
-        cos_sim_plot = np.where(single_cos == 0.0, np.nan, single_cos)
+    if has_single:
+        cos_sim_plot = single_cos.copy()
+        cos_sim_plot[~np.isfinite(cos_sim_plot)] = np.nan
         ax_cos.set_yscale('linear')
         ax_cos.plot(layer_index, cos_sim_plot, color='green', marker='.',
                     linestyle='-', linewidth=1, markersize=2, label='Cosine (single)')
         has_cos_data = True
 
-    if entire_cos is not None:
-        entire_cos_plot = np.where(np.asarray(entire_cos) == 0.0, np.nan, np.asarray(entire_cos))
+    if has_entire:
+        entire_cos_plot = entire_cos.copy()
+        entire_cos_plot[~np.isfinite(entire_cos_plot)] = np.nan
         ax_cos.plot(layer_index, entire_cos_plot, color=entire_val_color, marker='.',
                     linestyle='-', linewidth=1.5, markersize=2, label='Cosine (entire)')
         has_cos_data = True
@@ -120,11 +156,11 @@ def plot_accuracy_summary(names:list[str]=None, single_euc:np.ndarray=None, sing
     ax_cos.set_title('Cosine Similarity', fontsize=14, fontweight='bold')
     ax_cos.set_ylabel('Cosine Similarity', fontsize=12)
     ax_cos.set_xticks(layer_index)
-    if names is not None:
+    if names:
         ax_cos.set_xticklabels(names, rotation=-45, ha='left', fontsize=10)
     if has_cos_data:
         ax_cos.axhline(0.99, color='red', linestyle='--', linewidth=1, alpha=0.6,
-                        label='Warning Threshold (0.99)')
+                       label='Warning Threshold (0.99)')
         ax_cos.legend()
     ax_cos.grid(True, which="both", ls="--", alpha=0.5)
 
@@ -136,21 +172,11 @@ def plot_accuracy_summary(names:list[str]=None, single_euc:np.ndarray=None, sing
     plt.tight_layout()
     if save_path is not None:
         save_path = Path(save_path).resolve()
-
         plt.savefig(str(save_path), dpi=300, bbox_inches='tight')
         print(f"Figure saved to: {save_path}")
     plt.show()
 
     return save_path
-
-
-# ==========================================================================
-# 图结构构建（RknnAccuracyDebugger / QnnAccuracyDebugger 共用）
-# --------------------------------------------------------------------------
-# 两个调试器数据来源不同（RKNN 快照层名 = 原始 ONNX 张量名 + 后缀；QNN raw
-# 文件名 = 清洗名），但"解析 ONNX 构建张量 DAG -> 层图 -> 终端节点"的逻辑一致，
-# 统一放在这里，两侧仅以 sanitize / include_input / name_of 等参数区分。
-# ==========================================================================
 
 
 def build_onnx_tensor_graph(model_path, *, sanitize: bool = False) -> dict:
@@ -489,23 +515,17 @@ class RknnAccuracyDebugger:
         self.file_or_dir_to_clean:list[str] = []
         self.file_or_dir_to_clean.append(self.snapshot_dir)
 
-    def read_error_analysis(self) -> list[dict]:
+    def read_error_analysis(self) -> dict:
         """
-        读取 RKNN 精度分析结果文件 (snapshot/error_analysis.txt)。
+        读取 RKNN 精度分析结果文件 (snapshot/error_analysis.txt) 并直接组装统一
+        "层精度" dict（不再经 list[rows] 中转）。
 
-        Args:
-            error_analysis_path (str | None): 精度分析结果文件路径。
-                - None (默认): 使用 self.tmp_dir/snapshot/error_analysis.txt。
-
-        Returns:
-            list[dict]: 逐层精度数据列表，每个元素包含:
-                - op_type (str): 算子类型，如 'Conv'、'LeakyRelu'
-                - layer_name (str): 层名称
-                - entire_cos (float | None): 累积余弦相似度（从输入累计到该层）
-                - entire_euc (float | None): 累积欧氏距离
-                - single_cos (float | None): 单层余弦相似度（反映该层自身量化误差）
-                - single_euc (float | None): 单层欧氏距离
-                - 少数层（如部分 Concat）无数值，对应字段为 None。
+        {layer_name: {'op_type': str|None,
+                      'entire_cos'|'entire_euc'|'entire_mse': float|None,
+                      'single_cos'|'single_euc': float|None}}
+          - op_type: RKNN 自带算子类型（如 'Conv'、'LeakyRelu'）；
+          - 数值键与 LAYER_ACC_KEYS 一致；RKNN 无 mse，entire_mse 恒 None；
+          - 少数层（如部分 Concat）无数值，对应字段为 None。
 
         Raises:
             FileNotFoundError: 当结果文件不存在时。
@@ -519,7 +539,7 @@ class RknnAccuracyDebugger:
                 "请先通过 set_do_accuracy_analysis() 启用精度分析并运行 convert() 生成结果。"
             )
 
-        rows: list[dict] = []
+        accuracy: dict[str, dict] = {}
         with open(error_analysis_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.rstrip()
@@ -551,183 +571,47 @@ class RknnAccuracyDebugger:
                     layer_name = rest
                     entire_cos = entire_euc = single_cos = single_euc = None
 
-                rows.append({
+                accuracy[layer_name] = {
                     'op_type': op_type,
-                    'layer_name': layer_name,
-                    'entire_cos': entire_cos,
-                    'entire_euc': entire_euc,
-                    'single_cos': single_cos,
-                    'single_euc': single_euc,
-                })
+                    'entire_cos': entire_cos, 'entire_euc': entire_euc, 'entire_mse': None,
+                    'single_cos': single_cos, 'single_euc': single_euc,
+                }
 
-        print(f"Loaded {len(rows)} layers from {error_analysis_path}")
-        return rows
+        print(f"Loaded {len(accuracy)} layers from {error_analysis_path}")
+        return accuracy
 
-    def plot_accuracy_analysis(self):
+    def render_combined_report(self, show:bool=True):
         """
-        读取并可视化 RKNN 精度分析结果（欧氏距离柱状图 + 余弦相似度折线图）。
-        """
-        from matplotlib import axes
-        import matplotlib.pyplot as plt
+        可视化 RKNN 精度分析结果（欧氏距离柱状图 + 余弦相似度折线图）。
+        可视化 RKNN 精度分析网络图（Netron 风格 HTML）。
 
-        rows = self.read_error_analysis()
-        if not rows:
+        数据 = read_error_analysis() 组装的统一"层精度" dict（含 RKNN 自带
+        op_type）-> AccuracyGraph（onnx 构建/层图/Output 终端在其 __init__ 内
+        完成一次）。RKNN 快照已含输入层，include_input=False；层名为原始 ONNX
+        张量名，sanitize=False、layer_display 恒等。
+        """
+
+        accuracy = self.read_error_analysis()
+        if not accuracy:
             print("No data to plot.")
-            return rows
-
-        layer_names = [r['layer_name'] for r in rows]
-        n = len(rows)
-        x = np.arange(n)
-
-        entire_cos = np.array([r['entire_cos'] for r in rows], dtype=float)
-        entire_euc = np.array([r['entire_euc'] for r in rows], dtype=float)
-        single_cos = np.array([r['single_cos'] for r in rows], dtype=float)
-        single_euc = np.array([r['single_euc'] for r in rows], dtype=float)
+            return 
 
         save_path = self.tmp_work_dir / 'rknn_accuracy_analysis_summary.png'
-
-        plot_accuracy_summary(
-            names=layer_names,
-            single_euc=single_euc,
-            single_cos=single_cos,
-            entire_euc=entire_euc,
-            entire_cos=entire_cos,
-            entire_val_color="orange",
-            save_path=save_path,
-        )
-
+        plot_accuracy_summary(accuracy, entire_val_color="orange", save_path=save_path)
         self.file_or_dir_to_clean.append(save_path)
 
 
-    # ------------------------------------------------------------------
-    # 带路径追踪的精度分析：从多个输入到多个输出的排列组合路径
-    # ------------------------------------------------------------------
-
-    def read_path_analysis(self) -> dict:
-        """
-        读取 RKNN 精度分析数据，并结合 ONNX 图结构追踪"输入 -> 输出"的排列组合路径。
-
-        Returns:
-            dict: 包含
-                - inputs (list[str]): 模型输入名
-                - outputs (list[str]): 模型输出名
-                - paths (dict[tuple[str, str], list[dict]]): (输入, 输出) -> 路径层列表，
-                  每层包含 op_type / layer_name / tensor / entire_cos / entire_euc /
-                  single_cos / single_euc（累积精度与单层精度）。
-        """
-
-        rows = self.read_error_analysis()
-        if not rows:
-            return {}
-
-        graph = build_onnx_tensor_graph(self.tmp_model_path, sanitize=False)
-        children, parents, _ = build_layer_graph(
-            rows, graph, tensor_resolver=lambda nm: match_tensor(nm, graph))
-
-        node_order = {r['layer_name']: i for i, r in enumerate(rows)}
-        layer_row = {r['layer_name']: r for r in rows}
-
-        def descendants(start: str) -> set[str]:
-            """start 出发能到达的所有层（不含自身）。"""
-            seen: set[str] = set()
-            dq = deque([start])
-            while dq:
-                n = dq.popleft()
-                for c in children.get(n, []):
-                    if c not in seen:
-                        seen.add(c)
-                        dq.append(c)
-            return seen
-
-        def ancestors(start: str) -> set[str]:
-            """能到达 start 的所有层（不含自身）。"""
-            seen: set[str] = set()
-            dq = deque([start])
-            while dq:
-                n = dq.popleft()
-                for p in parents.get(n, []):
-                    if p not in seen:
-                        seen.add(p)
-                        dq.append(p)
-            return seen
-
-        # 输入/输出层：ONNX 图输入输出名对应的快照层
-        input_layers = [t for t in graph['inputs'] if t in layer_row]
-        output_layers = [t for t in graph['outputs'] if t in layer_row]
-
-        paths: dict[tuple[str, str], list[dict]] = {}
-        for inp in input_layers:
-            for out in output_layers:
-                if inp == out:
-                    continue
-                # 路径层 = (从输入可到达) ∩ (可到达输出)，并补上输入/输出层自身
-                path_layers = sorted(
-                    (descendants(inp) | {inp}) & (ancestors(out) | {out}),
-                    key=lambda x: node_order[x],
-                )
-                paths[(inp, out)] = [
-                    {
-                        'op_type': layer_row[ln]['op_type'],
-                        'layer_name': ln,
-                        'tensor': layer_row[ln].get('tensor'),
-                        'entire_cos': layer_row[ln]['entire_cos'],
-                        'entire_euc': layer_row[ln]['entire_euc'],
-                        'single_cos': layer_row[ln]['single_cos'],
-                        'single_euc': layer_row[ln]['single_euc'],
-                    }
-                    for ln in path_layers
-                ]
-
-        result = {
-            'inputs': input_layers,
-            'outputs': output_layers,
-            'paths': paths,
-            'rows': rows,
-        }
-        return result
-
-    def draw_network_analysis(self, show:bool=True):
-        """
-        带路径追踪的精度分析（Netron 风格网络图）。
-
-        复用 read_path_analysis() 的数据，并重新构建层图（children/parents），
-        交给独立的 pyvis 可视化类 AccuracyGraph 渲染整个网络图。
-
-        节点填充色 = 累积精度 entire_cos（红-黄-绿），悬停查看单层精度与欧氏距离。
-        额外追加 Output 示意终端节点（RKNN 默认已含输入层，无需额外加输入）。
-
-        Returns:
-            dict: read_path_analysis() 的原始结果。
-        """
-        data = self.read_path_analysis()
-        if not data or not data['paths']:
-            print("No path data to plot.")
-            return data
-
-        graph = build_onnx_tensor_graph(self.tmp_model_path, sanitize=False)
-        children, parents, tensor_layers  = build_layer_graph(
-            data['rows'], graph, tensor_resolver=lambda nm: match_tensor(nm, graph))
-
-        # 追加 Output 示意终端节点（RKNN 快照已含输入层，仅追加输出）
-        _, output_rows, _, output_layers, children, parents = build_terminal_nodes(
-            data['rows'], children, parents, graph, include_input=False, name_of=lambda k: k)
-        data['rows'] = data['rows'] + output_rows
-        data['outputs'] = output_layers
-
         output_path = self.tmp_work_dir / 'rknn_graph_accuracy_analysis.html'
-        # self.file_or_dir_to_clean.append(output_path)
-
         viz = AccuracyGraph(
-            data=data,
-            children=children,
-            parents=parents,
-            output_path=output_path,
+            accuracy,
+            self.tmp_model_path,
+            output_path,
             title='RKNN Graph Accuracy Analysis',
+            sanitize=False,
+            include_input=False,
         )
-
         html_path = viz.render(show=show)
         self.file_or_dir_to_clean.append(html_path)
-        return
 
     def clean(self):
         clean_files_or_dirs(self.file_or_dir_to_clean)
@@ -755,6 +639,7 @@ class QnnAccuracyDebugger:
         self.working_dir = self.tmp_dir / 'qnn_accuracy_analysis'
         self.onnx_path = Path(onnx_path).resolve()
         self.debugger_picture_list = [Path(p).resolve() for p in (debugger_picture_list or []) if Path(p).exists()]
+        self.accuracy_csv_path = self.working_dir / 'qnn_accuracy_analysis_layers.csv'
         
         if sys.platform.startswith('win'):
             # golden(FP32 全层 dump)走 CPU;量化推理/context-binary 只能走 HTP
@@ -768,6 +653,7 @@ class QnnAccuracyDebugger:
         self.onnx_info: dict = {}
         self.set_input_order:str = 'nhwc'
         self.exe_qairt_converter:str|None = None
+        self.target_dlc_path: str | None = None   # 量化 DLC（画 DLC 视角网络图时反射候选）
         self.file_or_dir_to_clean: list[str] = [str(self.working_dir)]
 
     # ------------------------------------------------------------------
@@ -861,41 +747,37 @@ class QnnAccuracyDebugger:
             target_dlc_path: 量化 DLC 路径（同时作为 single 的层结构反射源）。
         """
         self.working_dir.mkdir(parents=True, exist_ok=True)
+        self.target_dlc_path = str(target_dlc_path)
         input_list = self.prepare_input_data(mean_rgb, std_rgb)
 
-        # 1) entire（累积）
-        names_e, entire_cos, entire_euc, mse_e = self.entire_accuracy_analysis(
-            golden_dlc_path, target_dlc_path, input_list)
+        # 1) entire（累积）——末尾 save_accuracy_analysis_csv 落盘
+        self.entire_accuracy_analysis(golden_dlc_path, target_dlc_path, input_list)
 
-        # 2) single（单层）——失败时退回 entire-only 渲染（不阻断既有流程）
-        names_s, single_cos, single_euc, mse_s = None, None, None, None
+        # 2) single（单层）——失败时退回 entire-only 渲染（不阻断既有流程）。
+        #    成功则 save_accuracy_analysis_csv(kind='single') 追加到同一 CSV。
         fallback_entire_only = False
         if sys.platform.startswith('win'):
             fallback_entire_only = True
 
         if not fallback_entire_only:
             try:
-                names_s, single_cos, single_euc, mse_s = self.single_accuracy_analysis(
-                    golden_dlc_path, target_dlc_path, input_list)
+                self.single_accuracy_analysis(golden_dlc_path, target_dlc_path, input_list)
             except Exception as exc:
                 fallback_entire_only = True
                 print(f"[QAIRTAccuracyDebugger] single-layer analysis skipped ({type(exc).__name__}: {exc}); "
                     f"fallback to entire-only report")
 
 
-        # 3) 渲染：single 数据可用时输出 entire+single 联合图；
-        #    fallback(Windows 或 single 失败)时 single=None -> entire-only 图。
-        self._render_combined_report(
-            names_e, entire_cos, entire_euc, mse_e,
-            names_s, single_cos, single_euc,
-        )
+        # 3) 渲染：从精度 CSV 读回（entire/single 已落盘），single 数据可用时输出
+        #    entire+single 联合图；fallback(Windows 或 single 失败)时仅 entire 列 -> entire-only 图。
+        self.render_combined_report()
         return 0
 
     def clean(self):
         clean_files_or_dirs(self.file_or_dir_to_clean)
 
 
-    def entire_accuracy_analysis(self, golden_dlc_path:str, target_dlc_path:str, input_list:str) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray]:
+    def entire_accuracy_analysis(self, golden_dlc_path:str, target_dlc_path:str, input_list:str):
         golden_dir = self.working_dir / 'golden_output'
         target_dir = self.working_dir / 'target_output'
         for d in (golden_dir, target_dir):
@@ -935,25 +817,25 @@ class QnnAccuracyDebugger:
             order = sorted(common)
         print(f"[QAIRTAccuracyDebugger] matched layers: {len(order)}")
 
-        names, cos, euc, mse = [], [], [], []
+        # 统一 dict：{层名: {entire_cos/euc/mse 有值, single 侧 None}}
+        accuracy = {}
         for n in order:
             a, b = gold[n], targ[n]
-            names.append(n)
-            cos.append(float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12)))
-            euc.append(float(np.linalg.norm(a - b)))
-            mse.append(float(np.mean((a - b) ** 2)))
+            accuracy[n] = {
+                'entire_cos': float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12)),
+                'entire_euc': float(np.linalg.norm(a - b)),
+                'entire_mse': float(np.mean((a - b) ** 2)),
+                'single_cos': None, 'single_euc': None,
+            }
 
-        entire_cos, entire_euc, mse_vals = np.asarray(cos), np.asarray(euc), np.asarray(mse)
-
-        return names, entire_cos, entire_euc, mse_vals
+        self.save_accuracy_analysis_csv(accuracy, kind='entire')
 
     # ------------------------------------------------------------------
     # single：截断单算子实现（详见 QnnTruncatedAccuracyAnalysis）
     # ------------------------------------------------------------------
 
     def single_accuracy_analysis(self, golden_dlc_path: str, target_dlc_path: str,
-                                 input_list: str, only_tensor_prefix=None,
-                                 ) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray]:
+                                 input_list: str, only_tensor_prefix=None):
         """手动逐层（layerwise == single）精度分析（默认全层、并行）。
 
         误差语义 = 官方 layerwise：整图其余部分浮点，仅该层量化 -> 误差仅反映
@@ -972,153 +854,191 @@ class QnnAccuracyDebugger:
             input_list: qnn-net-run 输入列表。
             only_tensor_prefix: 只分析张量名以此前缀开头的层（str 或 tuple）。
 
-        Returns:
-            (names, single_cos, single_euc, mse)：names 为 sanitized 张量名。
+        本方法不返回值：内部调 QnnTruncatedAccuracyAnalysis.run 拿到统一"层精度"
+        dict（single 侧有值），save_accuracy_analysis_csv(kind='single') 落盘。
         """
-        return QnnTruncatedAccuracyAnalysis(self, self.onnx_path).run(
-            golden_dlc_path, target_dlc_path, input_list, only_tensor_prefix)
+        analyzer = QnnTruncatedAccuracyAnalysis(self, self.onnx_path)
+        accuracy = analyzer.run(golden_dlc_path, target_dlc_path, input_list, only_tensor_prefix)
+        self.save_accuracy_analysis_csv(accuracy, kind='single')
+
+    # ------------------------------------------------------------------
+    # 精度结果 CSV（working_dir/qnn_accuracy_analysis_layers.csv）
+    # ------------------------------------------------------------------
+
+    def save_accuracy_analysis_csv(self, accuracy: dict, kind: str = 'entire') -> str:
+        """把一轮精度结果（统一 dict）merge 写入 working_dir/qnn_accuracy_analysis_layers.csv。
+
+        统一 dict 形态见模块顶部 LAYER_ACC_KEYS 注释：
+            {层名: {'entire_cos': float|None, 'entire_euc': float|None,
+                    'entire_mse': float|None, 'single_cos': float|None,
+                    'single_euc': float|None}}
+        kind 决定本次写哪一侧、如何定序：
+          - kind='entire'：以 accuracy 键序（ONNX 拓扑序全集）重建 CSV 骨架，
+            写 entire 三列；single 列清空（本次 fresh）；
+          - kind='single' ：在现有骨架上按层名更新/追加 single 两列，不重排
+            文件（单独调试 single 时文件可能只有 single 行）。
+        数值列 float、缺值 None；entire 侧额外产出 entire_mse（单层无 mse）。
+
+        Args:
+            accuracy: 统一层精度 dict（至少含 kind 对应侧的键）。
+            kind: 'entire' | 'single'。
+
+        Returns:
+            CSV 路径。
+        """
+        if kind not in ('entire', 'single'):
+            raise ValueError(f"kind must be 'entire' or 'single', got {kind!r}")
+        csv_path = self.accuracy_csv_path
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def fnum(v):
+            return '' if v is None else repr(float(v))
+
+        # 读取现有骨架（统一 dict {name: row}，保持顺序）
+        old = self.load_accuracy_analysis_csv(csv_path)
+
+        # CSV 行统一形态：{'name':..., 'entire_cos':.., 'entire_euc':.., 'entire_mse':..,
+        #                   'single_cos':.., 'single_euc':..}（字符串）
+        def to_csv_row(name, row):
+            return {
+                'name': name,
+                'entire_cos': fnum(row.get('entire_cos')),
+                'entire_euc': fnum(row.get('entire_euc')),
+                'entire_mse': fnum(row.get('entire_mse')),
+                'single_cos': fnum(row.get('single_cos')),
+                'single_euc': fnum(row.get('single_euc')),
+            }
+
+        if kind == 'entire':
+            # 重建：entire 全集顺序 = 骨架；single 侧清空（本次 fresh）
+            rows = [to_csv_row(name, row) for name, row in accuracy.items()]
+        else:
+            # 更新/追加 single 列，保留既有行序（entire 骨架不动）
+            rows = [to_csv_row(name, row) for name, row in old.items()]
+            seen = {r['name'] for r in rows}
+            for name, row in accuracy.items():
+                sc, se = row.get('single_cos'), row.get('single_euc')
+                if name in seen:
+                    for r in rows:
+                        if r['name'] == name:
+                            r['single_cos'] = fnum(sc)
+                            r['single_euc'] = fnum(se)
+                            break
+                else:
+                    new_row = to_csv_row(name, {})
+                    new_row['single_cos'] = fnum(sc)
+                    new_row['single_euc'] = fnum(se)
+                    rows.append(new_row)
+                    seen.add(name)
+
+        fieldnames = ('name', 'entire_cos', 'entire_euc', 'entire_mse', 'single_cos', 'single_euc')
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=list(fieldnames))
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+
+        print(f"[QAIRTAccuracyDebugger] accuracy csv ({kind}, {len(accuracy)} layers) -> {csv_path}")
+        return str(csv_path)
+
+    def load_accuracy_analysis_csv(self, accuracy_csv_path: str) -> dict:
+        """读回精度 CSV -> 统一层精度 dict（有序，键序 = 文件行序）。
+
+        {层名: {'entire_cos': float|None, ..., 'single_euc': float|None}}。
+        文件不存在返回空 dict {}（而非 []）。旧列名（mse_e/single_mse）自动忽略。
+        """
+        csv_path = Path(accuracy_csv_path)
+        if not csv_path.exists():
+            return {}
+        accuracy = {}
+        with open(csv_path, newline='', encoding='utf-8') as f:
+            for line in csv.DictReader(f):
+                name = line.get('name', '')
+                if not name:
+                    continue
+                row = {}
+                for k in ('entire_cos', 'entire_euc', 'entire_mse', 'single_cos', 'single_euc'):
+                    v = (line.get(k) or '').strip()
+                    row[k] = float(v) if v else None
+                accuracy[name] = row
+        return accuracy
+
     # ------------------------------------------------------------------
     # 渲染：AccuracyGraph（HTML）与结果组织
     # ------------------------------------------------------------------
 
-    def _render_combined_report(self, names_e, entire_cos, entire_euc, mse_e,
-                                names_s, single_cos, single_euc) -> None:
-        """渲染 entire+single 联合报告：统计图（single 柱 + entire 折线）+ 网络图。
+    def render_combined_report(self) -> None:
+        """从精度 CSV（working_dir/qnn_accuracy_analysis_layers.csv）读回统一 dict 并渲染。
 
-        single_* 参数可为 None（或长度为 0）：此时退化为 entire-only 渲染——
-        统计图只画 entire 折线(+MSE)，网络图不带 single 数据。
+        entire / single 分析在各自末尾经 save_accuracy_analysis_csv 落盘；此处不再
+        接收参数，直接读 CSV（统一 dict）后渲染（调试/重画时无需重跑 net-run 重算精度）。
 
-        层对齐：有 single 时以 entire（ONNX 拓扑序）全集为 x 轴，single 按 sanitized 名
-        匹配填入对应位置；single 缺失的层置 nan（折线断开/柱留空，表示无该层数据）。
-        网络图用 entire 全集，single 缺失层保持 None（tooltip 显示 n/a）。
+        - CSV 含 entire 侧：以文件行序（entire 全集，ONNX 拓扑序）为 x 轴/图序；
+        - CSV 含 single 侧：叠画 single 柱状 / 网络图 tooltip 显示单层精度；
+        - 仅 single 无 entire：只画 single 统计图（entire 为空，网络图无法着色，跳过）。
         """
-        has_single = (names_s is not None and single_cos is not None
-                      and single_euc is not None and len(names_s) > 0)
+        accuracy = self.load_accuracy_analysis_csv(self.accuracy_csv_path)
+        if not accuracy:
+            raise RuntimeError(
+                "[QAIRTAccuracyDebugger] accuracy CSV 不存在/为空，无法渲染；"
+                "请先运行 accuracy_analysis()/entire_accuracy_analysis() 生成 "
+                f"{self.accuracy_csv_path}")
+
+        has_entire = any(r.get('entire_cos') is not None for r in accuracy.values())
+        has_single = any(r.get('single_cos') is not None for r in accuracy.values())
 
         plt_path = Path(self.tmp_dir / 'qnn_accuracy_analysis_summary.png')
-        if not has_single:
-            plot_accuracy_summary(
-                names=names_e,
-                entire_euc=entire_euc,
-                entire_cos=entire_cos,
-                mse_vals=mse_e,
-                entire_val_color="blue",
-                save_path=plt_path,
-            )
-            self.file_or_dir_to_clean.append(str(plt_path))
-            if self.onnx_path is not None:
-                self.draw_network_analysis(
-                    names=names_e, entire_cos=entire_cos, entire_euc=entire_euc, mse_vals=mse_e)
-            return
-
-        # 以 entire 全集为 x 轴；single 缺失层置 nan（不参与连线/柱体）
-        set_s = set(names_s)
-        idx_s = {n: i for i, n in enumerate(names_s)}
-        single_euc_arr = np.full(len(names_e), np.nan, dtype=np.float64)
-        single_cos_arr = np.full(len(names_e), np.nan, dtype=np.float64)
-        for pos, n in enumerate(names_e):
-            if n in set_s:
-                j = idx_s[n]
-                single_euc_arr[pos] = single_euc[j]
-                single_cos_arr[pos] = single_cos[j]
-
-        plot_accuracy_summary(
-            names=names_e,
-            single_euc=single_euc_arr,
-            single_cos=single_cos_arr,
-            entire_euc=entire_euc,
-            entire_cos=entire_cos,
-            mse_vals=mse_e,
-            entire_val_color="blue",
-            save_path=plt_path,
-        )
+        plot_accuracy_summary(accuracy, entire_val_color="blue", save_path=plt_path)
         self.file_or_dir_to_clean.append(str(plt_path))
 
-        if self.onnx_path is not None:
-            self.draw_network_analysis(
-                names=names_e, entire_cos=entire_cos, entire_euc=entire_euc, mse_vals=mse_e,
-                single_names=names_s, single_cos=single_cos, single_euc=single_euc,
-            )
+        # 网络图：需要 entire 作节点着色；仅 single（无 entire）时跳过
+        if self.onnx_path is not None and has_entire:
+            self.draw_network_analysis(accuracy)
 
-        # csv_path = save_csv or str(self.tmp_dir / 'layerwise_single_results.csv')
-        # import csv as _csv
-        # with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        #     w = _csv.writer(f)
-        #     w.writerow(['name', 'single_cos', 'single_euc', 'single_mse'])
-        #     for i, n in enumerate(names_s):
-        #         w.writerow([n, f'{single_cos[i]:.6f}', f'{single_euc[i]:.6f}',
-        #                     f'{mse_s[i]:.6f}'])
-        # self.file_or_dir_to_clean.append(csv_path)
-        # print(f"[QAIRTAccuracyDebugger] report saved: {plt_path}, {csv_path}")
+    def draw_network_analysis(self, accuracy: dict, show: bool = True,
+                              dlc_candidates: list[dict] | None = None) -> dict:
+        """基于统一"层精度" dict 渲染 AccuracyGraph（Netron 风格 HTML）。
 
-    def draw_network_analysis(self, names, entire_cos, entire_euc, mse_vals=None,
-                              single_names=None, single_cos=None, single_euc=None,
-                              show: bool = True) -> dict:
-        """基于 entire + single 精度数组渲染 AccuracyGraph（Netron 风格 HTML）。
-
-        内部流程：build_onnx_tensor_graph -> 构造 results（每个节点带 entire/single
-        精度，single 按 sanitized 张量名匹配，缺失层保留 None）-> build_layer_graph ->
-        build_terminal_nodes（输入/输出示意节点）-> AccuracyGraph.render。
+        onnx 图构建 / 层图 / Input·Output 终端全部收敛到 AccuracyGraph.__init__
+        （_parse_accuracy_dict）。QNN 视角默认用 DLC：节点全集 = 量化 DLC 候选层
+        （精度缺失层照画，None）、op_type = DLC 反射类型、连线 = DLC io_tensors；
+        dlc_candidates 未传时自动从 self.target_dlc_path 反射（无该路径则退回
+        ONNX 视角）。
 
         Args:
-            names: 层名列表（sanitized，ONNX 拓扑序，entire 全集）。
-            entire_cos / entire_euc: 整模型（累积）逐层精度数组，与 names 对齐。
-            mse_vals: 可选逐层 MSE。
-            single_names / single_cos / single_euc: 手动逐层（单层）结果；
-                single 缺失的层在 tooltip 显示 n/a，不阻塞渲染。
+            accuracy: 统一层精度 dict（schema 见 LAYER_ACC_KEYS 注释）。
             show: 渲染后是否自动打开浏览器。
+            dlc_candidates: 可选；量化 DLC layer_candidates() 产物。None 时若
+                self.target_dlc_path 存在则自动反射，否则 ONNX 视角。
 
         Returns:
             data: AccuracyGraph 内部数据结构（rows/inputs/outputs）。
         """
-        single_cos_map = dict(zip(single_names, single_cos)) if single_names else {}
-        single_euc_map = dict(zip(single_names, single_euc)) if single_names else {}
-
-        graph = build_onnx_tensor_graph(self.onnx_path, sanitize=True)
-        node_info = graph['node_info']
-
-        results = []
-        for i, name in enumerate(names):
-            raw_stem = str(name)
-            if raw_stem.endswith('.raw'):
-                raw_stem = raw_stem[:-4]
-            tensor = match_tensor(raw_stem, graph)
-            results.append({
-                'golden': str(name), 'infer': None, 'tensor': tensor,
-                'layer_name': graph['tensors'].get(tensor, str(name)) if tensor is not None else str(name),
-                'op_type': node_info.get(tensor)[0] if tensor is not None and tensor in node_info else 'Unknown',
-                'entire_cos': float(entire_cos[i]),
-                'entire_euc': float(entire_euc[i]),
-                'single_cos': single_cos_map.get(str(name)),
-                'single_euc': single_euc_map.get(str(name)),
-                'mse': float(mse_vals[i]) if mse_vals is not None else None,
-            })
-
-        real_rows = [{
-            'layer_name': r['layer_name'], 'op_type': r['op_type'],
-            'entire_cos': r['entire_cos'], 'entire_euc': r['entire_euc'],
-            'single_cos': r['single_cos'], 'single_euc': r['single_euc'],
-        } for r in results]
-
-        children, parents, tensor_layers = build_layer_graph(results, graph)
-
-        (input_rows, output_rows, input_layers, output_layers,
-         aug_children, aug_parents) = build_terminal_nodes(
-            results, children, parents, graph, include_input=True,
-            name_of=lambda k: graph['tensors'].get(k, k),
-        )
-
-        data = {
-            'rows': input_rows + real_rows + output_rows,
-            'inputs': input_layers, 'outputs': output_layers, 'paths': {},
-        }
+        if self.onnx_path is None:
+            raise ValueError("[QAIRTAccuracyDebugger] draw_network_analysis needs onnx_path")
         output_path = self.tmp_dir / 'qnn_graph_accuracy_analysis.html'
-        viz = AccuracyGraph(data=data, children=aug_children, parents=aug_parents,
-                            output_path=output_path, title='QNN Graph Accuracy Analysis')
 
+        if dlc_candidates is None and self.target_dlc_path:
+            try:
+                dlc_candidates = DlcV2EncodingExporter(self.target_dlc_path).layer_candidates()
+            except Exception as exc:
+                print(f"[QAIRTAccuracyDebugger] DLC candidate reflect failed, fallback onnx view: {exc}")
+                dlc_candidates = None
+
+        viz = AccuracyGraph(
+            accuracy,
+            self.onnx_path,
+            output_path,
+            title='QNN Graph Accuracy Analysis',
+            sanitize=True,
+            include_input=True,
+            layer_display=lambda g, k: g['tensors'].get(k, k),
+            dlc_candidates=dlc_candidates,
+        )
         html_path = viz.render(show=show)
         self.file_or_dir_to_clean.append(html_path)
-        return data
+        return viz.data
+
 
 
 def ensure_sdk_pythonpath() -> None:
@@ -1132,10 +1052,7 @@ def ensure_sdk_pythonpath() -> None:
         if entry and entry not in sys.path:
             sys.path.insert(0, entry)
 
-
-
 _CONV_SCRIPT_CACHE = None
-
 
 def _qairt_converter_script() -> str:
     """qairt-converter 脚本绝对路径（去掉 get_tool 的引号包装）。"""
@@ -1399,6 +1316,11 @@ class QnnTruncatedAccuracyAnalysis:
     # 取 4；ctx/feed/net_run 线程池取 8（12 核 x86 实测饱和值，继续加大无增益/变慢）。
     _WORKERS = dict(converter=4, ctx=8, feed=8, net_run=8)
 
+    # 截断边界向上保留的浮点算子层数(类级常量;实验对比可临时覆写,如
+    # cls.N_BACK = 3)。越界/遇分叉时实际保留层数可能 < N_BACK(见
+    # extend_boundary_inputs 的提前停止)。
+    N_BACK = 2
+
     def __init__(self, dbg: QnnAccuracyDebugger, onnx_path):
         """组合持有 QnnAccuracyDebugger；只存属性，不做任何初始化工作。"""
         self.dbg = dbg
@@ -1409,8 +1331,7 @@ class QnnTruncatedAccuracyAnalysis:
     # ------------------------------------------------------------------
 
     def run(self, golden_dlc_path: str, target_dlc_path: str, input_list: str,
-            only_tensor_prefix=None) -> tuple[list[str], np.ndarray,
-                                               np.ndarray, np.ndarray]:
+            only_tensor_prefix=None) -> dict:
         """执行截断单算子逐层分析：整图其余部分浮点、仅目标层量化。
 
         整体失败（抛异常）不自动降级；由调用方（accuracy_analysis）捕获后
@@ -1423,7 +1344,9 @@ class QnnTruncatedAccuracyAnalysis:
             only_tensor_prefix: 只分析张量名以此前缀开头的层（str 或 tuple）。
 
         Returns:
-            (names, single_cos, single_euc, mse)：names 为 sanitized 张量名。
+            统一"层精度" dict：{层名(sanitized): {'single_cos':..,'single_euc':..,
+            'entire_cos':None,'entire_euc':None,'entire_mse':None}}（single 侧有值，
+            entire 侧占位 None；单层分析不产出 single_mse）。
         """
         dbg = self.dbg
         if self.onnx_path is None:
@@ -1646,20 +1569,20 @@ class QnnTruncatedAccuracyAnalysis:
 
         无任何成功层时抛错；成功数/候选总数（total）打印在汇报里。
         """
-        names, cos, euc, mse = [], [], [], []
+        accuracy = {}
         for (info, qm), _il in net_ok:
             r = self._trunc_compare(info, qm, golden, dims_nchw)
             if r is None:
                 continue
-            names.append(r['name'])
-            cos.append(r['cos'])
-            euc.append(r['euc'])
-            mse.append(r['mse'])
-        if not names:
+            accuracy[r['name']] = {
+                'entire_cos': None, 'entire_euc': None, 'entire_mse': None,
+                'single_cos': r['cos'], 'single_euc': r['euc'],
+            }
+        if not accuracy:
             raise RuntimeError("[QAIRTAccuracyDebugger] truncated: no layer succeeded")
         print(f"[QAIRTAccuracyDebugger] single(truncated) succeeded: "
-              f"{len(names)}/{total}")
-        return names, np.asarray(cos), np.asarray(euc), np.asarray(mse)
+              f"{len(accuracy)}/{total}")
+        return accuracy
 
     # ------------------------------------------------------------------
     # 单层内部逻辑：准备 / 布局 / 喂数 / 比对（info 字典见 _trunc_prepare_layer）
@@ -1684,7 +1607,7 @@ class QnnTruncatedAccuracyAnalysis:
         if tensor not in {o for n in graph.node for o in n.output}:
             print(f"[QAIRTAccuracyDebugger] skip (not an onnx output): {tensor}")
             return None
-        acts = self.extend_boundary_inputs(graph, acts0, n_back=2)
+        acts = self.extend_boundary_inputs(graph, acts0, n_back=self.N_BACK)
         cut_onnx = sdir / 'cut.onnx'
         try:
             self.build_cut_onnx(str(self.onnx_path), cut_onnx, acts, tensor)
@@ -2280,7 +2203,7 @@ class AccuracyGraph:
     单层精度与欧氏距离等详细信息。
 
     Attributes:
-        data (dict): read_path_analysis() 的返回结果。
+        data (dict): AccuracyGraph 内部数据结构（rows/inputs/outputs/paths）。
         children (dict[str, list[str]]): 层 -> 下游层列表。
         parents (dict[str, list[str]]): 层 -> 上游层列表。
     """
@@ -2304,7 +2227,7 @@ class AccuracyGraph:
     }
     DEFAULT_COLOR = '#333333'        # Netron 未分类默认色
 
-    # RKNN 算子类型 -> Netron 类别
+    # 算子类型 -> Netron 类别
     OP_CATEGORY: dict[str, str] = {
         'Conv': 'Layer', 'Gemm': 'Layer', 'MatMul': 'Layer',
         'Add': 'Layer', 'Mul': 'Layer', 'Sub': 'Layer', 'Div': 'Layer',
@@ -2317,19 +2240,70 @@ class AccuracyGraph:
         'exNorm': 'Normalization', 'BatchNormalization': 'Normalization',
         'exDataConvert': 'Data', 'Input': 'Data', 'Output': 'Data',
         'exSDPAttention': 'Attention',
+        # ---- QNN (DLC 反射 op_type，见 docs/.../SupportedOps.html) ----
+        # 常用算子：保持精简，按实际模型出现与常见 QNN 算子补齐
+        # ---- QNN (DLC 反射 op_type，见 docs/.../SupportedOps.html) ----
+        # 只列前段(RKNN)未出现的 QNN 算子；同名映射已在上面定义，避免重复键
+        'Conv2d': 'Layer', 'DepthWiseConv2d': 'Layer', 'FullyConnected': 'Layer',
+        'TransposeConv2d': 'Layer',
+        'Eltwise_Binary': 'Layer', 'Eltwise_Or': 'Layer',
+        'Eltwise_And': 'Layer', 'Eltwise_Not': 'Layer',
+        'Prelu': 'Activation', 'ReluMinMax': 'Activation',
+        'Tanh': 'Activation', 'Gelu': 'Activation', 'HardSwish': 'Activation',
+        'ElementWiseNeuron': 'Activation', 'ElementWiseUnary': 'Activation',
+        'Resize': 'Transform',   # QNN Resize (最近邻/双线性上采样)
+        'PoolMax': 'Pool', 'PoolAvg': 'Pool', 'Pooling': 'Pool',
+        'BatchNorm': 'Normalization', 'RmsNorm': 'Normalization',
+        'InstanceNorm': 'Normalization',
     }
 
     def __init__(
         self,
-        data: dict,
-        children: dict[str, list[str]],
-        parents: dict[str, list[str]],
+        accuracy: dict,
+        onnx_path: str | Path,
         output_path: str | Path,
         title: str = 'Accuracy Analysis',
+        *,
+        sanitize: bool = False,
+        include_input: bool = False,
+        layer_display=None,
+        dlc_candidates: list[dict] | None = None,
     ):
-        self.data = data
-        self.children = children
-        self.parents = parents
+        """基于统一"层精度" dict 构建精度网络图（Netron 风格 HTML）。
+
+        onnx 计算图在本构造器内构建一次（_parse_accuracy_dict），不再由
+        RknnAccuracyDebugger / QnnAccuracyDebugger 各自构建（消除重复 load）。
+
+        Args:
+            accuracy: 统一层精度 dict：{层名: {'entire_cos'|'entire_euc'|'entire_mse'|
+                        'single_cos'|'single_euc': float|None, 'op_type': str|None(可选)}}。
+            onnx_path: 用于图结构/拓扑/算子类型推断的 ONNX 模型。
+            output_path: 输出 HTML 路径。
+            title: 图标题（如 'RKNN Graph Accuracy Analysis' / 'QNN ...'）。
+            sanitize: 层名是否为 sanitized（QNN raw 文件名清洗名 -> True；
+                      RKNN 快照名基于原始 ONNX 张量名 -> False）。
+            include_input: 是否追加 Input 示意终端（QNN raw 不含输入层 -> True；
+                           RKNN 快照已含输入层 -> False）。
+            layer_display: (graph, key) -> 节点显示名 的 resolver；graph 为 _parse
+                           内部构建好的 onnx 图（build_onnx_tensor_graph 返回值），
+                           调用方无需自行再 load。None = 恒等（dict 键即显示名，RKNN
+                           用）；QNN 传 lambda g, k: g['tensors'].get(k,k) 把 sanitized
+                           键还原成原始 ONNX 张量名。
+            dlc_candidates: 可选，量化 DLC 反射出的层候选列表（DlcV2EncodingExporter.
+                           layer_candidates() 产物：每项 {tensor, op_type, io_tensors}）。
+                           提供时本图按 **DLC 视角** 构建：
+                           - 节点全集 = 全部候选 op（精度结果没有的层也画，精度 None）；
+                           - 节点 op_type = DLC 反射类型（如 Prelu/Conv2d/Eltwise_Binary）；
+                           - 连线 = 按候选 io_tensors（DLC 实际拓扑，含 converter 融合层）。
+                           None（默认）时维持 ONNX 视角（RKNN / 无 DLC 时用）。
+        """
+        self._accuracy = accuracy or {}
+        self.onnx_path = Path(onnx_path)
+        self._sanitize = sanitize
+        self._include_input = include_input
+        self._layer_display = layer_display
+        self._dlc_candidates = dlc_candidates or None
+
         self.output_path = Path(output_path)
         self.title = title
         self.node_sep = 50.0 # 横向：真实节点之间的间距
@@ -2337,16 +2311,269 @@ class AccuracyGraph:
         self.rank_sep = 50.0 # 纵向：层与层之间的间距
         self.pan_speed:float = 15
 
-        self.rows = data.get('rows', [])
-        self.inputs = data.get('inputs', [])
-        self.outputs = data.get('outputs', [])
-        self.paths = data.get('paths', {})
+        self.rows: list[dict] = []
+        self.inputs: list[str] = []
+        self.outputs: list[str] = []
+        self.paths: dict = {}          # 保留字段（data 视图形状兼容）
+        self.node_order: dict[str, int] = {}
+        self.layer_row: dict[str, dict] = {}
+        self.euc_color_min = 0.0
+        self.euc_color_max = 1.0
+
+        self._parse_accuracy_dict()    # onnx 构建 + rows/终端/层图推导
+
+    # ------------------------------------------------------------------
+    # 内部：由统一 dict 构建 onnx 图 / 层图 / 终端节点
+    # ------------------------------------------------------------------
+
+    def _parse_accuracy_dict(self) -> None:
+        """从统一"层精度" dict 推导本图所需的全部数据（在 __init__ 调用）。
+
+        两种模式（构造器 dlc_candidates 决定）：
+          A) DLC 模式（QNN，dlc_candidates 非 None）：
+             节点全集 = 量化 DLC 的全部层候选（精度结果缺失的层也画，数值 None）；
+             op_type = DLC 反射类型（Prelu/Conv2d/Eltwise_Binary/...，与 encoding 一致）；
+             连线 = 按候选 io_tensors（DLC 实际拓扑，含 converter 融合/自造张量）。
+          B) ONNX 模式（RKNN / 无 DLC）：
+             onnx 计算图构建一次；层全集 = accuracy dict 键；op_type = dict 自带或
+             onnx node_info 回退；连线走 onnx 张量 succ。
+        两种模式最后都产出 rows/children/parents/inputs/outputs 及布局所需字段。
+        """
+        if self._dlc_candidates:
+            self._parse_accuracy_from_dlc()
+        else:
+            self._parse_accuracy_from_onnx()
+
+    def _finish_parse(self, real_rows: list[dict], children: dict, parents: dict,
+                      input_rows: list[dict], output_rows: list[dict],
+                      input_layers: list[str], output_layers: list[str]) -> None:
+        """收尾：组装 self.rows / children / parents / 颜色范围（两模式共用）。"""
+        self.rows = input_rows + real_rows + output_rows
+        self.inputs = input_layers
+        self.outputs = output_layers
+        self.children = children
+        self.parents = parents
+        self.data = {
+            'rows': self.rows,
+            'inputs': self.inputs,
+            'outputs': self.outputs,
+            'paths': self.paths,
+        }
         self.node_order = {r['layer_name']: i for i, r in enumerate(self.rows)}
         self.layer_row = {r['layer_name']: r for r in self.rows}
         euc_values = [r.get('entire_euc') for r in self.rows
                   if r.get('entire_euc') is not None]
         self.euc_color_min = min(euc_values, default=0.0)
         self.euc_color_max = max(euc_values, default=1.0)
+
+    # ------------------------------------------------------------------
+    # B) ONNX 模式（默认）：层全集 = accuracy 键；连线走 onnx 张量 succ
+    # ------------------------------------------------------------------
+
+    def _parse_accuracy_from_onnx(self) -> None:
+        graph = build_onnx_tensor_graph(self.onnx_path, sanitize=self._sanitize)
+        node_info = graph['node_info']
+        # layer_display(graph, key) -> 显示名；None 用恒等（graph 只此一次 load）
+        name_of = ((lambda k: self._layer_display(graph, k))
+                   if self._layer_display is not None else (lambda k: k))
+
+        results = []
+        for name, row in self._accuracy.items():
+            raw_stem = str(name)
+            if raw_stem.endswith('.raw'):
+                raw_stem = raw_stem[:-4]
+            tensor = match_tensor(raw_stem, graph)
+            # op_type：优先 dict 自带（Rknn error_analysis），缺则 onnx node_info 推断
+            op_type = row.get('op_type')
+            if not op_type and tensor is not None and tensor in node_info:
+                op_type = node_info[tensor][0]
+            results.append({
+                'golden': str(name), 'infer': None, 'tensor': tensor,
+                'layer_name': name_of(raw_stem),
+                'op_type': op_type or 'Unknown',
+                'entire_cos': row.get('entire_cos'),
+                'entire_euc': row.get('entire_euc'),
+                'single_cos': row.get('single_cos'),
+                'single_euc': row.get('single_euc'),
+                'mse': row.get('entire_mse'),
+            })
+
+        real_rows = [{
+            'layer_name': r['layer_name'], 'op_type': r['op_type'],
+            'entire_cos': r['entire_cos'], 'entire_euc': r['entire_euc'],
+            'single_cos': r['single_cos'], 'single_euc': r['single_euc'],
+        } for r in results]
+
+        children, parents, tensor_layers = build_layer_graph(results, graph)
+
+        (input_rows, output_rows, input_layers, output_layers,
+         aug_children, aug_parents) = build_terminal_nodes(
+            results, children, parents, graph, include_input=self._include_input,
+            name_of=name_of,
+        )
+
+        self._finish_parse(real_rows, aug_children, aug_parents,
+                           input_rows, output_rows, input_layers, output_layers)
+
+    # ------------------------------------------------------------------
+    # A) DLC 模式（QNN）：节点全集 = DLC 候选层；连线走候选 io_tensors
+    # ------------------------------------------------------------------
+
+    def _parse_accuracy_from_dlc(self) -> None:
+        import re as _re
+        san = lambda x: _re.sub(r'[^A-Za-z0-9_]', '_', x)
+        # onnx 图仍用于模型级输入/输出终端 + 显示名还原（与精度匹配分离）
+        graph = build_onnx_tensor_graph(self.onnx_path, sanitize=self._sanitize)
+        onnx_name_of = graph['tensors']           # sanitized 键 -> 原始 onnx 名
+        name_of = ((lambda k: self._layer_display(graph, k))
+                   if self._layer_display is not None else (lambda k: k))
+
+        cands = self._dlc_candidates
+        # DLC 精度表：以候选张量原始名做键（sanitize 匹配 accuracy dict 的键）
+        acc_by_san = {k: row for k, row in self._accuracy.items()}
+
+        # ---- 1) 层全集 = 全部候选 op（精度缺失层也画，None）----
+        # 注意同一候选输出张量去重；DLC 输出张量 = io_tensors 的最后一项（多数 op）
+        seen_tensor: set[str] = set()
+        nodes: list[dict] = []                     # {name(原始tensor), op_type, acc_row|None}
+        for c in cands:
+            t = c['tensor']
+            if t in seen_tensor:
+                continue
+            seen_tensor.add(t)
+            acc = acc_by_san.get(san(t)) or {}
+            nodes.append({
+                'name': t,
+                'op_type': c['op_type'],
+                'entire_cos': acc.get('entire_cos'),
+                'entire_euc': acc.get('entire_euc'),
+                'single_cos': acc.get('single_cos'),
+                'single_euc': acc.get('single_euc'),
+                'mse': acc.get('entire_mse'),
+            })
+
+        # ---- 2) children/parents：producer(输出张量名) -> 消费它的候选 ----
+        # io_tensors = [输入..., 输出]；输出 = 候选的 'tensor'。
+        # 输入张量名若等于某候选输出 -> 连 producer -> 当前候选。
+        # converter 自造/非候选张量（权重、coeff、Softmax 前的 reshape 等）作为叶子/边界。
+        producer_by_out = {c['tensor']: c['tensor'] for c in cands}
+        children: dict[str, list[str]] = defaultdict(list)
+        parents: dict[str, list[str]] = defaultdict(list)
+
+        for c in cands:
+            cur = c['tensor']
+            if len(c['io_tensors']) > 1:
+                ins = c['io_tensors'][:-1]
+            else:
+                ins = []
+            for i in ins:
+                prod = producer_by_out.get(i)
+                if prod and prod != cur:
+                    children[prod].append(cur)
+                    parents[cur].append(prod)
+        # 去重 + 保持出现顺序
+        for k in children:
+            children[k] = list(dict.fromkeys(children[k]))
+        for k in parents:
+            parents[k] = list(dict.fromkeys(parents[k]))
+
+        # ---- 3) 构造真实行（显示层名 = 原始 DLC 张量名；可带 name_of 还原）----
+        real_rows = []
+        for n in nodes:
+            raw = n['name']
+            display = name_of(raw)
+            real_rows.append({
+                'layer_name': display,
+                'op_type': n['op_type'],
+                'entire_cos': n['entire_cos'],
+                'entire_euc': n['entire_euc'],
+                'single_cos': n['single_cos'],
+                'single_euc': n['single_euc'],
+            })
+
+        # ---- 4) children/parents 的键是原始 tensor 名；真实行 layer_name 可能被
+        #        还原(显示)成不同字符串 -> 需把边键统一到 display 名 ----
+        display_of = {c['tensor']: name_of(c['tensor']) for c in cands}
+        def map_edge(d):
+            out = defaultdict(list)
+            for a, bl in d.items():
+                da = display_of.get(a, a)
+                for b in bl:
+                    db = display_of.get(b, b)
+                    if da != db:
+                        out[da].append(db)
+            return {k: list(dict.fromkeys(v)) for k, v in out.items()}
+        children_disp = map_edge(children)
+        parents_disp = map_edge(parents)
+
+        # ---- 5) Input/Output 终端：模型级输入/输出张量 -> 连到 DLC 节点 ----
+        # 用 onnx graph inputs/outputs（原始名经 sanitize 在 display 域匹配困难，
+        # 直接按原始 tensor 名找出消费它的候选）。
+        def first_consumer(t: str) -> str | None:
+            # 在 parents(原始域)里找以 t 为输入的候选
+            hit = None
+            for c in cands:
+                if t in c['io_tensors'][:-1] if len(c['io_tensors']) > 1 else False:
+                    return display_of.get(c['tensor'], c['tensor'])
+            return hit
+
+        input_rows: list[dict] = []
+        input_layers: list[str] = []
+        output_rows: list[dict] = []
+        output_layers: list[str] = []
+        if self._include_input:
+            # DLC 候选输入里不属于任何候选输出的激活张量 = 图输入(input0)
+            all_ins: set[str] = set()
+            for c in cands:
+                if len(c['io_tensors']) > 1:
+                    all_ins.update(c['io_tensors'][:-1])
+            model_ins = sorted(all_ins - set(producer_by_out))
+            for inp in model_ins:
+                # 排除权重/常量(coeff/weight/bias/onnx:: 等) - 保留 input0 这类
+                if any(k in inp for k in ('weight', 'bias', 'coeff', 'onnx::')):
+                    continue
+                display = inp  # 图输入没有 DLC 节点，直接显示原名
+                input_layers.append(display)
+                input_rows.append({
+                    'layer_name': display, 'op_type': 'Input',
+                    'entire_cos': 1.0, 'entire_euc': 0.0,
+                    'single_cos': 1.0, 'single_euc': 0.0,
+                })
+                # 连到下游第一个消费该输入张量的候选
+                con = first_consumer(inp)
+                if con:
+                    children_disp.setdefault(display, []).append(con)
+                    parents_disp.setdefault(con, []).append(display)
+
+        # 输出终端 = 无人消费的候选输出（图输出，如 output0/1/2）
+        # 注：output0 这类有输入(在 parents)但无下游消费者，故判 children 而非 parents
+        for c in cands:
+            t = c['tensor']
+            if t not in children:   # 无下游消费者 -> 图输出
+                display = display_of.get(t, t)
+                if display in {r['layer_name'] for r in real_rows}:
+                    node_name = f'{display} (out)'
+                else:
+                    node_name = display
+                output_layers.append(node_name)
+                src = [display]
+                output_rows.append({
+                    'layer_name': node_name, 'op_type': 'Output',
+                    'entire_cos': next((r['entire_cos'] for r in real_rows
+                                        if r['layer_name'] == display), None),
+                    'entire_euc': next((r['entire_euc'] for r in real_rows
+                                        if r['layer_name'] == display), None),
+                    'single_cos': next((r['single_cos'] for r in real_rows
+                                        if r['layer_name'] == display), None),
+                    'single_euc': next((r['single_euc'] for r in real_rows
+                                        if r['layer_name'] == display), None),
+                })
+                for s in src:
+                    children_disp.setdefault(s, []).append(node_name)
+                    parents_disp.setdefault(node_name, []).append(s)
+
+        self._finish_parse(real_rows, children_disp, parents_disp,
+                           input_rows, output_rows, input_layers, output_layers)
 
     # ------------------------------------------------------------------
     # 颜色辅助

@@ -179,8 +179,7 @@ class OnnxToRKNN:
             self.self_convert(mean_rgb, std_rgb)
 
         if self.accuracy_analyzer is not None:
-            self.accuracy_analyzer.plot_accuracy_analysis()
-            self.accuracy_analyzer.draw_network_analysis(show=True) # 带路径追踪的精度分析（Netron 风格网络图）
+            self.accuracy_analyzer.render_combined_report() # 带路径追踪的精度分析（Netron 风格网络图）
 
     def clean(self):
         clean_files_or_dirs(self.file_or_dir_to_clean)
