@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 from typing import Callable
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future
 
 import numpy as np
 import cv2
@@ -1078,35 +1078,3 @@ class MultThreadExetutor:
 
         return return_code_list
 
-class MultProcessExetutor:
-    """类级进程池执行器（并行执行 CPU 密集 / 子进程密集任务，fork 语义）。
-
-    API 与 MultThreadExetutor 对齐：set_max_workers / run_exetutor / future_list /
-    wait_and_close。限制：任务函数必须为模块级可 pickle 函数，参数与返回值
-    必须可 pickle（Linux fork 下无需 __main__ guard；spawn 环境需 guard）。
-    """
-    processpool = None
-    max_workers = 8
-    future_list: list[Future] = []
-
-    @classmethod
-    def set_max_workers(cls, max_workers: int = 8):
-        cls.max_workers = max_workers
-
-    @classmethod
-    def run_exetutor(cls, exetutor: Callable, *args, **kwargs):
-        if cls.processpool is None:
-            cls.processpool = ProcessPoolExecutor(max_workers=cls.max_workers)
-            cls.future_list.clear()
-        future = cls.processpool.submit(exetutor, *args, **kwargs)
-        cls.future_list.append(future)
-
-    @classmethod
-    def wait_and_close(cls) -> list:
-        return_code_list: list = []
-        if cls.processpool is not None:
-            cls.processpool.shutdown(wait=True)
-            return_code_list.extend([future.result() for future in cls.future_list])
-        cls.processpool = None
-        cls.max_workers = 8
-        return return_code_list
