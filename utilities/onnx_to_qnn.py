@@ -856,7 +856,9 @@ class OnnxToQNN:
         config_path = self.write_config_file(dlc_model_path)
 
         # 9.
-        self.generate_context_binary_model(quantized_dlc_model_path, config_path)
+        ret = self.generate_context_binary_model(quantized_dlc_model_path, config_path)
+        if not ret:
+            exit(1)
 
         # 10. accuracy_analyze
         if self.accuracy_analyzer is not None and quantized_dlc_model_path is not None:

@@ -3,7 +3,10 @@ import os
 import sys
 import csv
 import json
+import runpy
+import shlex
 import shutil
+import tempfile
 
 from pathlib import Path
 from typing import Callable
@@ -1073,6 +1076,18 @@ class QnnAccuracyDebugger:
         return viz.data
 
 
+# ==========================================================================
+# QNN SDK 工具（模块级）：环境注入 / converter worker / tiny DLC meta 直读
+# --------------------------------------------------------------------------
+# 消费方：
+#   - QnnTruncatedAccuracyAnalysis：converter 进程池 worker、tiny DLC meta 批量直读；
+#   - DlcV2EncodingExporter：QNN_DATATYPE_* -> dtype 字符串（_qnn_dtype_name）；
+#   - CLI：python accuracy_debugger.py encodings|layers|tinydlc|tinydlc-batch。
+# ==========================================================================
+
+# --------------------------------------------------------------------------
+# SDK 环境
+# --------------------------------------------------------------------------
 
 def ensure_sdk_pythonpath() -> None:
     """主进程内使用 qti 前，把 SDK 的 python 目录并入 sys.path。
@@ -1085,22 +1100,32 @@ def ensure_sdk_pythonpath() -> None:
         if entry and entry not in sys.path:
             sys.path.insert(0, entry)
 
-_CONV_SCRIPT_CACHE = None
+
+# --------------------------------------------------------------------------
+# converter：脚本定位 / 命令行 / 进程池 worker
+# --------------------------------------------------------------------------
+
+_CONV_SCRIPT = None          # qairt-converter 脚本绝对路径（进程内缓存一次）
+
 
 def _qairt_converter_script() -> str:
     """qairt-converter 脚本绝对路径（去掉 get_tool 的引号包装）。"""
-    global _CONV_SCRIPT_CACHE
-    if _CONV_SCRIPT_CACHE is None:
+    global _CONV_SCRIPT
+    if _CONV_SCRIPT is None:
         from onnx_to_qnn import QAIRTScript
-        _CONV_SCRIPT_CACHE = QAIRTScript.get_tool('qairt-converter').strip().strip('"')
-    return _CONV_SCRIPT_CACHE
+        _CONV_SCRIPT = QAIRTScript.get_tool('qairt-converter').strip().strip('"')
+    return _CONV_SCRIPT
 
 
 def _conv_argv(cut_onnx: str, out_dlc: str, ov_json: str, layout: str) -> list:
-    import shlex
+    """cut 图 + 单层 overrides -> converter 命令行参数。
+
+    layout 是 "--source_model_input_layout <张量> <NCHW|NHWC> --desired_input_layout
+    ..." 串，用 shlex.split 去引号（与 shell 语义一致）。
+    """
     args = ['--input_network', cut_onnx, '--output_path', out_dlc,
             '--quantization_overrides', ov_json]
-    args += shlex.split(layout)          # 去引号，与 shell 语义一致
+    args += shlex.split(layout)
     args += ['--onnx_skip_simplification']
     return args
 
@@ -1122,8 +1147,6 @@ def _trunc_conv_one(job: tuple) -> tuple:
     sys.argv = argv
     txt = ''
     try:
-        import runpy
-        import tempfile
         with tempfile.TemporaryFile(mode='w+', encoding='utf-8',
                                     errors='replace') as tf:
             saved_out, saved_err = os.dup(1), os.dup(2)
@@ -1150,13 +1173,10 @@ def _trunc_conv_one(job: tuple) -> tuple:
         sys.argv = old_argv
 
 
-# ==========================================================================
-# tiny DLC meta 读取（qti IR 图直读）
 # --------------------------------------------------------------------------
-# 生产路径：QnnTruncatedAccuracyAnalysis._stage_meta -> query_tiny_dlc_batch
-# -> query_tiny_dlc；CLI：python accuracy_debugger.py tinydlc / tinydlc-batch。
-# 每个文件新建 IrDlcReader（复用同一 reader 重复 open 会返回旧图导致串数据）。
-# ==========================================================================
+# tiny DLC meta 直读（qti IR 图）
+# --------------------------------------------------------------------------
+# 每个文件新建 IrDlcReader：复用同一 reader 重复 open 会返回旧图导致串数据。
 
 # QNN_DATATYPE_* -> 'uint8'/'int16'/'float32' 等（编码导出与 tiny meta 共用一份）
 _DTYPE_PATTERNS = (
@@ -1231,6 +1251,13 @@ def _write_tiny_dlc_meta(dlc_path: str) -> str:
     return str(out)
 
 
+
+# ==========================================================================
+# tiny DLC meta 读取（qti IR 图直读）
+# --------------------------------------------------------------------------
+# 生产路径：QnnTruncatedAccuracyAnalysis._stage_meta -> query_tiny_dlc_batch
+# -> query_tiny_dlc；CLI：python accuracy_debugger.py tinydlc / tinydlc-batch。
+# 每个文件新建 IrDlcReader（复用同一 reader 重复 open 会返回旧图导致串数据）。
 # ==========================================================================
 # 量化 DLC 反射器（DlcV2EncodingExporter）：encodings + 层候选 一站式读取。
 # --------------------------------------------------------------------------
@@ -1404,10 +1431,8 @@ class QnnTruncatedAccuracyAnalysis:
     每层流程（run() 只做阶段化编排，各阶段私有方法按调用顺序排在下方）：
       1) golden dump（复用 fp32 全图 --debug 结果，缺则补跑一次，不截断 golden）;
       2) 反射量化 DLC 层候选 + 导出 v2 encodings + 模型输入名/raw 映射 + dims;
-      3) 逐层准备：derive_activation_inputs -> extend_boundary_inputs(N_BACK)
-         -> extend_boundary_inputs_safe（边界安全化，见类常量注释）
-         -> build_cut_onnx（保留目标层前 N_BACK 层浮点上界）+ 单层 overrides；
-         安全化后仍不安全的层直接跳过（宁缺勿假）;
+      3) 逐层准备：subgraph_boundary（目标 DLC op -> 其 ONNX 子图输入边界）
+         -> build_cut_onnx + 单层 overrides；无边界或输出不在 ONNX 图的层跳过;
       4) 阶段A converter（进程池：每进程内复用引擎连续转多片，fd 级静默）;
       5) 阶段B tiny DLC meta（qti 主进程直读，每文件新建 reader）;
       6) 阶段C ctx binary（混合精度 DLC 必须离线编译）;
@@ -1415,34 +1440,31 @@ class QnnTruncatedAccuracyAnalysis:
       8) best-match 比对 vs golden（两种布局取最大 cos，量化输出按编码反量化）。
 
     golden 侧仍是一次 fp32 全图 --debug dump（不截断），供喂数与比对共用。
-    数值与整图半量化 single 一致（RetinaFace 实测 116/118 层，cos 差 <= 1e-5；
-    余 2 层结构上不可截断：DLC 自造张量 / 以该张量为输入的 Softmax）。
+    切图口径对齐官方 snooping（graph_utils.get_common_parent_activations）：
+    目标 DLC op 的子图 = 沿 DLC 图向上回溯到"ONNX 里也存在的张量"作为输入
+    边界，因此 converter 融合进该 op 的算子集合被完整包含（例：头部
+    Conv+Transpose 融成 1 个 Conv2d），重新转换后算子结构与量化编码一致。
     """
 
     # 各阶段并发 worker 数。converter 走进程池（每进程内连转多片，引擎复用），
     # 取 4；ctx/feed/net_run 线程池取 8（12 核 x86 实测饱和值，继续加大无增益/变慢）。
     _WORKERS = dict(converter=4, ctx=8, feed=8, net_run=8)
 
-    # 截断边界向上保留的浮点算子层数(类级常量;实验对比可临时覆写,如
-    # cls.N_BACK = 3)。越界/遇分叉时实际保留层数可能 < N_BACK(见
-    # extend_boundary_inputs 的提前停止)。边界安全化会按需再向上扩，故
-    # N_BACK=1/2/3 的成功层数一致（实测均 116/118）。
-    N_BACK = 2
-
-    # 边界安全化（boundary safety）：边界张量若被"非目标"的 shape 算子直接
-    # 消费，converter 会把它当规范 NCHW 再按 NHWC 约定置换一次 dims，后续
-    # Reshape/Transpose 的展平顺序与整图不一致 -> 数值静默错位。
-    # 实测（RetinaFace 118 层）：N_BACK=1 时 output0/output2 cos 0.1118/0.0297
-    # （流水线"成功"但值错），N_BACK=2 时同两层 feed 失败；安全扩展后 1/2/3
-    # 三档均 116/118 且两层 cos 0.999915/0.999906（与 N_BACK=3 基线一致）。
-    _BOUNDARY_SHAPE_OPS = ('Reshape', 'Transpose', 'Flatten', 'Squeeze',
-                           'Unsqueeze', 'Expand', 'Slice', 'Gather', 'Split')
-    MAX_BOUNDARY_EXTEND = 6   # 安全扩展上限（防极端图无限向上扩）
+    # 布局不规范的产出算子：其输出的张量若被当作 cut 图输入，converter 的布局
+    # 推断会二次置换（详见 subgraph_boundary 注释），故不能作为子图边界。
+    _NONCANONICAL_PRODUCERS = ('Reshape', 'Transpose', 'Flatten', 'Squeeze',
+                               'Unsqueeze', 'Slice', 'Gather', 'Split', 'Expand')
 
     def __init__(self, dbg: QnnAccuracyDebugger, onnx_path):
-        """组合持有 QnnAccuracyDebugger；只存属性，不做任何初始化工作。"""
+        """组合持有 QnnAccuracyDebugger；只存属性，不做任何初始化工作。
+
+        _dlc_ops / _onnx_acts / _onnx_model 在 _collect_run_context 中填充。
+        """
         self.dbg = dbg
         self.onnx_path = Path(onnx_path) if onnx_path else None
+        self._dlc_ops: dict[str, dict] = {}   # DLC 张量 -> {'inputs': [...], 'op_type': ...}
+        self._onnx_acts: set[str] = set()     # ONNX 节点输出 ∪ 图输入（不含 initializer）
+        self._onnx_model = None               # onnx.ModelProto（整轮只 load 一次）
 
     # ------------------------------------------------------------------
     # 入口：run() —— 阶段化编排（每个阶段委托一个私有方法）
@@ -1510,8 +1532,18 @@ class QnnTruncatedAccuracyAnalysis:
         模型输入名取 ONNX graph.input 顺序（与 prepare_input_data 写 raw 的
         顺序一致）；input_list 第一个样本的 raw 路径按序对应每个输入，
         多输入模型每个输入各一条，不写死 input0。
+
+        同时构建子图映射所需的两张表（官方口径，见 subgraph_boundary）：
+          _dlc_ops  : 全部 DLC 候选（不过滤）-> 输出张量: {inputs, op_type}
+          _onnx_acts: ONNX 节点输出 ∪ 图输入（initializer 除外）
         """
-        layers = self.extract_layer_candidates(target_dlc_path)
+        candidates = self.extract_layer_candidates(target_dlc_path)
+        self._dlc_ops = {}
+        for c in candidates:
+            self._dlc_ops.setdefault(c['tensor'], {
+                'inputs': c['io_tensors'][:-1], 'op_type': c['op_type']})
+
+        layers = candidates
         if only_tensor_prefix:
             layers = [c for c in layers if c['tensor'].startswith(only_tensor_prefix)]
         layers = [c for c in layers if self._sanitize_name(c['tensor']) in golden]
@@ -1520,7 +1552,22 @@ class QnnTruncatedAccuracyAnalysis:
         v2_encodings_path = self.extract_dlc_encoding(target_dlc_path)
 
         full_m = onnx.load(str(self.onnx_path))
+        self._onnx_model = full_m
+        self._onnx_acts = ({o for n in full_m.graph.node for o in n.output}
+                           | {i.name for i in full_m.graph.input})
         self._model_input_names = [i.name for i in full_m.graph.input]
+        self._model_inputs = set(self._model_input_names)
+        self._onnx_producer: dict[str, str] = {}     # 张量 -> 产出它的 ONNX 算子类型
+        self._onnx_inputs: dict[str, list] = {}      # 张量 -> 该 ONNX 算子的输入
+        self._onnx_rank: dict[str, int] = {}         # 张量 -> 维数（有 shape 信息时）
+        for n in full_m.graph.node:
+            for o in n.output:
+                self._onnx_producer[o] = n.op_type
+                self._onnx_inputs[o] = list(n.input)
+        for v in (list(full_m.graph.value_info) + list(full_m.graph.input)
+                  + list(full_m.graph.output)):
+            if v.type.tensor_type.HasField('shape'):
+                self._onnx_rank[v.name] = len(v.type.tensor_type.shape.dim)
         with open(input_list, 'r', encoding='utf-8') as f:
             first_line = f.readline().strip()
         tokens = first_line.split()
@@ -1538,7 +1585,7 @@ class QnnTruncatedAccuracyAnalysis:
 
         绝对路径嵌张量名会超 ~260 字符（深层长名层 qnn-net-run 写文件失败
         rc17），目录只放序号（与手动 layerwise 的 out/<NNN> 同一先例）。
-        不可截断的层（无激活输入 / 输出不在 ONNX 图中）在 _prepare_layer
+        不可截断的层（输出不在 ONNX 图 / 子图无输入边界）在 _trunc_prepare_layer
         内跳过；全部失败时直接抛错（不让后续阶段空转）。
         """
         dbg = self.dbg
@@ -1680,38 +1727,62 @@ class QnnTruncatedAccuracyAnalysis:
     # 单层内部逻辑：准备 / 布局 / 喂数 / 比对（info 字典见 _trunc_prepare_layer）
     # ------------------------------------------------------------------
 
+    def subgraph_boundary(self, target_tensor: str) -> list:
+        """目标 DLC op 的 ONNX 子图输入边界（官方 snooping 口径 + 布局规范约束）。
+
+        官方口径：从目标 DLC op 的输入张量出发，张量只要在 ONNX 图里存在就是
+        边界；仍是 DLC 内部张量（converter 融合/自造）则沿 DLC 图继续向上。
+        因此切出的 ONNX 子图 = 被融合进该 DLC op 的算子集合（例：头部
+        Conv+Transpose 融成 1 个 Conv2d），重新转换后算子结构与整图一致。
+
+        额外约束（实测）：边界张量必须是"布局规范"的——产出它的 ONNX 算子不能
+        是 Reshape/Transpose 等 shape 算子，且维数应为 4（模型输入除外）。否则
+        cut 图把这些张量声明成 NCHW->NHWC 输入时，converter 会二次置换布局：
+        - shape 算子产出（如 Transpose 输出）→ Reshape 展平顺序错乱（静默错值）；
+        - 3D 张量喂 Concat/Softmax → layout_inferer 直接 IndexError（转换失败）。
+        不满足就继续沿 DLC 链（优先）或 ONNX 产出链向上找规范张量。
+
+        Returns: 边界张量名列表（去重）；空 = 该层无可用子图（跳过）。
+        """
+        boundary: list[str] = []
+        seen: set[str] = set()
+        stack = list(self._dlc_ops.get(target_tensor, {}).get('inputs', []))
+        while stack:
+            t = stack.pop()
+            if t in seen:
+                continue
+            seen.add(t)
+            prod = self._onnx_producer.get(t)
+            rank = self._onnx_rank.get(t)
+            if t in self._model_inputs or (prod is not None
+                                           and prod not in self._NONCANONICAL_PRODUCERS
+                                           and (rank is None or rank == 4)):
+                boundary.append(t)
+            elif t in self._dlc_ops:                     # DLC 自造/融合中间张量
+                stack.extend(self._dlc_ops[t]['inputs'])
+            elif prod is not None:                       # 非规范 ONNX 中间张量
+                stack.extend(self._onnx_inputs.get(t, []))
+            # else: 权重/常量等，不构成边界
+        return boundary
+
     def _trunc_prepare_layer(self, sdir: Path, layer: dict, v2_encodings_path: str,
                              dims_nchw: dict) -> dict | None:
-        """单层准备：切 ONNX（保留前 N_BACK 层浮点上界 + 边界安全化）+
-        生成单层 override json。
+        """单层准备：按 DLC-op -> ONNX 子图映射切 cut ONNX + 生成单层 overrides。
 
-        不可截断（无激活输入 / 输出不在 ONNX 图中 / 边界仍不安全）返回 None。
+        不可截断（输出不在 ONNX 图 / 子图无输入边界）返回 None。
         """
         tensor = layer['tensor']
-        try:
-            graph = onnx.load(str(self.onnx_path)).graph
-        except Exception as exc:
-            print(f"[QAIRTAccuracyDebugger] onnx load failed ({exc})")
+        if tensor not in self._onnx_acts:
+            print(f"[QAIRTAccuracyDebugger] skip (not an onnx tensor): {tensor}")
             return None
-        acts0 = self.derive_activation_inputs(graph, layer)
-        if not acts0:
-            print(f"[QAIRTAccuracyDebugger] skip (no activation input): {tensor}")
-            return None
-        if tensor not in {o for n in graph.node for o in n.output}:
-            print(f"[QAIRTAccuracyDebugger] skip (not an onnx output): {tensor}")
-            return None
-        acts = self.extend_boundary_inputs(graph, acts0, n_back=self.N_BACK)
-        acts = self.extend_boundary_inputs_safe(graph, acts, tensor)
-        unsafe = self.boundary_unsafe_inputs(graph, acts, tensor)
-        if unsafe:
-            # 兜底（宁缺勿假）：无法再向上扩（已到图输入/分叉）时跳过该层，
-            # 避免边界布局二次置换导致的静默错值进入 CSV。
-            print(f"[QAIRTAccuracyDebugger] skip (unsafe boundary, cannot extend): "
-                  f"{tensor} <- {unsafe}")
+        acts = self.subgraph_boundary(tensor)
+        if not acts:
+            print(f"[QAIRTAccuracyDebugger] skip (no onnx subgraph input): {tensor}")
             return None
         cut_onnx = sdir / 'cut.onnx'
         try:
-            self.build_cut_onnx(str(self.onnx_path), cut_onnx, acts, tensor)
+            self.build_cut_onnx(str(self.onnx_path), cut_onnx, acts, tensor,
+                                model=self._onnx_model)
         except Exception as exc:
             print(f"[QAIRTAccuracyDebugger] cut failed for {tensor}: {type(exc).__name__}")
             return None
@@ -2041,100 +2112,13 @@ class QnnTruncatedAccuracyAnalysis:
         return None
 
     @staticmethod
-    def derive_activation_inputs(graph, candidate: dict) -> list:
-        """DLC 候选 io_tensors -> 该算子 ONNX 侧的激活输入张量名。"""
-        init = {i.name for i in graph.initializer}
-        known = (init | {i.name for i in graph.input} | {o.name for o in graph.output}
-                 | {v.name for v in graph.value_info}
-                 | {o for n in graph.node for o in n.output})
-        acts = []
-        for t in candidate['io_tensors'][:-1]:          # 去掉算子输出（最后一个）
-            if t in init:                                # 权重/偏置 initializer
-                continue
-            if t not in known:                           # DLC-only（converter 生成）
-                continue
-            acts.append(t)
-        return acts
-
-    @staticmethod
-    def extend_boundary_inputs(graph, start_inputs: list, n_back: int = 2) -> list:
-        """把截断边界再往上游扩 n_back 层算子（这些层保持浮点，使目标层量化
-        输入由图内 float->int 边界产生——与可用的整图半量化结构一致）。"""
-        producer = {}
-        for n in graph.node:
-            for o in n.output:
-                producer[o] = n
-        graph_in = {i.name for i in graph.input}
-        init = {i.name for i in graph.initializer}
-
-        def act_inputs_of(node):
-            return [i for i in node.input
-                    if i and i not in init and (i in producer or i in graph_in)]
-
-        cur = list(dict.fromkeys(start_inputs))
-        for _ in range(n_back):
-            nxt = []
-            changed = False
-            for t in cur:
-                node = producer.get(t)
-                if node is None:
-                    nxt.append(t)
-                    continue
-                ai = act_inputs_of(node)
-                if len(node.output) == 1 and len(ai) == 1 and ai[0] not in cur:
-                    nxt.append(ai[0])
-                    changed = True
-                else:
-                    nxt.append(t)
-            if not changed:
-                break
-            cur = list(dict.fromkeys(nxt))
-        return cur
-
-    @staticmethod
-    def boundary_unsafe_inputs(graph, act_inputs: list, target_tensor: str) -> list:
-        """返回边界中"被非目标 shape 算子直接消费"的张量名（空 = 安全）。
-
-        目标算子自身是 shape 算子时不算不安全：小图从目标算子开始，其输入
-        顺序与整图一致（实测 N_BACK=2 的 9 个 Reshape 层数值正确）。
-        """
-        shape_ops = QnnTruncatedAccuracyAnalysis._BOUNDARY_SHAPE_OPS
-        consumers = {}
-        for n in graph.node:
-            for i in n.input:
-                consumers.setdefault(i, []).append(n)
-        return [a for a in act_inputs
-                for c in consumers.get(a, [])
-                if target_tensor not in c.output and c.op_type in shape_ops]
-
-    @staticmethod
-    def extend_boundary_inputs_safe(graph, act_inputs: list, target_tensor: str,
-                                    max_extra: int = None) -> list:
-        """边界安全化：边界张量不得被"非目标"的 shape 算子直接消费。
-
-        命中时继续向上游扩一层（复用 extend_boundary_inputs 的单步语义），
-        直到边界进入点是 Conv/Pool 等布局规范算子或目标算子本身；无法再扩
-        （已到图输入/分叉）时原样返回，由 boundary_unsafe_inputs 兜底。
-        """
-        if max_extra is None:
-            max_extra = QnnTruncatedAccuracyAnalysis.MAX_BOUNDARY_EXTEND
-        acts = list(act_inputs)
-        for _ in range(max_extra):
-            if not QnnTruncatedAccuracyAnalysis.boundary_unsafe_inputs(
-                    graph, acts, target_tensor):
-                break
-            nxt = QnnTruncatedAccuracyAnalysis.extend_boundary_inputs(
-                graph, acts, n_back=1)
-            if nxt == acts:
-                break
-            acts = nxt
-        return acts
-
-    @staticmethod
     def build_cut_onnx(onnx_path: str, out_onnx: Path, act_inputs: list,
-                       out_tensor: str) -> None:
-        """从完整 ONNX 切出 [act_inputs -> out_tensor] 子图（张量名保留）。"""
-        m = onnx.load(onnx_path)
+                       out_tensor: str, model=None) -> None:
+        """从完整 ONNX 切出 [act_inputs -> out_tensor] 子图（张量名保留）。
+
+        model 可传入已加载的 onnx.ModelProto（逐层切图时避免重复 load 大模型）。
+        """
+        m = model if model is not None else onnx.load(onnx_path)
         g = m.graph
         init_names = {i.name for i in g.initializer}
 
@@ -2265,8 +2249,8 @@ class AccuracyGraph:
         # 只列前段(RKNN)未出现的 QNN 算子；同名映射已在上面定义，避免重复键
         'Conv2d': 'Layer', 'DepthWiseConv2d': 'Layer', 'FullyConnected': 'Layer',
         'TransposeConv2d': 'Layer',
-        'Eltwise_Binary': 'Layer', 'Eltwise_Or': 'Layer',
-        'Eltwise_And': 'Layer', 'Eltwise_Not': 'Layer',
+        'Eltwise_Binary': 'Activation', 'Eltwise_Or': 'Activation',
+        'Eltwise_And': 'Activation', 'Eltwise_Not': 'Activation',
         'Prelu': 'Activation', 'ReluMinMax': 'Activation',
         'Tanh': 'Activation', 'Gelu': 'Activation', 'HardSwish': 'Activation',
         'ElementWiseNeuron': 'Activation', 'ElementWiseUnary': 'Activation',
@@ -2274,6 +2258,7 @@ class AccuracyGraph:
         'PoolMax': 'Pool', 'PoolAvg': 'Pool', 'Pooling': 'Pool',
         'BatchNorm': 'Normalization', 'RmsNorm': 'Normalization',
         'InstanceNorm': 'Normalization',
+        "StridedSlice": "Tensor",
     }
 
     def __init__(
