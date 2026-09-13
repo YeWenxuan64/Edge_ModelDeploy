@@ -1,0 +1,36 @@
+pyyaml
+yacs
+
+psutil>=5.9.0
+ruamel.yaml>=0.17.21
+tqdm>=4.64.1
+fast-histogram>=0.11
+
+numpy<2.0
+scipy
+matplotlib
+
+
+onnxruntime==1.20
+onnx==1.17.0
+onnxslim
+
+opencv-python>=4.5.5
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.4.1+cpu
+torchvision==0.19.1+cpu
+timm
+
+tensorflow-cpu==2.16.0rc0
+tf-keras==2.16.0rc0
+tensorboardx
+tf2onnx
+
+
+
+protobuf<=4.25.4
+easydict
+# ml_dtypes>0.5
+
+# aimet-onnx

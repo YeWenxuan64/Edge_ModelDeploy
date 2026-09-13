@@ -179,20 +179,22 @@ converter.set_quantization_method(
 # )
 
 # 可选：混合精度量化（部分敏感子图使用更高精度，其余仍按全局设置量化为 INT8）
+# 用户只需给「层范围 + 精度」，scale/offset/bias 由 qairt-quantizer 按注入的精度校准补齐。
 # 两种模式（二选一）：
 # 1) 整数混合量化：指定区域内的位宽 'w<W>a<A>'
 #    e.g. 全局 w8a8、区域内 w8a16（权重 8bit，激活 16bit）
 # converter.do_hybrid_quantization(
-#     custom_hybrid=[['子图输入张量名', '子图输出张量名']],
-#     bitwidth='w8a16',     # 区域内位宽: 'w4a8' / 'w4a16' / 'w8a8' / 'w8a16' / 'w16a16'
-#     bias_bitwidth=8       # 区域内偏置位宽: 8 / 32
+#     custom_hybrid=[['子图输入张量名', '子图输出张量名']],  # [[X, X]] 表示只选该节点
+#     bitwidth='w8a16',     # 区域精度: 'w8a8' / 'w8a16' / 'w16a16'（后者需 dsp>=v73）
 # )
-# 2) 浮点保留：指定区域内保持 FP16 / FP32 浮点精度（此时忽略 bitwidth / bias_bitwidth）
+# 2) 浮点保留：指定区域内保持 FP16 / FP32 浮点精度（此时忽略 bitwidth）
 # converter.do_hybrid_quantization(
 #     custom_hybrid=[['子图输入张量名', '子图输出张量名']],
 #     float_bitwidth=16     # 16 = FP16 / 32 = FP32
 # )
 # 注：custom_hybrid 支持同时指定多个子图；边界可以是张量名，也可以是节点名（自动取该节点的输出张量）
+# 注：w8a16 / 浮点只需校准数据集；w16a16 会用同一份校准数据先跑一遍全图 16/16 参考校准，
+#     详见 [3.4 混合量化](#34-混合量化)
 
 # 可选：精度分析（放置模型输入节点所对应的图片）
 # converter.set_do_accuracy_analysis(
@@ -325,18 +327,33 @@ converter.convert(
 
 ```python
 converter.do_hybrid_quantization(
-    custom_hybrid=[[in1, out1]],   # 子图边界
-    bitwidth="w8a16",              # 区域内 w/a 位宽
-    bias_bitwidth=8,               # 区域内 bias 位宽（8/32）
+    custom_hybrid=[[in1, out1]],   # 子图边界；[[X, X]] 表示单层
+    bitwidth="w8a16",              # 区域激活位宽：w8a8 / w8a16
     float_bitwidth=None,           # 16/32 表示区域保持 FP16/FP32
 )
 ```
 
 两种模式（二选一）：
-1. **整数混合量化**（默认）：`bitwidth` + `bias_bitwidth` 指定区域内权重/激活/偏置位宽。例：全局 `w8a8`、区域 `w8a16`。
-2. **浮点保留**：设置 `float_bitwidth`（16=FP16 / 32=FP32），区域保持浮点，忽略整数位宽参数。
+1. **整数混合量化**（默认）：`bitwidth` 指定区域精度。
+   - `w8a16`（**推荐**）：区域激活 16bit，权重沿用全局 int8（全局默认 `w8a8`）；dsp v68 起可用。
+   - `w16a16`：区域激活+权重都 16bit（int16 权重，`sFxp_16`）。**需要 dsp_arch ≥ v73**（qcs8550/qcs9075），且只支持 Conv2d/DepthConv2d/TransposeConv2D/FullyConnected/Matmul/Batchnorm/LayerNorm；A16W16 要求**权重对称**，内部会用 `--restrict_quantization_steps "-0x8000 0x7F7F"`（Hexagon int16 权重范围限制）。
+   - 区域只接受「层范围 + 精度」：对称性/scale/offset **无需也无法指定**——w16a16 内部固定权重 symmetric；w8a16 的权重与 bias 编码完全交给量化器按注入的激活精度校准（`bias_scale = weight_scale × activation_scale`）。
+2. **浮点保留**：设置 `float_bitwidth`（16=FP16 / 32=FP32），区域整体浮点。
+   - FP16 需要目标 SoC 支持 HTP float16 math（文档：*"on select Qualcomm SoCs"*）；实测 qcs6490(v68) 不支持，qcs8550(v73) 可用。
+   - 浮点区域只注入激活为 float，权重/bias 由 converter 的"三件套一致"规则自动跟随为 float。
 
-内部由 `QnnHybridQuantGen` 生成 `quantization_overrides.json` 交给 `qairt-quantizer`，子图边界会自动插入 Convert 节点。
+**实现方式**（`QnnHybridQuantGen`）：生成 `quantization_overrides`（0.6.1 schema），沿用 QAIRT 原有两步流程：
+
+1. `qairt-converter --quantization_overrides <overrides>` → **全浮点 DLC**（overrides 随 DLC 作为量化元数据携带；此时没给校准数据，模型本身仍是浮点）；
+2. `qairt-quantizer --input_list <校准数据>`（全局位宽，如 w8a8）识别 DLC 里已注入的编码：目标层按注入位宽，其余张量按全局位宽校准补齐 → 混合精度 DLC；
+3. 之后照常写 config / 生成 context binary。
+
+注入内容按精度分两种：
+- **w8a16 / 浮点：只注入激活**（只写位宽/类型）。bias(32bit 定点) 的 scale = weight_scale × activation_scale、PReLU coeff 等激活域参数、以及权重的 per-channel 量化，都由量化器按注入精度重算，天然自洽。
+- **w16a16：注入目标 op 的激活 + 完整 per-channel 权重编码**。16bit 权重的 `min/max/scale`（对称、offset = 0/-2^15）只能来自真实校准，所以 `QnnHybridQuantGen` 内部先用自带的 `quantize_model()` 在**干净浮点 DLC** 上跑一遍全图 16/16 校准（带 `--restrict_quantization_steps "-0x8000 0x7F7F"`），再取目标 op 的编码合并进 overrides；这些中间产物会随 `clean()` 一起清理。
+
+> **不要手写只带位宽的权重/bias 注入**：量化器会认为该参数"已给定"而跳过校准——权重丢掉 per-channel（8 条塌成 1 条）、bias 偏约 2^Δbw 倍（实测 w8a16 下 bias scale 从 2.9e-08 变成 4.1e-10），精度直接崩掉。条目数还决定粒度：1 条 = per-tensor，N 条 = per-channel，per-channel 必须对称且带 offset，只写位宽会被 converter 拒绝（"Axis quantization is required to be symmetric..."）。
+> **开销**：仅 `w16a16` 会多跑一次全图 16/16 校准（≈ 一次 `qairt-quantizer`），w8a16/浮点没有额外开销。
 
 **RKNN（`OnnxToRKNN`）：**
 
@@ -353,10 +370,11 @@ converter.do_hybrid_quantization(
 
 | 项目 | QNN | RKNN |
 |------|-----|------|
-| 区域精度 | 可配整数位宽或 FP16/FP32 | 固定 FP16 |
-| 额外参数 | `bitwidth` / `bias_bitwidth` / `float_bitwidth` | 无 |
+| 区域精度 | w8a8 / w8a16 / w16a16（整数）或 FP16/FP32 | 固定 FP16 |
+| 额外参数 | `bitwidth` / `float_bitwidth` | 无 |
+| 平台约束 | w16a16 需 dsp_arch ≥ v73；FP16 需 SoC 支持 | 无 |
 | 子图外 | 全局设置（默认 w8a8） | 8-bit |
-| 底层机制 | quantization_overrides.json | hybrid_quantization_step1/2 |
+| 底层机制 | overrides（w8a16 只含激活；w16a16 内部先跑 16/16 校准再合并权重）→ 浮点 DLC → `qairt-quantizer` 补齐 | hybrid_quantization_step1/2 |
 
 ---
 

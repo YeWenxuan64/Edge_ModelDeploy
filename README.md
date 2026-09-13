@@ -120,24 +120,23 @@ sudo apt install python3-pip python3-venv python3-tk
 
 ```bash
 # 严格按此顺序执行（逐条！）
-pip install -r requirements_base.txt
-pip install -r requirements_torch_cpu.txt
-pip install -r requirements_tensorflow.txt
+pip install -r requirements_cpu.txt
 pip install -r requirements_overwrite.txt
-pip install rknn-toolkit2 --no-deps
+pip install rknn-toolkit2 --no-deps # Rockchip RKNN 工具（可选）
+pip install aimet-onnx # Qualcomm AIMET 量化工具（可选）
 ```
 
-> ⚠️ **安装顺序至关重要**，请严格按以下顺序逐条执行，**不要合并为一条命令**，**不要加 `--upgrade` 标志**：
+> ⚠️ **安装顺序至关重要**，请严格按以下顺序逐条执行，**不要加 `--upgrade` 标志**：
 >
 > | 步骤 | 命令 | 说明 |
 > |------|------|------|
-> | 1. | `pip install -r requirements_base.txt` | 基础依赖（numpy, opencv-python 等） |
-> | 2. | `pip install -r requirements_torch_cpu.txt` | PyTorch **CPU 版**。也可以自行安装普通 GPU 版，但 GPU 版体积会稍微**膨胀**，且 Linux 下会强制安装体积巨大的 Nvidia 驱动 |
-> | 3. | `pip install -r requirements_tensorflow.txt` | TensorFlow **CPU 版**（与 PyTorch 有共同依赖，需在 base 之后安装） |
+> | 1. | `pip install -r requirements_cpu.txt` | 基础依赖与 PyTorch TensorFlow **CPU 版** |
 > | 4. | `pip install -r requirements_overwrite.txt` | **包版本覆盖** — 将某些包降级/锁定到兼容版本（必须在最后装！） |
 > | 5. | `pip install rknn-toolkit2 --no-deps` | Rockchip RKNN 工具（可选）（`--no-deps` 避免上游依赖冲突） |
+> | 6. | `pip install aimet-onnx` | Qualcomm AIMET 量化工具（可选） |
 >
 > **为什么顺序重要？** 核心原因是 **`protobuf`** 和 **`easydict`** 等包在 TensorFlow 与 PyTorch 不同版本间存在冲突 — 先装 A 框架拉高版本，再装 B 框架时可能不兼容。`requirements_overwrite.txt` 会在最后统一锁定兼容版本。此外 **RKNN / QNN 框架对 TensorFlow 和 PyTorch 的版本要求极其严苛**，混装极易踩坑，分步安装可以精确控制每一层的依赖版本。
+> **为什么建议安装CPU版的神经网络框架** GPU 版体积会稍微**膨胀**，且 Linux 下会强制安装体积巨大的 Nvidia 驱动
 
 #### QNN 依赖
 
@@ -308,6 +307,7 @@ python yolo26_onnx2qnn.py
 - [x] **QNN 混合量化** — 由于小女子太笨了，不会树和图数据结构，不会遍历计算图的特定节点来指定混合量化
     - 支持 `QAIRT` 原生的混合精度量化：可对**指定子图**使用 16-bit 整数量化（如 w16a16）或保留 FP16/FP32 浮点精度，其余部分仍按全局设置（默认 w8a8）量化为 INT8
     - 🛠️ 测试性支持（完成于 2026-08-12）
+    - 🛠️ 重构于 2026-09-12
 
 - [x] **QNN 高级量化（AIMET）** — 由于小女子太笨了，尚未接入 `AIMET (AI Model Efficiency Toolkit)` 的更高级量化方法
     - 支持基于 `AIMET (AI Model Efficiency Toolkit)` 的 **PQT** 量化方法，可作为独立的 QNNX 量化器或 QNN 的外置量化器使用
