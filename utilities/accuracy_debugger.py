@@ -6,6 +6,7 @@ import json
 import runpy
 import shlex
 import shutil
+import subprocess
 import tempfile
 
 from pathlib import Path
@@ -626,10 +627,14 @@ class QnnAccuracyDebugger:
       2) 按张量名匹配，手动计算 cosine / 绝对欧氏距离 ||x-y||2 / mse；
       3) 渲染 AccuracyGraph（HTML，cos+euc 双着色）+ plot_accuracy_summary（PNG）+ CSV。
 
-    backend 选择（x86 实测结论）：
-      - FP32 DLC -> CPU 后端（libQnnCpu.so；HTP 要求量化模型）
-      - 量化 DLC -> HTP 后端（libQnnHtp.so；CPU 后端拒绝量化/16bit 激活中间层）
+    backend 选择（实测）：
+      - Linux：FP32 -> CPU 后端，量化 -> HTP 后端（CPU 拒绝量化/16bit 图）；
+      - Windows x86：两侧都 QnnCpu.dll（无 HTP 执行环境），故 single 不可用；
+      - Windows ARM64：推理侧切原生 ARM64（见 _prepare_native_net_run）。
     """
+
+    # WoA 上推理侧（net-run / ctx-gen）用的 SDK 子目录；转换侧仍是 x86 工具
+    WIN_ARM64_ARCH = 'aarch64-windows-msvc'
 
     def __init__(self, tmp_dir:str, onnx_path:str=None, debugger_picture_list:list=None):
         self.tmp_dir = Path(tmp_dir).resolve()
@@ -647,6 +652,8 @@ class QnnAccuracyDebugger:
         else:
             self.backend_lib_golden = "libQnnCpu.so"
             self.backend_lib_target = "libQnnHtp.so"
+
+        self.native_net_run: bool = False   # 推理侧是否已切原生 ARM64
 
         self.onnx_info: dict = {}
         self.set_input_order:str = 'nhwc'
@@ -710,6 +717,41 @@ class QnnAccuracyDebugger:
         print(f"[QAIRTAccuracyDebugger] input_list: {input_list}")
         return str(input_list)
 
+
+    def _prepare_native_net_run(self):
+        """WoA 上把推理侧切到原生 ARM64，其它平台原样返回。
+
+        只切推理侧：converter/quantizer 只有 x86 版；而 16bit/fp16 的 DLC 在 x86 的
+        qnn-net-run 上会卡死在 "Executing Graphs"，原生 ARM64 才能驱动 HTP。
+        裸名工具按 PATH 决定架构，故只需前置 ARM64 的 bin/lib，另加 skel 搜索路径
+        （ADSP_LIBRARY_PATH，缺了 DSP 打不开 session）。skel 按全部版本拼接：DLC 的
+        编译目标与真机架构可以不一致，而它是搜索路径列表、名字自带版本号不冲突。
+        """
+        from onnx_to_qnn import QAIRTScript     # 惰性导入：见 QnnSdkTools.converter_script
+        if not QAIRTScript.is_windows_arm64():
+            return
+
+        sdk_root = os.environ.get('QAIRT_SDK_ROOT')
+        sdk = Path(sdk_root) if sdk_root else None
+        bin_dir = sdk / 'bin' / self.WIN_ARM64_ARCH if sdk else None
+        lib_dir = sdk / 'lib' / self.WIN_ARM64_ARCH if sdk else None
+        if not (bin_dir and bin_dir.is_dir() and lib_dir.is_dir()):
+            print(f"[QnnAccuracyDebugger] Windows ARM64 host but the SDK has no "
+                  f"{self.WIN_ARM64_ARCH}; keeping the x86 net-run environment")
+            return
+
+        os.environ['Path'] = os.pathsep.join(
+            [str(bin_dir), str(lib_dir), os.environ.get('Path', '')])
+
+        skel_dirs = sorted((sdk / 'lib').glob('hexagon-v*/unsigned'))
+        if skel_dirs:
+            os.environ['ADSP_LIBRARY_PATH'] = os.pathsep.join(str(d) for d in skel_dirs)
+
+        # 量化侧走 HTP（与 Linux 同策略）；golden 仍留在 CPU
+        self.backend_lib_target = 'QnnHtp.dll'
+        self.native_net_run = True
+        print(f"[QnnAccuracyDebugger] native ARM64 net-run: {len(skel_dirs)} skel dirs, "
+              f"target backend -> {self.backend_lib_target}")
 
     def run_qnn_net_run(self, dlc_path:str, backend_lib:str, input_list:str, output_dir:str, output_tensors:str="all") -> int:
         """执行 qnn-net-run --dlc_path <dlc> --backend <lib> --input_list --output_dir [--debug]。"""
@@ -777,6 +819,7 @@ class QnnAccuracyDebugger:
             target_dlc_path: 量化 DLC 路径（同时作为 single 的层结构反射源）。
         """
         self.working_dir.mkdir(parents=True, exist_ok=True)
+        self._prepare_native_net_run()          # WoA 上切原生 ARM64，须早于任何 net-run
         self.target_dlc_path = str(target_dlc_path)
         input_list = self.prepare_input_data(mean_rgb, std_rgb)
 
@@ -785,9 +828,8 @@ class QnnAccuracyDebugger:
 
         # 2) single（单层）——失败时退回 entire-only 渲染（不阻断既有流程）。
         #    成功则 save_accuracy_analysis_csv(kind='single') 追加到同一 CSV。
-        fallback_entire_only = False
-        if sys.platform.startswith('win'):
-            fallback_entire_only = True
+        #    Windows x86 无 HTP、single 必失败故跳过；WoA 已切原生 ARM64 则放行。
+        fallback_entire_only = sys.platform.startswith('win') and not self.native_net_run
 
         if not fallback_entire_only:
             try:
@@ -1130,10 +1172,15 @@ class QnnSdkTools:
 
     @classmethod
     def converter_script(cls) -> str:
-        """qairt-converter 脚本绝对路径（去掉 get_tool 的引号包装）。"""
+        """qairt-converter 脚本绝对路径。
+
+        get_tool 在 Windows 返回「解释器 + 脚本」两个带引号 token（Linux 只有一个），
+        故按引号切分取最后一个；早先的 strip('"') 会把两者粘成非法路径。
+        """
         if cls.converter_script_path is None:
             from onnx_to_qnn import QAIRTScript
-            cls.converter_script_path = QAIRTScript.get_tool('qairt-converter').strip().strip('"')
+            cls.converter_script_path = shlex.split(
+                QAIRTScript.get_tool('qairt-converter'))[-1]
         return cls.converter_script_path
 
     @staticmethod
@@ -1191,6 +1238,22 @@ class QnnSdkTools:
             return -1, f'{type(exc).__name__}: {exc}\n' + txt[-1500:]
         finally:
             sys.argv = old_argv
+
+    @staticmethod
+    def convert_one_isolated(job: tuple) -> tuple:
+        """隔离子进程转换一个 cut 图 -> (rc, 日志尾部)；仅在池崩后补跑少量层时用。
+
+        与 convert_one 的区别：每层开全新进程（放弃引擎复用），因为 worker 的
+        0xC0000005 会连带杀掉同进程里后续的层，独立进程只损失该层、可重试。
+        job 含义同 convert_one；环境用 os.environ（x86 转换侧）。
+        """
+        cut, ov, layout, out_dlc = job
+        argv = ([sys.executable, QnnSdkTools.converter_script()]
+                + QnnSdkTools.converter_argv(cut, out_dlc, ov, layout))
+        proc = subprocess.run(argv, env=os.environ, capture_output=True, text=True,
+                              errors='replace')
+        tail = ((proc.stderr or '') + (proc.stdout or '')).strip()
+        return proc.returncode, tail[-1500:]
 
     # ------------------------------------------------------------------
     # tiny DLC meta 直读（qti IR 图）
@@ -1447,8 +1510,9 @@ class QnnTruncatedAccuracyAnalysis:
     # 各阶段并发 worker 数：converter 走进程池（每进程内连转多片、引擎复用），
     # ctx/feed/net_run 是线程池。converter 取 8：RF 117 层复用已备 cut 图的进程池
     # 基准（8 核 x86、负载 ~2.7）w4 44~60s、w8 38~45s；再加大受机器负载支配，
-    # 无稳定增益。
-    stage_max_workers = dict(converter=8, ctx=8, feed=8, net_run=8)
+    # 无稳定增益。converter_retry 是"池崩后补跑"的并发数（每层一个独立进程、不复用
+    # 引擎）：实测 32 层 W=8 比顺序快 ~7 倍（9.6s vs 66.5s），最低可用内存 4.2GB。
+    stage_max_workers = dict(converter=8, converter_retry=8, ctx=8, feed=8, net_run=8)
 
     # 布局不规范的产出算子：其输出的张量若被当作 cut 图输入，converter 的布局
     # 推断会二次置换（详见 subgraph_boundary 注释），故不能作为子图边界。
@@ -1596,30 +1660,93 @@ class QnnTruncatedAccuracyAnalysis:
         """阶段A：converter 进程池，每层一个任务（chunksize=1）按提交序回收。
 
         每层一个任务而非静态分片：引擎复用已带来同等收益，动态派发还避免巨型层
-        拖长某个分片（MSI 有 36.7MB 的 cut 单层 ~4s）。返回 rc==0 的层上下文；
+        拖长某个分片（MSI 有 36.7MB 的 cut 单层 ~4s）。返回产物有效的层上下文；
         阶段失败不中断，交由下游继续过滤/汇报。
+
+        池在 WoA（x64 模拟）上会概率性硬崩（qti 原生模块 0xC0000005，与量化配置、
+        具体层都无关）。硬崩按"部分失败"处理：已完成层的产物已落盘，在飞丢失的层用
+        每层一个独立进程**并发**补跑（不复用引擎，单层崩只损失该层）—— 否则一次崩溃
+        会让整段 single 作废。实测 32 层补跑 W=8 比顺序快 ~7 倍（9.6s vs 66.5s）。
         """
         from concurrent.futures import ProcessPoolExecutor
+        from concurrent.futures.process import BrokenProcessPool
         import tqdm as _tqdm
         jobs = [(str(info['cut_onnx']), str(info['ov_json']), info['layout'],
                  str(info['dlc_q'])) for info in infos]
-        codes, tails = [], []
-        with ProcessPoolExecutor(max_workers=self.stage_max_workers['converter']) as pool:
-            with _tqdm.tqdm(total=len(jobs), desc='single[trunc 1/3 converter]',
-                            unit='it', ncols=110, file=sys.stderr) as bar:
-                for rc, tail in pool.map(QnnSdkTools.convert_one, jobs, chunksize=1):
-                    codes.append(rc)
-                    tails.append(tail)
-                    bar.update(1)
-        converted_infos = [layer_info for layer_info, return_code
-                            in zip(infos, codes) if return_code == 0]
+
+        codes, tails = [None] * len(jobs), [None] * len(jobs)
+        pool_aborted = False
+        try:
+            with ProcessPoolExecutor(max_workers=self.stage_max_workers['converter']) as pool:
+                with _tqdm.tqdm(total=len(jobs), desc='single[trunc 1/3 converter]',
+                                unit='it', ncols=110, file=sys.stderr) as bar:
+                    for idx, (rc, tail) in enumerate(
+                            pool.map(QnnSdkTools.convert_one, jobs, chunksize=1)):
+                        codes[idx], tails[idx] = rc, tail
+                        bar.update(1)
+        except BrokenProcessPool:
+            pool_aborted = True
+
+        def _produced(layer_info: dict) -> bool:
+            out = Path(layer_info['dlc_q'])
+            return out.exists() and out.stat().st_size > 0
+
+        bad: set[int] = set()   # 补跑仍失败的层：即使残留半截产物也不算成功
+
+        # 成功判据：rc==0 且产物有效；rc 未知（在飞时被中止）则看产物，但补跑失败过的不算
+        def _converted(idx: int) -> bool:
+            if idx in bad:
+                return False
+            return (_produced(infos[idx]) if codes[idx] is None
+                    else codes[idx] == 0 and _produced(infos[idx]))
+
+        for layer_info, return_code, log_tail in zip(infos, codes, tails):
+            if return_code not in (0, None) and log_tail:
+                print(f"  [conv fail] {layer_info['tensor']}: {log_tail.strip()[-600:]}")
+
+        if pool_aborted:
+            lost = [idx for idx in range(len(infos)) if not _converted(idx)]
+            print(f"[QAIRTAccuracyDebugger] converter pool aborted; {len(lost)} layer(s) "
+                  f"lost, retrying in isolated processes")
+            MultThreadExetutor.set_max_workers(self.stage_max_workers['converter_retry'])
+            for attempt in (1, 2):
+                pending = [idx for idx in lost if not _converted(idx)]
+                if not pending:
+                    break
+                retry_codes = self._run_batch_progress(
+                    self._retry_one_isolated, [((infos[idx],), {}) for idx in pending],
+                    f'single[trunc 1/3 conv retry {attempt}]')
+                for idx, rc in zip(pending, retry_codes):
+                    if rc == 0:
+                        codes[idx] = 0
+                        bad.discard(idx)
+                    else:
+                        bad.add(idx)
+
+        converted_infos = [info for idx, info in enumerate(infos) if _converted(idx)]
         failed_count = len(infos) - len(converted_infos)
         if failed_count:
             print(f"[QAIRTAccuracyDebugger] truncated converter failures: {failed_count}")
-            for layer_info, return_code, log_tail in zip(infos, codes, tails):
-                if return_code != 0 and log_tail:
-                    print(f"  [conv fail] {layer_info['tensor']}: {log_tail.strip()[-600:]}")
         return converted_infos
+
+    @staticmethod
+    def _retry_one_isolated(info: dict) -> int:
+        """池崩后补跑一层：全新进程跑 converter（一个进程只转一层，硬崩只损失该层）。
+
+        返回 0 表示产物有效；非 0 由调用方记账并在下一轮重试。每次尝试前清掉半截产物。
+        成功不打印（批次进度条已覆盖），失败打一行带原因。
+        """
+        out_path = Path(info['dlc_q'])
+        if out_path.exists():
+            out_path.unlink()
+        rc, tail = QnnSdkTools.convert_one_isolated(
+            (str(info['cut_onnx']), str(info['ov_json']), info['layout'], str(info['dlc_q'])))
+        if rc == 0 and out_path.exists() and out_path.stat().st_size > 0:
+            return 0
+        last = [line for line in tail.splitlines() if line.strip()][-1:]
+        print(f"  [conv retry fail] {info['tensor']}: rc={rc} "
+              f"{last[0].strip()[:110] if last else ''}")
+        return rc if rc != 0 else -1
 
     def _stage_meta(self, converted_infos: list) -> list:
         """阶段B：tiny DLC meta 主进程直读，返回 [(层上下文, tiny meta)]（读取失败项剔除）。"""
@@ -4015,25 +4142,27 @@ class AccuracyGraph:
             '    mmSvg.appendChild(vr);\n'
             '    mmData.rect = vr;\n'
             '  }\n'
-            '  // 点击/拖拽小地图跳转\n'
+            '  // 点击/拖拽小地图跳转（pointer 事件：鼠标/触摸/触控笔通用）\n'
             '  var mmDrag = false;\n'
             '  function mmJump(px, py) {\n'
             '    var pos = mmToWorld(px, py);\n'
             '    var vb = getView();\n'
             '    setView(pos.x - vb.w / 2, pos.y - vb.h / 2, vb.w, vb.h);\n'
             '  }\n'
-            '  mmSvg.addEventListener("mousedown", function(e) {\n'
+            '  mmSvg.addEventListener("pointerdown", function(e) {\n'
+            '    if (e.pointerType === "mouse" && e.button !== 0) { return; }\n'
             '    mmDrag = true;\n'
             '    var r = mmSvg.getBoundingClientRect();\n'
             '    mmJump(e.clientX - r.left, e.clientY - r.top);\n'
-            '    e.preventDefault(); e.stopPropagation();\n'
+            '    e.stopPropagation();\n'
             '  });\n'
-            '  window.addEventListener("mousemove", function(e) {\n'
+            '  window.addEventListener("pointermove", function(e) {\n'
             '    if (!mmDrag) { return; }\n'
             '    var r = mmSvg.getBoundingClientRect();\n'
             '    mmJump(e.clientX - r.left, e.clientY - r.top);\n'
             '  });\n'
-            '  window.addEventListener("mouseup", function() { mmDrag = false; });\n'
+            '  window.addEventListener("pointerup", function() { mmDrag = false; });\n'
+            '  window.addEventListener("pointercancel", function() { mmDrag = false; });\n'
             '  function initialView() {\n'
             '    var figH = (B.maxY - B.minY) || 1;\n'
             '    var targetH = figH / 10;\n'
@@ -4054,20 +4183,60 @@ class AccuracyGraph:
             '    e.preventDefault();\n'
             '    zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? 1.15 : 1 / 1.15);\n'
             '  }, {passive: false});\n'
+            '  // 平移/捏合统一走 pointer 事件（鼠标/触摸/触控笔）；touch-action:none 见 CSS。\n'
+            '  // 注意：原来的 mousedown/mousemove/mouseup 已删除，两套并存会让鼠标平移速度翻倍。\n'
             '  var dragging = false, sx = 0, sy = 0, svx = 0, svy = 0;\n'
-            '  svg.addEventListener("mousedown", function(e) {\n'
-            '    dragging = true; sx = e.clientX; sy = e.clientY;\n'
-            '    var vb = getView(); svx = vb.x; svy = vb.y;\n'
-            '    svg.style.cursor = "grabbing";\n'
+            '  var ptrs = {}, ptrN = 0, pinch = null;   // ptrs: pointerId -> {x,y}\n'
+            '  function ptrVals() {\n'
+            '    var o = [];\n'
+            '    for (var k in ptrs) { if (ptrs.hasOwnProperty(k)) { o.push(ptrs[k]); } }\n'
+            '    return o;\n'
+            '  }\n'
+            '  function ptrDist(p) {\n'
+            '    return Math.sqrt(Math.pow(p[0].x - p[1].x, 2) + Math.pow(p[0].y - p[1].y, 2));\n'
+            '  }\n'
+            '  svg.addEventListener("pointerdown", function(e) {\n'
+            '    if (e.pointerType === "mouse" && e.button !== 0) { return; }\n'
+            '    ptrs[e.pointerId] = {x: e.clientX, y: e.clientY}; ptrN++;\n'
+            '    if (ptrN === 1) {\n'
+            '      dragging = true; sx = e.clientX; sy = e.clientY;\n'
+            '      var vb = getView(); svx = vb.x; svy = vb.y;\n'
+            '      svg.style.cursor = "grabbing";\n'
+            '    } else if (ptrN === 2) {\n'
+            '      dragging = false;                      // 双指 -> 捏合\n'
+            '      var p = ptrVals();\n'
+            '      pinch = {d: ptrDist(p), cx: (p[0].x + p[1].x) / 2, cy: (p[0].y + p[1].y) / 2};\n'
+            '    }\n'
             '  });\n'
-            '  window.addEventListener("mousemove", function(e) {\n'
+            '  window.addEventListener("pointermove", function(e) {\n'
+            '    if (!ptrs.hasOwnProperty(e.pointerId)) { return; }\n'
+            '    ptrs[e.pointerId] = {x: e.clientX, y: e.clientY};\n'
+            '    if (pinch && ptrN >= 2) {\n'
+            '      var p = ptrVals(); var d = ptrDist(p);\n'
+            '      if (d > 0 && pinch.d > 0) { zoomAt(pinch.cx, pinch.cy, pinch.d / d); }  // 两指分开=放大\n'
+            '      pinch.d = d;\n'
+            '      return;\n'
+            '    }\n'
             '    if (!dragging) { return; }\n'
             '    var vb = getView();\n'
             '    var dx = (e.clientX - sx) / window.innerWidth * vb.w;\n'
             '    var dy = (e.clientY - sy) / window.innerHeight * vb.h;\n'
             '    setView(svx - dx, svy - dy, vb.w, vb.h);\n'
             '  });\n'
-            '  window.addEventListener("mouseup", function() { dragging = false; svg.style.cursor = "grab"; });\n'
+            '  function endPointer(e) {\n'
+            '    if (!ptrs.hasOwnProperty(e.pointerId)) { return; }\n'
+            '    delete ptrs[e.pointerId]; ptrN--;\n'
+            '    if (ptrN < 2) { pinch = null; }\n'
+            '    if (ptrN === 1) {                          // 双指松一指：重设基准，避免画面跳变\n'
+            '      var p = ptrVals()[0];\n'
+            '      dragging = true; sx = p.x; sy = p.y;\n'
+            '      var vb = getView(); svx = vb.x; svy = vb.y;\n'
+            '    } else if (ptrN === 0) {\n'
+            '      dragging = false; svg.style.cursor = "grab";\n'
+            '    }\n'
+            '  }\n'
+            '  window.addEventListener("pointerup", endPointer);\n'
+            '  window.addEventListener("pointercancel", endPointer);\n'
             '  var pressed = {};\n'
             '  window.addEventListener("keydown", function(e) { pressed[e.key.toLowerCase()] = true; });\n'
             '  window.addEventListener("keyup", function(e) { pressed[e.key.toLowerCase()] = false; });\n'
@@ -4140,8 +4309,13 @@ class AccuracyGraph:
             '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="utf-8">\n'
             f'<title>{self.title}</title>\n'
             '<style>\n'
-            'html,body{margin:0;height:100%;overflow:hidden;font-family:Arial;}\n'
+            'html,body{margin:0;height:100%;overflow:hidden;overscroll-behavior:none;'
+            'font-family:Arial;}\n'
             'svg#svg{display:block;width:100vw;height:100vh;background:#fff;cursor:grab;}\n'
+            # 触摸屏：必须显式声明 touch-action，否则手指拖拽会被浏览器判为页面平移/缩放并中断事件流
+            'svg#svg,#minimap svg{touch-action:none;-webkit-user-select:none;user-select:none;'
+            '-webkit-touch-callout:none;}\n'
+            'button{touch-action:manipulation;}\n'
             'image.node{cursor:pointer;}\n'
             '#tip{position:fixed;display:none;z-index:3000;background:rgba(255,255,255,.97);'
             'border:1px solid #aaa;border-radius:4px;padding:6px 10px;font-size:12px;'

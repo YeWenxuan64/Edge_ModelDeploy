@@ -13,14 +13,17 @@ from utilities.utils import collect_image_paths
 # 从指定目录收集图片路径，生成 txt 索引文件
 dataset_txt = collect_image_paths(
     dir_paths=['/path/to/coco/val2017'],  # 图片目录列表
-    max_count=200                          # 最多取 200 张
+    max_count=200,                         # 最多取 200 张（0 = 不限制）
+    random_sample=False,                   # True 且目录内图片数 > max_count 时随机抽取
+    step=1,                                # 顺序模式的间隔挑选步长（step=N 取第 0、N、2N... 张）
+    use_relative=False,                    # True 时写成相对当前工作目录的 ./xxx 或 ../xxx
 )
 
 print(f"数据集索引已生成: {dataset_txt}")
-# 输出: utilities/tmp/combind_image_paths.txt
+# 输出: <当前工作目录>/combind_image_paths.txt
 ```
 
-该函数会扫描指定目录下所有常见格式的图片（jpg/png/bmp/webp/tiff 等），将绝对路径逐行写入 `utilities/tmp/combind_image_paths.txt`，然后返回该文件的绝对路径。
+该函数会扫描指定目录**本级**（不递归子目录）下所有常见格式的图片（jpg/jpeg/png/bmp/gif/webp/tiff/tif），将路径逐行写入 **当前工作目录**下的 `combind_image_paths.txt`（默认绝对路径），然后返回该文件的绝对路径。
 
 
 ## 1. 创建转换工程
@@ -186,6 +189,7 @@ converter.set_quantization_method(
 # converter.do_hybrid_quantization(
 #     custom_hybrid=[['子图输入张量名', '子图输出张量名']],  # [[X, X]] 表示只选该节点
 #     bitwidth='w8a16',     # 区域精度: 'w8a8' / 'w8a16' / 'w16a16'（后者需 dsp>=v73）
+#     act_quant_schema=None, # 注入激活的对称性 'asymmetric'/'symmetric'（None = 不写 is_symmetric）
 # )
 # 2) 浮点保留：指定区域内保持 FP16 / FP32 浮点精度（此时忽略 bitwidth）
 # converter.do_hybrid_quantization(
@@ -195,6 +199,9 @@ converter.set_quantization_method(
 # 注：custom_hybrid 支持同时指定多个子图；边界可以是张量名，也可以是节点名（自动取该节点的输出张量）
 # 注：w8a16 / 浮点只需校准数据集；w16a16 会用同一份校准数据先跑一遍全图 16/16 参考校准，
 #     详见 [3.4 混合量化](#34-混合量化)
+# 注：区域位宽只支持 w8a8 / w8a16 / w16a16 —— 16bit 权重必须配 16bit 激活，w16a8 直接报错
+# 注：Concat / Transpose / Reshape / Split 等要求「输入输出编码一致」的算子按「生产链闭合」升级：
+#     只有该算子所有由节点产生的输入都已进入区域时才会升级，否则整链被按最小位宽拉齐
 
 # 可选：精度分析（放置模型输入节点所对应的图片）
 # converter.set_do_accuracy_analysis(
@@ -233,8 +240,8 @@ from utilities.onnx_aimet_quant import AimetOnnxQuantizer
 
 quantizer = AimetOnnxQuantizer(
     model_path='models/yourmodel.onnx',             # 输入 FP32 ONNX
-    quantized_model_path='models/yourmodel_q.onnx', # 输出 QDQ ONNX（None 默认同目录）
-    dataset_path='datasets/datasets.txt',           # 校准图片列表 txt（必须提供）
+    quantized_model_path='models/yourmodel_q.onnx', # 输出 QDQ ONNX（None 默认同目录 *_qdq.onnx）
+    dataset_path='datasets/datasets.txt',           # 校准图片列表 txt；为 None 时改用 use_custom_calibration_data
     config_file=None,                               # AIMET quantsim_config 路径或别名（'default'/'htp_v68'...）
     fold_batch_norms=True,                          # 是否先做 BatchNorm 折叠
 )
@@ -252,6 +259,11 @@ quantizer.set_quantization_method(
 #     custom_hybrid=[['子图输入张量名', '子图输出张量名']],
 #     bitwidth='w8a16',              # 子图内位宽
 #     float_bitwidth=None,           # 16/32 = 子图保持 FP16/FP32
+# )
+# 可选：自定义校准数据（.raw / .npy 张量数据集），代替图片数据集
+# quantizer.use_custom_calibration_data(
+#     custom_calibration_data_path='path/to/calibration_data.txt',
+#     dataset_tensor_order='nhwc',       # 张量布局 'nhwc' / 'nchw'
 # )
 # 可选：精度分析（FP32 vs 量化输出对比）
 # quantizer.set_do_accuracy_analysis(['img1.jpg'])
@@ -276,6 +288,7 @@ qdq_path, enc_path = quantizer.convert(
 | `param_quant_schema` / `act_quant_schema` | 权重 / 激活对称性：`asymmetric` / `symmetric` / `unsignedsymmetric`（权重/bias 经 quantsim_config 配置表应用，激活可独立设符号） |
 | `use_cle_algorithm` | 是否启用 Cross-Layer Equalization（含 HighBiasFold 偏置修正） |
 | `config_file` | AIMET quantsim_config 路径或别名（`default` / `htp_v66`~`htp_v81`）；`None` 用 `default` |
+| `dataset_path` / `use_custom_calibration_data()` | 二者提供其一：图片数据集索引 txt，或预处理好的 `.raw` / `.npy` 张量数据集（`dataset_tensor_order` 指定 `nhwc` / `nchw`）；两者都未提供时 `convert()` 报错 |
 | `convert()` 的 `mean_rgb` / `std_rgb` | 输入归一化参数，语义与 `OnnxToQNN` / `OnnxToRKNN` 一致（多输入传多个列表） |
 | `convert()` 的 `normalize_model` | `True`：把归一化烘焙进模型（校准输入为原始像素）；`False`：在校准/验证输入上应用 `(x-mean)/std` |
 | `convert()` 的 `export_encodings` | `False`（默认）：encodings 输出到临时目录（`clean()` 删除）；`True`：输出到 QDQ 同目录 |
@@ -285,6 +298,8 @@ qdq_path, enc_path = quantizer.convert(
 - **encodings JSON**（v2.0.0）：量化编码；可作为 QNN 的外置量化器使用（经 `OnnxToQNN.set_use_aimet()` 接入）
 
 > 数据集 txt 格式与 `OnnxToQNN` / `OnnxToRKNN` 完全一致：每行一个样本、多输入图片路径空格分隔、相对路径基于 txt 所在目录、letterbox 预处理。
+
+> 量化过程的临时产物在 `utilities/tmp/<模型名>_to_qdq_onnx/`，由 `clean()` 清理；`export_encodings=True` 时 encodings 与 QDQ ONNX 同目录，不属于临时文件。
 
 ### 接入 QNN：作为 `OnnxToQNN` 的外置量化器
 
@@ -328,16 +343,19 @@ converter.convert(
 ```python
 converter.do_hybrid_quantization(
     custom_hybrid=[[in1, out1]],   # 子图边界；[[X, X]] 表示单层
-    bitwidth="w8a16",              # 区域激活位宽：w8a8 / w8a16
+    bitwidth="w8a16",              # 区域精度：w8a8 / w8a16 / w16a16
     float_bitwidth=None,           # 16/32 表示区域保持 FP16/FP32
+    act_quant_schema=None,         # 注入激活的对称性 'asymmetric'/'symmetric'（None = 不写 is_symmetric）
 )
 ```
 
 两种模式（二选一）：
 1. **整数混合量化**（默认）：`bitwidth` 指定区域精度。
+   - 区域位宽只支持 `w8a8` / `w8a16` / `w16a16`：16bit 权重必须配 16bit 激活，`w16a8` 在构造期即被拒绝（HTP 无该 kernel）。
    - `w8a16`（**推荐**）：区域激活 16bit，权重沿用全局 int8（全局默认 `w8a8`）；dsp v68 起可用。
    - `w16a16`：区域激活+权重都 16bit（int16 权重，`sFxp_16`）。**需要 dsp_arch ≥ v73**（qcs8550/qcs9075），且只支持 Conv2d/DepthConv2d/TransposeConv2D/FullyConnected/Matmul/Batchnorm/LayerNorm；A16W16 要求**权重对称**，内部会用 `--restrict_quantization_steps "-0x8000 0x7F7F"`（Hexagon int16 权重范围限制）。
    - 区域只接受「层范围 + 精度」：对称性/scale/offset **无需也无法指定**——w16a16 内部固定权重 symmetric；w8a16 的权重与 bias 编码完全交给量化器按注入的激活精度校准（`bias_scale = weight_scale × activation_scale`）。
+   - **生产链闭合规则**：`Concat` / `Transpose` / `Reshape` / `Split` 等要求输入输出编码一致的算子，只有当其**所有由节点产生的输入都已进入区域**时才会被升级；否则工具会把整链按最小位宽拉齐，产出「16bit 标记 + 8bit scale」的矛盾编码。圈定子图时请把这类算子的上游一并纳入。
 2. **浮点保留**：设置 `float_bitwidth`（16=FP16 / 32=FP32），区域整体浮点。
    - FP16 需要目标 SoC 支持 HTP float16 math（文档：*"on select Qualcomm SoCs"*）；实测 qcs6490(v68) 不支持，qcs8550(v73) 可用。
    - 浮点区域只注入激活为 float，权重/bias 由 converter 的"三件套一致"规则自动跟随为 float。
@@ -371,7 +389,7 @@ converter.do_hybrid_quantization(
 | 项目 | QNN | RKNN |
 |------|-----|------|
 | 区域精度 | w8a8 / w8a16 / w16a16（整数）或 FP16/FP32 | 固定 FP16 |
-| 额外参数 | `bitwidth` / `float_bitwidth` | 无 |
+| 额外参数 | `bitwidth` / `float_bitwidth` / `act_quant_schema` | 无 |
 | 平台约束 | w16a16 需 dsp_arch ≥ v73；FP16 需 SoC 支持 | 无 |
 | 子图外 | 全局设置（默认 w8a8） | 8-bit |
 | 底层机制 | overrides（w8a16 只含激活；w16a16 内部先跑 16/16 校准再合并权重）→ 浮点 DLC → `qairt-quantizer` 补齐 | hybrid_quantization_step1/2 |

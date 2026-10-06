@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import copy
+import ctypes
 import platform
 import shutil
 import subprocess
@@ -94,6 +95,33 @@ class QAIRTScript:
                 return 'aarch64-oe-linux-gcc11.2'
             else:
                 return 'x86_64-linux-clang'
+
+    @classmethod
+    def is_windows_arm64(cls) -> bool:
+        """当前宿主是否为 Windows ARM64（WoA）。
+
+        注意"进程架构 != 宿主架构"：x64 模拟解释器下 platform.machine() 与
+        GetNativeSystemInfo 都报 AMD64（实测），只有 IsWow64Process2 的
+        nativeMachine 认得出宿主。非 Windows 恒为 False。
+        """
+        if not sys.platform.startswith('win'):
+            return False
+        try:
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p  # 不设会按 c_int 截断句柄
+            kernel32.IsWow64Process2.argtypes = [ctypes.c_void_p,
+                                                 ctypes.POINTER(ctypes.c_ushort),
+                                                 ctypes.POINTER(ctypes.c_ushort)]
+            kernel32.IsWow64Process2.restype = ctypes.c_int
+            process_machine, native_machine = ctypes.c_ushort(0), ctypes.c_ushort(0)
+            if not kernel32.IsWow64Process2(kernel32.GetCurrentProcess(),
+                                            ctypes.byref(process_machine),
+                                            ctypes.byref(native_machine)):
+                return False
+            return native_machine.value == 0xAA64        # IMAGE_FILE_MACHINE_ARM64
+        except Exception:
+            # 兜底（无 IsWow64Process2 的老系统）：该变量由系统写入，模拟进程读到的也是宿主标识
+            return 'arm' in os.environ.get('PROCESSOR_IDENTIFIER', '').lower()
 
     @classmethod
     def get_tool(cls, tool_name:str) -> str:
