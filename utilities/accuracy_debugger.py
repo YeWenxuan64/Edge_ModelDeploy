@@ -501,8 +501,9 @@ class RknnAccuracyDebugger:
 
     Attributes:
         tmp_work_dir (Path): 存放精度分析与中间产物的目录。
-        tmp_model_path (Path): convert() 复制到 tmp 目录的模型副本（图结构分析使用）。
+        tmp_model_path (Path): convert() 复制到 tmp 目录的模型副本，图结构分析的回退参考图。
         snapshot_dir (Path): RKNN 精度分析快照目录（snapshot/）。
+        fused_model_path (Path): RKNN fuse 阶段 dump 到本目录的内部图，图结构分析的首选参考图。
     """
 
     def __init__(self, tmp_work_dir:str, tmp_model_path:str):
@@ -510,6 +511,11 @@ class RknnAccuracyDebugger:
         self.tmp_model_path = Path(tmp_model_path).resolve()
 
         self.snapshot_dir = self.tmp_work_dir / 'snapshot'
+        # error_analysis.txt 的层名来自这张图而不是入参 ONNX 副本：fuse 阶段会把
+        # GlobalAveragePool 之类算子改写成 <节点名>_2convN 等合成层，只有末级沿用
+        # 原来的 <...>_output_0 张量名。是否可用要到 convert() 后才能判定（本类在
+        # set_do_accuracy_analysis() 里就构造好了），所以这里只记路径。
+        self.fused_model_path = self.tmp_work_dir / 'check3_fuse_ops.onnx'
 
         self.file_or_dir_to_clean:list[str] = []
         self.file_or_dir_to_clean.append(self.snapshot_dir)
@@ -586,8 +592,9 @@ class RknnAccuracyDebugger:
 
         数据 = read_error_analysis() 组装的统一"层精度" dict（含 RKNN 自带
         op_type）-> AccuracyGraph（onnx 构建/层图/Output 终端在其 __init__ 内
-        完成一次）。RKNN 快照已含输入层，include_input=False；层名为原始 ONNX
-        张量名，sanitize=False、layer_display 恒等。
+        完成一次）。RKNN 快照已含输入层，include_input=False；层名为 RKNN 内部图
+        的张量名（未清洗），sanitize=False、layer_display 恒等，故结构参考图优先用
+        fused_model_path，缺失时回退 tmp_model_path。
         """
 
         accuracy = self.read_error_analysis()
@@ -601,9 +608,11 @@ class RknnAccuracyDebugger:
 
 
         output_path = self.tmp_work_dir / 'rknn_graph_accuracy_analysis.html'
+        graph_model_path = self.fused_model_path if self.fused_model_path.exists() else self.tmp_model_path
+
         viz = AccuracyGraph(
             accuracy,
-            self.tmp_model_path,
+            graph_model_path,
             output_path,
             title='RKNN Graph Accuracy Analysis',
             sanitize=False,

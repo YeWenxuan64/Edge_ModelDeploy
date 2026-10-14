@@ -181,6 +181,8 @@ class OnnxToRKNN:
         if self.accuracy_analyzer is not None:
             self.accuracy_analyzer.render_combined_report() # 带路径追踪的精度分析（Netron 风格网络图）
 
+        self.file_or_dir_to_clean.append(self.tmp_work_dir)
+
     def clean(self):
         clean_files_or_dirs(self.file_or_dir_to_clean)
 
