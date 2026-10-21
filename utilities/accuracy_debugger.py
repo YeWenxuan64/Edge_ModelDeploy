@@ -3,13 +3,15 @@ import os
 import sys
 import csv
 import json
+import html
 import runpy
 import shlex
 import shutil
 import subprocess
-import tempfile
+import traceback
 
 from pathlib import Path
+from datetime import datetime
 from typing import Callable
 from collections import defaultdict, deque
 
@@ -29,18 +31,13 @@ from utils import clean_files_or_dirs, run_command, MultThreadExetutor
 # 层精度 schema（内存 dict 与 CSV 共用同一套键；历史名 LAYER_ACC_KEYS）
 #   键序 = CSV 列序 = 渲染 x 轴序：
 #     entire_cos, entire_euc, entire_mse, single_cos, single_euc
-#   dict 形态：{层名(sanitized): {上述键: float|None}}
+#   dict 形态：{输出张量名(sanitized): {上述键: float|None}}；界面层名另取生产算子名。
 #     - entire 侧有值 = 该层在累积(entire)分析中有结果；
 #     - single 侧有值 = 该层在单层(single/truncated)分析中有结果；
 #     - 无结果侧一律 None（CSV 空列读回亦为 None），由下游自行解析；
 #     - 单层分析不产出 single_mse。
 #   内存可选附加键（非 CSV 列）：op_type 算子类型 —— Rknn 侧由 error_analysis
 #   自带类型带入；Qnn 侧缺失时 AccuracyGraph 回退 onnx node_info 推断。
-
-
-def _acc_col(accuracy: dict, key: str) -> list:
-    """从统一 dict 按层序取某指标列（缺失 None -> 原样保留，绘图处再转 nan）。"""
-    return [row.get(key) if isinstance(row, dict) else None for row in accuracy.values()]
 
 
 def plot_accuracy_summary(accuracy: dict = None, entire_val_color: str = "blue",
@@ -72,6 +69,10 @@ def plot_accuracy_summary(accuracy: dict = None, entire_val_color: str = "blue",
     names = list(accuracy.keys())
     n = len(names)
     layer_index = np.arange(n)
+
+    def _acc_col(accuracy: dict, key: str) -> list:
+        """从统一 dict 按层序取某指标列（缺失 None -> 原样保留，绘图处再转 nan）。"""
+        return [row.get(key) if isinstance(row, dict) else None for row in accuracy.values()]
 
     def col(key):
         """某指标列 -> np.ndarray；无值(None) -> nan（plot 自动断开/跳过）。"""
@@ -191,6 +192,7 @@ def build_onnx_tensor_graph(model_path, *, sanitize: bool = False) -> dict:
             - tensors (dict[str, str]): (清洗后)张量名 -> 原始张量名
             - tensor_set (set[str]): 全部 (清洗后)张量名（输入/输出/节点输出）
             - node_info (dict[str, tuple[str, list[str]]]): 张量 -> (算子类型, 输入张量)
+            - node_labels (dict[str, str]): 张量 -> 生产算子名，多输出附输出序号
             - pred (dict[str, list[str]]): 张量 -> 产生它的节点输入张量列表
             - succ (dict[str, list[str]]): 张量 -> 消费它的后续张量列表
             - inputs / outputs (list[str]): 模型输入/输出名
@@ -217,13 +219,18 @@ def build_onnx_tensor_graph(model_path, *, sanitize: bool = False) -> dict:
                 tensors.setdefault(_norm(o), o)
 
     node_info: dict[str, tuple[str, list[str]]] = {}
+    node_labels: dict[str, str] = {}
     pred: dict[str, list[str]] = {}
     succ: dict[str, list[str]] = {}
     for n in g.node:
         outs = [_norm(o) for o in n.output if o]
         ins = [_norm(i) for i in n.input if i]
-        for out in outs:
+        for index, original_out in enumerate(n.output):
+            if not original_out:
+                continue
+            out = _norm(original_out)
             node_info.setdefault(out, (n.op_type, ins))
+            node_labels.setdefault(out, (n.name + (f' [输出 {index}]' if len(outs) > 1 else '')) if n.name else '')
             pred.setdefault(out, []).extend(ins)
         for i in ins:
             succ.setdefault(i, []).extend(outs)
@@ -261,6 +268,7 @@ def build_onnx_tensor_graph(model_path, *, sanitize: bool = False) -> dict:
         'tensors': tensors,
         'tensor_set': set(tensors),
         'node_info': node_info,
+        'node_labels': node_labels,
         'pred': pred,
         'succ': succ,
         'inputs': [_norm(t.name) for t in g.input],
@@ -614,7 +622,6 @@ class RknnAccuracyDebugger:
             accuracy,
             graph_model_path,
             output_path,
-            title='RKNN Graph Accuracy Analysis',
             sanitize=False,
             include_input=False,
         )
@@ -663,6 +670,7 @@ class QnnAccuracyDebugger:
             self.backend_lib_target = "libQnnHtp.so"
 
         self.native_net_run: bool = False   # 推理侧是否已切原生 ARM64
+        self.native_htp_config: Path | None = None   # 实测宿主 DSP 架构，不沿用部署目标 SoC
 
         self.onnx_info: dict = {}
         self.set_input_order:str = 'nhwc'
@@ -761,6 +769,44 @@ class QnnAccuracyDebugger:
         self.native_net_run = True
         print(f"[QnnAccuracyDebugger] native ARM64 net-run: {len(skel_dirs)} skel dirs, "
               f"target backend -> {self.backend_lib_target}")
+        self._prepare_native_htp_config(bin_dir, lib_dir)
+
+    def _prepare_native_htp_config(self, bin_dir: Path, lib_dir: Path) -> None:
+        """检测实际 DSP 架构，避免 context 编译默认按 v68 拒绝 FP16 子图。"""
+        self.native_htp_config = None
+        validator = bin_dir / 'qnn-platform-validator.exe'
+        if not validator.is_file():
+            return
+        config_dir = self.working_dir / 'native_htp'
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / 'validator').mkdir(exist_ok=True)
+        try:
+            probe = subprocess.run(
+                [str(validator), '--backend', 'dsp', '--coreVersion',
+                 '--targetPath', str(config_dir / 'validator')],
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                timeout=15, env=os.environ)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            (config_dir / 'validator.log').write_text(str(exc), encoding='utf-8')
+            return
+        output = (probe.stdout or '') + (probe.stderr or '')
+        (config_dir / 'validator.log').write_text(output, encoding='utf-8')
+        arch = re.search(r'Core Version of the backend DSP:\s*Hexagon Architecture V(\d+)',
+                         output, re.IGNORECASE)
+        if probe.returncode != 0 or arch is None:
+            return
+        dsp_arch = f'v{arch.group(1)}'
+        backend_path = config_dir / 'backend.json'
+        backend_path.write_text(json.dumps({'devices': [{'dsp_arch': dsp_arch}]}, indent=2),
+                                encoding='utf-8')
+        config_path = config_dir / 'config.json'
+        config_path.write_text(json.dumps({'backend_extensions': {
+            'shared_library_path': str(lib_dir / 'QnnHtpNetRunExtensions.dll'),
+            'config_file_path': str(backend_path),
+        }}, indent=2), encoding='utf-8')
+        self.native_htp_config = config_path
+        print(f"[QnnAccuracyDebugger] native HTP architecture: {dsp_arch}; "
+              f"config: {config_path}")
 
     def run_qnn_net_run(self, dlc_path:str, backend_lib:str, input_list:str, output_dir:str, output_tensors:str="all") -> int:
         """执行 qnn-net-run --dlc_path <dlc> --backend <lib> --input_list --output_dir [--debug]。"""
@@ -778,8 +824,13 @@ class QnnAccuracyDebugger:
             cmd += f' --set_output_tensors {output_tensors} --log_level warn'
 
         cmd += f' --dlc_path {dlc_path} --input_list {input_list} --output_dir {output_dir}'
+        if self.native_htp_config and backend_lib == self.backend_lib_target:
+            cmd += f' --config_file "{self.native_htp_config}"'
 
-        return run_command(cmd, signature="[QAIRTAccuracyDebugger]")
+        log_path = Path(output_dir) / 'net-run.log'
+        print(f"[QAIRTAccuracyDebugger] net-run {backend_lib}; log: {log_path}")
+        return run_command(cmd, signature="[QAIRTAccuracyDebugger]", print_output=False,
+                           log_path=log_path)
 
     # ------------------------------------------------------------------
     # 逐层 dump 工具（entire 与 single 共用）
@@ -845,8 +896,17 @@ class QnnAccuracyDebugger:
                 self.single_accuracy_analysis(golden_dlc_path, target_dlc_path, input_list)
             except Exception as exc:
                 fallback_entire_only = True
+                failure_log = self.working_dir / 'single_failures.log'
+                try:
+                    with failure_log.open('a', encoding='utf-8') as log:
+                        log.write(f"\n[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+                                  f"SDK={os.environ.get('QAIRT_SDK_ROOT', '')}\n"
+                                  f"golden={golden_dlc_path}\ntarget={target_dlc_path}\n"
+                                  f"{traceback.format_exc()}")
+                except OSError as log_exc:
+                    print(f"[QAIRTAccuracyDebugger] cannot save single failure: {log_exc}")
                 print(f"[QAIRTAccuracyDebugger] single-layer analysis skipped ({type(exc).__name__}: {exc}); "
-                    f"fallback to entire-only report")
+                      f"fallback to entire-only report; log: {failure_log}")
 
 
         # 3) 渲染：从精度 CSV 读回（entire/single 已落盘），single 数据可用时输出
@@ -934,7 +994,10 @@ class QnnAccuracyDebugger:
         dict（single 侧有值），save_accuracy_analysis_csv(kind='single') 落盘。
         """
         analyzer = QnnTruncatedAccuracyAnalysis(self, self.onnx_path)
-        accuracy = analyzer.run(golden_dlc_path, target_dlc_path, input_list, only_tensor_prefix)
+        try:
+            accuracy = analyzer.run(golden_dlc_path, target_dlc_path, input_list, only_tensor_prefix)
+        finally:
+            analyzer.save_stage_results()
         self.save_accuracy_analysis_csv(accuracy, kind='single')
 
     # ------------------------------------------------------------------
@@ -1110,7 +1173,6 @@ class QnnAccuracyDebugger:
             accuracy,
             self.onnx_path,
             output_path,
-            title='QNN Graph Accuracy Analysis',
             sanitize=True,
             include_input=True,
             layer_display=lambda g, k: g['tensors'].get(k, k),
@@ -1203,12 +1265,10 @@ class QnnSdkTools:
 
     @staticmethod
     def convert_one(job: tuple) -> tuple:
-        """进程池 worker：转换一个 cut 图 -> 量化 DLC，返回 (rc, 日志尾部)。
+        """进程池 worker：转换一个 cut 图 -> 量化 DLC，返回 (SDK rc, 失败原因)。
 
         job = (cut_onnx, ov_json, layout, out_dlc)（均为 str 路径）。
-        引擎复用靠 runpy 在 worker 进程内执行 converter（重模块只 import 一次，
-        同一 worker 后续层直接复用，是并行的主要收益来源）；converter 的 C 层
-        直写 fd1/fd2，故做 fd 级静默，失败时回传尾部便于诊断。
+        runpy 让 worker 复用重模块；C 层直写 fd1/fd2，完整输出按层写入 converter.log。
         保持 staticmethod + 类名显式取工具：进程池按限定名 pickle 本函数。
         """
         cut, ov, layout, out_dlc = job
@@ -1217,10 +1277,10 @@ class QnnSdkTools:
         argv = [script] + QnnSdkTools.converter_argv(cut, out_dlc, ov, layout)
         old_argv = sys.argv
         sys.argv = argv
-        txt = ''
+        diagnostic, exception_trace = '', ''
+        log_path = Path(out_dlc).parent / 'converter.log'
         try:
-            with tempfile.TemporaryFile(mode='w+', encoding='utf-8',
-                                        errors='replace') as tf:
+            with log_path.open('w+', encoding='utf-8', errors='replace') as tf:
                 try:
                     saved_out, saved_err = os.dup(1), os.dup(2)
                     os.dup2(tf.fileno(), 1)
@@ -1235,22 +1295,40 @@ class QnnSdkTools:
                         os.close(saved_out)
                         os.close(saved_err)
                 finally:
-                    # 必须在 with 退出（文件已关闭）之前取回日志：异常路径上
-                    # except 分支已在 with 之外，届时读不到任何内容。
                     tf.flush()
-                    tf.seek(0)
-                    txt = tf.read()
-            return 0, ''
+            rc = 0
         except SystemExit as e:
-            return int(e.code or 0), txt[-1500:]
+            rc = int(e.code or 0)
         except Exception as exc:
-            return -1, f'{type(exc).__name__}: {exc}\n' + txt[-1500:]
+            diagnostic = f'{type(exc).__name__}: {exc}'
+            exception_trace = traceback.format_exc()
+            rc = None
         finally:
             sys.argv = old_argv
+        if rc == 0:
+            # 池崩时 Future 返回值可能丢失；只有 converter 正常结束才留下完成标记。
+            try:
+                out = Path(out_dlc)
+                if not out.is_file() or out.stat().st_size == 0:
+                    diagnostic = 'converter returned success without a non-empty DLC'
+                else:
+                    out.with_suffix('.converted').touch()
+            except OSError as exc:
+                diagnostic = f'cannot mark converted DLC: {exc}'
+        try:
+            with log_path.open('a', encoding='utf-8') as log:
+                log.write(f'\nconverter rc={rc}; status={"failed" if diagnostic or rc else "ok"}\n')
+                if diagnostic:
+                    log.write(diagnostic + '\n')
+                if exception_trace:
+                    log.write(exception_trace)
+        except OSError:
+            pass  # 转换和完成标记已确认，附属日志失败不撤销有效产物。
+        return rc, diagnostic
 
     @staticmethod
     def convert_one_isolated(job: tuple) -> tuple:
-        """隔离子进程转换一个 cut 图 -> (rc, 日志尾部)；仅在池崩后补跑少量层时用。
+        """隔离子进程转换一个 cut 图 -> (SDK rc, 失败原因)；仅在池崩后补跑少量层时用。
 
         与 convert_one 的区别：每层开全新进程（放弃引擎复用），因为 worker 的
         0xC0000005 会连带杀掉同进程里后续的层，独立进程只损失该层、可重试。
@@ -1262,7 +1340,17 @@ class QnnSdkTools:
         proc = subprocess.run(argv, env=os.environ, capture_output=True, text=True,
                               errors='replace')
         tail = ((proc.stderr or '') + (proc.stdout or '')).strip()
-        return proc.returncode, tail[-1500:]
+        rc, reason = proc.returncode, ''
+        out = Path(out_dlc)
+        if rc == 0 and (not out.is_file() or out.stat().st_size == 0):
+            reason = 'converter returned success without a non-empty DLC'
+        try:
+            (Path(out_dlc).parent / 'converter_retry.log').write_text(
+                f'{subprocess.list2cmdline(argv)}\n{tail}\nconverter rc={rc}\n{reason}\n',
+                encoding='utf-8')
+        except OSError:
+            pass  # 日志写入失败不撤销 SDK 已确认的有效 DLC。
+        return rc, reason
 
     # ------------------------------------------------------------------
     # tiny DLC meta 直读（qti IR 图）
@@ -1359,8 +1447,8 @@ class DlcV2EncodingExporter:
     提供两类数据（同一 reader / 同一 IR 图）：
       - encodings：可量化张量的量化编码，导出为 AIMET 2.0.0 json
         （extract / to_dict / dump）；
-      - layer candidates：每个有输出张量的 op -> {tensor, op_type, io_tensors}
-        （layer_candidates，供单层 overrides 筛选）。
+      - layer candidates：每个 op 的每个输出 -> {tensor, op_type, inputs, outputs, io_tensors}
+        （layer_candidates，另保留 op_name，供显示层名及单层 overrides 筛选）。
 
     qti 模块在首次实例化时惰性导入并缓存在类属性（进程内一次）；编码类型常量
     亦缓存到类上，避免逐张量重复属性查找。dtype 名称转换共用 QnnSdkTools。
@@ -1458,7 +1546,7 @@ class DlcV2EncodingExporter:
     # ------------------------------------------------------------------
 
     def layer_candidates(self) -> list[dict]:
-        """每个有输出张量的 op -> {"tensor": 输出张量名, "op_type", "io_tensors": 输入+输出}。
+        """每个 op 的每个输出各有一个候选；保留 op_name 与显式 inputs/outputs。
 
         io_tensors 范围与官方 subgraph_snooper 的 overrides 一致：Conv2d 取
         input+weight+bias+output，Prelu 取 input+coeff+output，Concat 取各输入激活+output。
@@ -1468,11 +1556,14 @@ class DlcV2EncodingExporter:
             outs = [t.name() for t in op.outputs()]
             if not outs:
                 continue
-            candidates.append({
-                'tensor': outs[0],
-                'op_type': str(op.type.name if hasattr(op.type, 'name') else op.type),
-                'io_tensors': [t.name() for t in op.inputs()] + outs,
-            })
+            ins = [t.name() for t in op.inputs()]
+            op_type = str(op.type.name if hasattr(op.type, 'name') else op.type)
+            for out in outs:
+                candidates.append({
+                    'tensor': out, 'op_type': op_type, 'op_name': getattr(op, 'name', '') or '',
+                    'inputs': ins, 'outputs': outs,
+                    'io_tensors': ins + outs,
+                })
         return candidates
 
     def graph_io_tensors(self) -> dict:
@@ -1493,10 +1584,7 @@ class QnnTruncatedAccuracyAnalysis:
     语义 = 官方 layerwise：整图其余部分浮点、仅该层量化 -> 误差只反映该层
     自身的量化误差（single_euc / single_cos，与 entire 累积相对）。
 
-    与 QnnAccuracyDebugger 的关系：组合（composition）——本类持有 dbg 实例，
-    复用其 golden net-run / backend / 工作目录 / set_input_order；SDK 工具
-    （ctx generator / net-run-bin / encodings / layer candidates / override
-    json / 进度条线程池）自带副本，不依赖 dbg 转发。
+    持有 dbg，复用 Golden、后端、工作目录和输入布局；本类负责截断分析与阶段编排。
 
     每层流程（run() 只做阶段化编排，各阶段私有方法按调用顺序排在下方）：
       1) golden dump（复用 fp32 全图 --debug 结果，缺则补跑一次，不截断 golden）;
@@ -1516,11 +1604,7 @@ class QnnTruncatedAccuracyAnalysis:
     Conv+Transpose 融成 1 个 Conv2d），重新转换后算子结构与量化编码一致。
     """
 
-    # 各阶段并发 worker 数：converter 走进程池（每进程内连转多片、引擎复用），
-    # ctx/feed/net_run 是线程池。converter 取 8：RF 117 层复用已备 cut 图的进程池
-    # 基准（8 核 x86、负载 ~2.7）w4 44~60s、w8 38~45s；再加大受机器负载支配，
-    # 无稳定增益。converter_retry 是"池崩后补跑"的并发数（每层一个独立进程、不复用
-    # 引擎）：实测 32 层 W=8 比顺序快 ~7 倍（9.6s vs 66.5s），最低可用内存 4.2GB。
+    # converter 进程池复用引擎；补跑每层独立进程，其余阶段使用线程池。
     stage_max_workers = dict(converter=8, converter_retry=8, ctx=8, feed=8, net_run=8)
 
     # 布局不规范的产出算子：其输出的张量若被当作 cut 图输入，converter 的布局
@@ -1529,19 +1613,10 @@ class QnnTruncatedAccuracyAnalysis:
                                      'Unsqueeze', 'Slice', 'Gather', 'Split', 'Expand')
 
     def __init__(self, dbg: QnnAccuracyDebugger, onnx_path):
-        """组合持有 QnnAccuracyDebugger；只存属性不做初始化（下表属性到 _collect_run_context 才填）。"""
+        """保存依赖；每轮共享数据由 _collect_run_context 初始化。"""
         self.dbg = dbg
         self.onnx_path = Path(onnx_path) if onnx_path else None
-        self._dlc_ops: dict[str, dict] = {}    # DLC 输出张量 -> {'inputs', 'op_type'}；collect_run_context 填充
-        self._onnx_acts: set[str] = set()      # ONNX 节点输出 ∪ 图输入（不含 initializer）
-        self._onnx_model = None                # onnx.ModelProto，整轮只 load 一次后复用
-        self._onnx_producer: dict[str, str] = {}    # 张量 -> 产出它的 ONNX 算子类型
-        self._onnx_inputs: dict[str, list] = {}     # 张量 -> 该 ONNX 算子的输入
-        self._onnx_rank: dict[str, int] = {}        # 张量 -> 维数（ONNX 带 shape 信息时）
-        self._input_order: str = 'nhwc'             # 模型原始输入布局（run 开头取自 dbg）
-        self._model_input_names: list[str] = []     # ONNX graph.input 顺序 = input_list 列顺序
-        self._model_inputs: set[str] = set()
-        self._input_raw_by_name: dict[str, str] = {}  # 输入名 -> input_list 第一样本的 raw 路径
+        self._context: dict = {'stage_results': []}
 
     # ------------------------------------------------------------------
     # 入口：run() —— 阶段化编排（每个阶段委托一个私有方法）
@@ -1555,12 +1630,10 @@ class QnnTruncatedAccuracyAnalysis:
         （QnnAccuracyDebugger.accuracy_analysis）捕获后只输出 entire 报告。
         """
         dbg = self.dbg
+        self._context = {'stage_results': []}
         if self.onnx_path is None:
             raise ValueError("QnnTruncatedAccuracyAnalysis needs onnx_path "
                                "(QnnAccuracyDebugger(..., onnx_path=...))")
-
-        # 0) 运行上下文：输入布局（layout 声明与喂数重排都按它来）
-        self._input_order = getattr(dbg, 'set_input_order', 'nhwc')
 
         # 1) golden dump（复用 dbg.working_dir/golden_output，缺则补跑一次）
         golden_dir = dbg.ensure_golden_dump(golden_dlc_path, input_list)
@@ -1570,11 +1643,11 @@ class QnnTruncatedAccuracyAnalysis:
         print(f"[QAIRTAccuracyDebugger] golden layers: {len(golden)}")
 
         # 2) 层候选 + v2 encodings + 模型输入名/raw 映射 + 全图 NCHW dims
-        layers, v2_encodings_path, dims_nchw = self._collect_run_context(
+        layers = self._collect_run_context(
             target_dlc_path, input_list, golden, only_tensor_prefix)
 
-        # 3) 逐层准备：cut ONNX（前 2 层浮点上界）+ 单层 overrides
-        infos = self._prepare_all_layers(layers, v2_encodings_path, dims_nchw)
+        # 3) 准备目标子图与单层 overrides
+        infos = self._prepare_all_layers(layers)
 
         # 4) 阶段A converter（进程池）    5) 阶段B tiny meta（主进程直读）
         converted_infos = self._stage_converter(infos)
@@ -1582,28 +1655,32 @@ class QnnTruncatedAccuracyAnalysis:
 
         # 6) 阶段C ctx binary    7) 阶段D feed + 阶段E net-run
         ctx_ready_items = self._stage_context_binary(meta_ready_items)
-        net_run_ok_items = self._stage_feed_and_netrun(ctx_ready_items, golden, dims_nchw)
+        net_run_ok_items = self._stage_feed_and_netrun(ctx_ready_items)
 
         # 8) best-match 比对 vs golden
-        return self._collect_results(net_run_ok_items, golden, dims_nchw, total=len(layers))
+        return self._collect_results(net_run_ok_items, total=len(layers))
 
     # ------------------------------------------------------------------
     # 阶段私有方法（按 run() 调用顺序排列）
     # ------------------------------------------------------------------
 
     def _collect_run_context(self, target_dlc_path: str, input_list: str,
-                             golden: dict, only_tensor_prefix) -> tuple:
+                             golden: dict, only_tensor_prefix) -> list:
         """反射层候选（按前缀/golden 过滤）+ 导出 v2 encodings + 输入映射 + 全图 dims。
 
         模型输入名取 ONNX graph.input 顺序（= prepare_input_data 写 raw 的顺序），
         input_list 首样本按序对应每个输入，多输入模型不写死 input0。
-        同时填充子图映射用的 _dlc_ops / _onnx_acts（口径见 subgraph_boundary）。
+        图索引、编码和输入映射集中保存在本轮上下文，不传入 converter 进程池。
         """
+        self._context = ctx = {
+            'stage_results': [], 'golden': golden,
+            'input_order': str(getattr(self.dbg, 'set_input_order', 'nhwc')).lower(),
+            'dlc_ops': {}, 'onnx_producer': {}, 'onnx_inputs': {}, 'onnx_rank': {},
+        }
         candidates = self.extract_layer_candidates(target_dlc_path)
-        self._dlc_ops = {}
         for c in candidates:
-            self._dlc_ops.setdefault(c['tensor'], {
-                'inputs': c['io_tensors'][:-1], 'op_type': c['op_type']})
+            ctx['dlc_ops'].setdefault(c['tensor'], {
+                'inputs': c['inputs'], 'op_type': c['op_type']})
 
         layers = candidates
         if only_tensor_prefix:
@@ -1611,38 +1688,33 @@ class QnnTruncatedAccuracyAnalysis:
         layers = [c for c in layers if self._sanitize_name(c['tensor']) in golden]
         print(f"[QAIRTAccuracyDebugger] candidate layers to analyze: {len(layers)}")
 
-        v2_encodings_path = self.extract_dlc_encoding(target_dlc_path)
+        ctx['encodings_path'] = self.extract_dlc_encoding(target_dlc_path)
 
         full_m = onnx.load(str(self.onnx_path))
-        self._onnx_model = full_m
-        self._onnx_acts = ({o for n in full_m.graph.node for o in n.output}
-                           | {i.name for i in full_m.graph.input})
-        self._model_input_names = [i.name for i in full_m.graph.input]
-        self._model_inputs = set(self._model_input_names)
-        self._onnx_producer: dict[str, str] = {}     # 张量 -> 产出它的 ONNX 算子类型
-        self._onnx_inputs: dict[str, list] = {}      # 张量 -> 该 ONNX 算子的输入
-        self._onnx_rank: dict[str, int] = {}         # 张量 -> 维数（有 shape 信息时）
+        ctx['onnx_model'] = full_m
+        ctx['onnx_acts'] = ({o for n in full_m.graph.node for o in n.output}
+                            | {i.name for i in full_m.graph.input})
+        ctx['model_input_names'] = [i.name for i in full_m.graph.input]
         for n in full_m.graph.node:
             for o in n.output:
-                self._onnx_producer[o] = n.op_type
-                self._onnx_inputs[o] = list(n.input)
+                ctx['onnx_producer'][o] = n.op_type
+                ctx['onnx_inputs'][o] = list(n.input)
         for v in (list(full_m.graph.value_info) + list(full_m.graph.input)
                   + list(full_m.graph.output)):
             if v.type.tensor_type.HasField('shape'):
-                self._onnx_rank[v.name] = len(v.type.tensor_type.shape.dim)
+                ctx['onnx_rank'][v.name] = len(v.type.tensor_type.shape.dim)
         with open(input_list, 'r', encoding='utf-8') as f:
             first_line = f.readline().strip()
         tokens = first_line.split()
-        if len(tokens) != len(self._model_input_names):
+        if len(tokens) != len(ctx['model_input_names']):
             raise RuntimeError(
                 f"[QAIRTAccuracyDebugger] input_list raw count ({len(tokens)}) != "
-                f"model inputs ({len(self._model_input_names)}): {self._model_input_names}")
-        self._input_raw_by_name = dict(zip(self._model_input_names, tokens))
-        dims_nchw = self.onnx_graph_dims_nchw(str(self.onnx_path), model=full_m)
-        return layers, v2_encodings_path, dims_nchw
+                f"model inputs ({len(ctx['model_input_names'])}): {ctx['model_input_names']}")
+        ctx['input_raw_by_name'] = dict(zip(ctx['model_input_names'], tokens))
+        ctx['dims_nchw'] = self.onnx_graph_dims_nchw(str(self.onnx_path), model=full_m)
+        return layers
 
-    def _prepare_all_layers(self, layers: list, v2_encodings_path: str,
-                            dims_nchw: dict) -> list:
+    def _prepare_all_layers(self, layers: list) -> list:
         """逐层准备：样本目录只用纯序号 001..，张量名只出现在输出 raw 文件名一次。
 
         把张量名嵌进绝对路径会超 ~260 字符，深层长名层 qnn-net-run 写文件失败
@@ -1652,118 +1724,142 @@ class QnnTruncatedAccuracyAnalysis:
         samples_dir = dbg.working_dir / 'truncated'   # 001/002/... 直接放这里
         samples_dir.mkdir(parents=True, exist_ok=True)
 
-        infos = []
-        for i, layer in enumerate(layers):
-            tag = f"{i + 1:03d}"
-            sdir = samples_dir / tag
-            sdir.mkdir(parents=True, exist_ok=True)
-            info = self._trunc_prepare_layer(sdir, layer, v2_encodings_path, dims_nchw)
-            if info is not None:
-                infos.append(info)
+        def prepare(info):
+            info['sdir'].mkdir(parents=True, exist_ok=True)
+            prepared = self._trunc_prepare_layer(info['sdir'], info)
+            if prepared is None:
+                return self._stage_result(info, 'prepare', status='skipped',
+                                          reason='no ONNX output or usable input boundary')
+            return self._stage_result(prepared, 'prepare')
+
+        results = [self._call_stage(prepare, dict(layer, sdir=samples_dir / f'{i + 1:03d}'),
+                                   'prepare') for i, layer in enumerate(layers)]
+        infos = self._finish_stage(results)
         print(f"[QAIRTAccuracyDebugger] truncated prepared layers: {len(infos)}")
         if not infos:
             raise RuntimeError("[QAIRTAccuracyDebugger] truncated: no layer prepared")
         return infos
 
     def _stage_converter(self, infos: list) -> list:
-        """阶段A：converter 进程池，每层一个任务（chunksize=1）按提交序回收。
+        """按完成顺序更新进度，按输入顺序返回成功层。
 
-        每层一个任务而非静态分片：引擎复用已带来同等收益，动态派发还避免巨型层
-        拖长某个分片（MSI 有 36.7MB 的 cut 单层 ~4s）。返回产物有效的层上下文；
-        阶段失败不中断，交由下游继续过滤/汇报。
-
-        池在 WoA（x64 模拟）上会概率性硬崩（qti 原生模块 0xC0000005，与量化配置、
-        具体层都无关）。硬崩按"部分失败"处理：已完成层的产物已落盘，在飞丢失的层用
-        每层一个独立进程**并发**补跑（不复用引擎，单层崩只损失该层）—— 否则一次崩溃
-        会让整段 single 作废。实测 32 层补跑 W=8 比顺序快 ~7 倍（9.6s vs 66.5s）。
+        进程内复用 converter 引擎；池崩后凭完成标记保留产物，缺失层独立补跑。
         """
-        from concurrent.futures import ProcessPoolExecutor
+        from concurrent.futures import ProcessPoolExecutor, as_completed
         from concurrent.futures.process import BrokenProcessPool
         import tqdm as _tqdm
+        # 数字目录会被下一轮复用，不能把旧 DLC 或旧完成标记当成本轮产物。
+        ready, cleanup_results = [], []
+        for info in infos:
+            try:
+                out = Path(info['dlc_q'])
+                for path in (out, out.with_suffix('.converted'), *(info['sdir'] / name
+                             for name in ('comparison.json', 'converter.log', 'converter_retry.log'))):
+                    path.unlink(missing_ok=True)
+                ready.append(info)
+            except OSError as exc:
+                cleanup_results.append(self._stage_result(info, 'converter', reason=str(exc)))
+        self._finish_stage(cleanup_results)
+        infos = ready
+        if not infos:
+            return []
         jobs = [(str(info['cut_onnx']), str(info['ov_json']), info['layout'],
                  str(info['dlc_q'])) for info in infos]
 
-        codes, tails = [None] * len(jobs), [None] * len(jobs)
+        results = [None] * len(jobs)
         pool_aborted = False
         try:
             with ProcessPoolExecutor(max_workers=self.stage_max_workers['converter']) as pool:
+                idx_of = {pool.submit(QnnSdkTools.convert_one, job): idx
+                          for idx, job in enumerate(jobs)}
                 with _tqdm.tqdm(total=len(jobs), desc='single[trunc 1/3 converter]',
                                 unit='it', ncols=110, file=sys.stderr) as bar:
-                    for idx, (rc, tail) in enumerate(
-                            pool.map(QnnSdkTools.convert_one, jobs, chunksize=1)):
-                        codes[idx], tails[idx] = rc, tail
+                    for future in as_completed(idx_of):
+                        idx = idx_of[future]
+                        try:
+                            rc, reason = future.result()
+                            results[idx] = self._stage_result(infos[idx], 'converter', rc=rc, reason=reason)
+                        except BrokenProcessPool:
+                            raise
+                        except Exception:
+                            results[idx] = self._exception_result(infos[idx], 'converter')
                         bar.update(1)
         except BrokenProcessPool:
             pool_aborted = True
 
         def _produced(layer_info: dict) -> bool:
             out = Path(layer_info['dlc_q'])
-            return out.exists() and out.stat().st_size > 0
-
-        bad: set[int] = set()   # 补跑仍失败的层：即使残留半截产物也不算成功
-
-        # 成功判据：rc==0 且产物有效；rc 未知（在飞时被中止）则看产物，但补跑失败过的不算
-        def _converted(idx: int) -> bool:
-            if idx in bad:
+            try:
+                return out.is_file() and out.stat().st_size > 0
+            except OSError:
                 return False
-            return (_produced(infos[idx]) if codes[idx] is None
-                    else codes[idx] == 0 and _produced(infos[idx]))
 
-        for layer_info, return_code, log_tail in zip(infos, codes, tails):
-            if return_code not in (0, None) and log_tail:
-                print(f"  [conv fail] {layer_info['tensor']}: {log_tail.strip()[-600:]}")
+        # rc 未知时还需 worker 的完成标记；非空的半截 DLC 不代表转换成功。
+        def _converted(idx: int) -> bool:
+            if not _produced(infos[idx]):
+                return False
+            if results[idx] is None:
+                return Path(infos[idx]['dlc_q']).with_suffix('.converted').is_file()
+            return results[idx]['status'] == 'ok'
 
         if pool_aborted:
             lost = [idx for idx in range(len(infos)) if not _converted(idx)]
             print(f"[QAIRTAccuracyDebugger] converter pool aborted; {len(lost)} layer(s) "
                   f"lost, retrying in isolated processes")
-            MultThreadExetutor.set_max_workers(self.stage_max_workers['converter_retry'])
             for attempt in (1, 2):
                 pending = [idx for idx in lost if not _converted(idx)]
                 if not pending:
                     break
-                retry_codes = self._run_batch_progress(
-                    self._retry_one_isolated, [((infos[idx],), {}) for idx in pending],
-                    f'single[trunc 1/3 conv retry {attempt}]')
-                for idx, rc in zip(pending, retry_codes):
-                    if rc == 0:
-                        codes[idx] = 0
-                        bad.discard(idx)
-                    else:
-                        bad.add(idx)
+                retried = self._run_batch_progress(
+                    self._retry_one_isolated, [infos[idx] for idx in pending], 'converter_retry',
+                    f'single[trunc 1/3 conv retry {attempt}]',
+                    max_workers=self.stage_max_workers['converter_retry'])
+                for result in retried:
+                    result['attempt'] = attempt
+                self._finish_stage(retried)
+                for idx, result in zip(pending, retried):
+                    results[idx] = dict(result, stage='converter')
+                    results[idx].pop('attempt', None)
 
-        converted_infos = [info for idx, info in enumerate(infos) if _converted(idx)]
-        failed_count = len(infos) - len(converted_infos)
-        if failed_count:
-            print(f"[QAIRTAccuracyDebugger] truncated converter failures: {failed_count}")
-        return converted_infos
+        for idx, info in enumerate(infos):
+            if results[idx] is None:
+                results[idx] = self._stage_result(info, 'converter', reason=(
+                    '' if _converted(idx) else 'worker exited without a completed DLC'))
+            elif results[idx]['status'] == 'ok' and not _produced(info):
+                results[idx].update(status='failed', reason='DLC is missing or empty')
+        return self._finish_stage(results)
 
-    @staticmethod
-    def _retry_one_isolated(info: dict) -> int:
-        """池崩后补跑一层：全新进程跑 converter（一个进程只转一层，硬崩只损失该层）。
-
-        返回 0 表示产物有效；非 0 由调用方记账并在下一轮重试。每次尝试前清掉半截产物。
-        成功不打印（批次进度条已覆盖），失败打一行带原因。
-        """
+    def _retry_one_isolated(self, info: dict) -> dict:
+        """清除残留后独立补跑一层；失败日志落盘，由调用方汇报。"""
         out_path = Path(info['dlc_q'])
-        if out_path.exists():
-            out_path.unlink()
-        rc, tail = QnnSdkTools.convert_one_isolated(
+        out_path.unlink(missing_ok=True)
+        out_path.with_suffix('.converted').unlink(missing_ok=True)
+        rc, reason = QnnSdkTools.convert_one_isolated(
             (str(info['cut_onnx']), str(info['ov_json']), info['layout'], str(info['dlc_q'])))
-        if rc == 0 and out_path.exists() and out_path.stat().st_size > 0:
-            return 0
-        last = [line for line in tail.splitlines() if line.strip()][-1:]
-        print(f"  [conv retry fail] {info['tensor']}: rc={rc} "
-              f"{last[0].strip()[:110] if last else ''}")
-        return rc if rc != 0 else -1
+        if rc == 0 and (not out_path.is_file() or not out_path.stat().st_size):
+            reason = reason or 'DLC is missing or empty'
+        return self._stage_result(info, 'converter_retry', rc=rc, reason=reason)
 
     def _stage_meta(self, converted_infos: list) -> list:
-        """阶段B：tiny DLC meta 主进程直读，返回 [(层上下文, tiny meta)]（读取失败项剔除）。"""
-        tiny_metas = self.query_tiny_dlc_batch([layer_info['dlc_q']
-                                               for layer_info in converted_infos])
-        meta_ready_items = [(layer_info, tiny_meta)
-                            for layer_info, tiny_meta in zip(converted_infos, tiny_metas)
-                            if tiny_meta]
+        """阶段B：读取 tiny meta 写回层任务，剔除读取失败项。"""
+        import tqdm
+
+        def read_meta(info):
+            info['tiny_meta'] = None
+            meta = self.query_tiny_dlc(info['dlc_q'])
+            if not meta or not all(meta.get(key) for key in ('inputs', 'outputs', 'tensors')):
+                raise ValueError('tiny DLC metadata has no inputs, outputs or tensors')
+            for tensor in meta['inputs'] + meta['outputs']:
+                if (tensor.get('name') not in meta['tensors'] or tensor.get('dims') is None
+                        or any(d <= 0 for d in tensor['dims'])):
+                    raise ValueError(f'invalid boundary tensor metadata: {tensor}')
+            info['tiny_meta'] = meta
+            return self._stage_result(info, 'meta')
+
+        results = [self._call_stage(read_meta, info, 'meta') for info in tqdm.tqdm(
+            converted_infos, desc='single[trunc meta]', unit='it', ncols=110,
+            file=sys.stderr, disable=not converted_infos)]
+        meta_ready_items = self._finish_stage(results)
         print(f"[QAIRTAccuracyDebugger] truncated meta ok: "
               f"{len(meta_ready_items)}/{len(converted_infos)} (in-process)")
         return meta_ready_items
@@ -1775,30 +1871,21 @@ class QnnTruncatedAccuracyAnalysis:
         报 "QNN_DEFINITION_IMPL_GENERATED tensor not supported as output for Convert"，
         必须先离线编译成 context binary 再 --retrieve_context 执行。
         """
-        def _ctx(meta_ready_item):
-            layer_info, _tiny_meta = meta_ready_item
-            return self.run_qairt_context_binary_generator(
-                str(layer_info['dlc_q']), str(layer_info['sdir'] / 'quant.bin'),
+        def _ctx(layer_info):
+            bin_path = layer_info['sdir'] / 'quant.bin'
+            bin_path.unlink(missing_ok=True)
+            rc = self.run_qairt_context_binary_generator(
+                str(layer_info['dlc_q']), str(bin_path),
                 str(layer_info['sdir']), print_output=False)
+            reason = 'context binary is missing or empty' if rc == 0 and (
+                not bin_path.is_file() or not bin_path.stat().st_size) else ''
+            return self._stage_result(layer_info, 'ctx', rc=rc, reason=reason)
 
-        MultThreadExetutor.set_max_workers(self.stage_max_workers['ctx'])
-        ctx_items = [((item,), {}) for item in meta_ready_items]
-        ctx_codes = self._run_batch_progress(_ctx, ctx_items,
-                                            'single[trunc 2/3 ctx]')
-        # 失败层的 SDK 错误尾部由 run_command(print_output=False) 打，但它夹在进度条
-        # 流里、看不出属于哪一层；这里补"是哪一层 + 计数"便于定位（例如 2.46 HTP x86
-        # 编不出注意力分支 fp16->uint8 Convert 边界的 ctx，rc=15）。
-        ctx_ok = [item for item, code in zip(meta_ready_items, ctx_codes) if code == 0]
-        failed = [(item[0]['tensor'], code) for item, code
-                  in zip(meta_ready_items, ctx_codes) if code != 0]
-        if failed:
-            print(f"[QAIRTAccuracyDebugger] truncated ctx failures: {len(failed)}")
-            for tensor_name, code in failed:
-                print(f"  [ctx fail] {tensor_name}: rc={code}")
-        return ctx_ok
+        return self._finish_stage(self._run_batch_progress(
+            _ctx, meta_ready_items, 'ctx', 'single[trunc 2/3 ctx]',
+            max_workers=self.stage_max_workers['ctx']))
 
-    def _stage_feed_and_netrun(self, ctx_ready_items: list, golden: dict,
-                               dims_nchw: dict) -> list:
+    def _stage_feed_and_netrun(self, ctx_ready_items: list) -> list:
         """阶段D 写 fp32 feed + 阶段E net-run --retrieve_context（并行）。
 
         feed 铁律：输入文件永远是 fp32，net-run 会按该张量编码自行量化定点输入，
@@ -1807,52 +1894,48 @@ class QnnTruncatedAccuracyAnalysis:
         dbg = self.dbg
 
         # ---- 阶段D：feed（并行）----
-        def _feed(ctx_ready_item):
-            layer_info, tiny_meta = ctx_ready_item
-            return self._trunc_write_feed(layer_info, tiny_meta, golden, dims_nchw)
+        def _feed(layer_info):
+            layer_info['input_list'] = None
+            path = self._trunc_write_feed(layer_info)
+            if not isinstance(path, str) or not Path(path).is_file() or not Path(path).stat().st_size:
+                raise ValueError('input list is missing or empty')
+            layer_info['input_list'] = path
+            return self._stage_result(layer_info, 'feed')
 
-        MultThreadExetutor.set_max_workers(self.stage_max_workers['feed'])
-        feed_items = [((item,), {}) for item in ctx_ready_items]
-        input_list_paths = self._run_batch_progress(_feed, feed_items,
-                                      'single[trunc feeds]')
-        net_ready_items = [(ctx_ready_item, input_list_path)
-                           for ctx_ready_item, input_list_path
-                           in zip(ctx_ready_items, input_list_paths)
-                           if isinstance(input_list_path, str)]
-        feed_failed = len(ctx_ready_items) - len(net_ready_items)
-        if feed_failed:
-            print(f"[QAIRTAccuracyDebugger] truncated feed failures: {feed_failed} "
-                  f"(逐层原因见上面 feed failed for ...)")
+        net_ready_items = self._finish_stage(self._run_batch_progress(
+            _feed, ctx_ready_items, 'feed', 'single[trunc feeds]',
+            max_workers=self.stage_max_workers['feed']))
 
         # ---- 阶段E：net-run（并行）----
-        def _net(net_ready_item):
-            (layer_info, _tiny_meta), input_list_path = net_ready_item
-            return self.run_qnn_net_run_bin(
+        def _net(layer_info):
+            run_dir = layer_info['sdir'] / 'quant_run'
+            if run_dir.exists():
+                # 只清本层生成的输出目录；拒绝沿链接删除到其它位置。
+                if run_dir.resolve().parent != layer_info['sdir'].resolve():
+                    raise ValueError(f'output directory escapes layer directory: {run_dir}')
+                shutil.rmtree(run_dir)
+            rc = self.run_qnn_net_run_bin(
                 str(layer_info['sdir'] / 'quant.bin'), dbg.backend_lib_target,
-                input_list_path, str(layer_info['sdir'] / 'quant_run'), print_output=False)
+                layer_info['input_list'], str(run_dir), print_output=False)
+            reason = 'no non-empty output in Result_0' if rc == 0 and not any(
+                p.stat().st_size for p in (run_dir / 'Result_0').rglob('*.raw')) else ''
+            return self._stage_result(layer_info, 'net-run', rc=rc, reason=reason)
 
-        MultThreadExetutor.set_max_workers(self.stage_max_workers['net_run'])
-        net_items = [((item,), {}) for item in net_ready_items]
-        net_codes = self._run_batch_progress(_net, net_items,
-                                            'single[trunc 3/3 net-run]')
-        net_run_ok_items = [item for item, code in zip(net_ready_items, net_codes)
-                            if code == 0]
-        net_failed = [(item[0][0]['tensor'], code) for item, code
-                      in zip(net_ready_items, net_codes) if code != 0]
-        if net_failed:
-            print(f"[QAIRTAccuracyDebugger] truncated net-run failures: {len(net_failed)}")
-            for tensor_name, code in net_failed:
-                print(f"  [net-run fail] {tensor_name}: rc={code}")
-        return net_run_ok_items
+        return self._finish_stage(self._run_batch_progress(
+            _net, net_ready_items, 'net-run', 'single[trunc 3/3 net-run]',
+            max_workers=self.stage_max_workers['net_run']))
 
-    def _collect_results(self, net_run_ok_items: list, golden: dict, dims_nchw: dict,
-                         total: int) -> dict:
+    def _collect_results(self, net_run_ok_items: list, total: int) -> dict:
         """阶段8：best-match 比对汇总成统一 dict；一层都没成功时抛错（single 视为失败）。"""
         accuracy = {}
-        for (layer_info, tiny_meta), _input_list_path in net_run_ok_items:
-            compared = self._trunc_compare(layer_info, tiny_meta, golden, dims_nchw)
-            if compared is None:
-                continue
+        def compare(info):
+            info['comparison'] = self._trunc_compare(info)
+            return self._stage_result(info, 'compare', reason=(
+                '' if info['comparison'] is not None else 'no finite output with matching dimensions'))
+
+        results = [self._call_stage(compare, info, 'compare') for info in net_run_ok_items]
+        for layer_info in self._finish_stage(results):
+            compared = layer_info['comparison']
             accuracy[compared['name']] = {
                 'entire_cos': None, 'entire_euc': None, 'entire_mse': None,
                 'single_cos': compared['cos'], 'single_euc': compared['euc'],
@@ -1862,6 +1945,49 @@ class QnnTruncatedAccuracyAnalysis:
         print(f"[QAIRTAccuracyDebugger] single(truncated) succeeded: "
               f"{len(accuracy)}/{total}")
         return accuracy
+
+    def _stage_result(self, task, stage, *, rc=None, reason='', status=None) -> dict:
+        """统一阶段状态；SDK rc 原样保留，异常或无 SDK 调用时为 None。"""
+        log_name = {'converter': 'converter.log', 'converter_retry': 'converter_retry.log',
+                    'ctx': 'ctx.log', 'net-run': 'quant_run/net-run.log'}.get(stage, f'{stage}.log')
+        return dict(task=task, stage=stage, rc=rc, reason=reason,
+                    status=status or ('failed' if reason or rc not in (None, 0) else 'ok'),
+                    log_path=task['sdir'] / log_name)
+
+    def _exception_result(self, task, stage) -> dict:
+        result = self._stage_result(task, stage, reason=traceback.format_exc().strip().splitlines()[-1])
+        try:
+            with result['log_path'].open('a', encoding='utf-8') as log:
+                log.write(traceback.format_exc() + '\n')
+        except OSError as exc:
+            result['reason'] += f'; log unavailable: {exc}'
+        return result
+
+    def _call_stage(self, fn, task, stage) -> dict:
+        try:
+            return fn(task)
+        except Exception:
+            return self._exception_result(task, stage)
+
+    def _finish_stage(self, results: list) -> list:
+        self._context['stage_results'].extend(results)
+        for result in results:
+            if result['status'] != 'ok':
+                print(f"  [{result['stage']} {result['status']}] {result['task']['tensor']}: "
+                      f"rc={result['rc']}; {result['reason']}; log: {result['log_path']}")
+        return [result['task'] for result in results if result['status'] == 'ok']
+
+    def save_stage_results(self):
+        """保存本轮阶段诊断；写盘失败不影响已有精度结果。"""
+        path = self.dbg.working_dir / 'stage_results.json'
+        try:
+            rows = [dict(tensor=r['task']['tensor'],
+                         **{key: str(value) if isinstance(value, Path) else value
+                            for key, value in r.items() if key != 'task'})
+                    for r in self._context['stage_results']]
+            path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+        except OSError as exc:
+            print(f'[QAIRTAccuracyDebugger] cannot save stage results: {exc}')
 
     # ------------------------------------------------------------------
     # 单层内部逻辑：准备 / 布局 / 喂数 / 比对（info 字典见 _trunc_prepare_layer）
@@ -1884,35 +2010,36 @@ class QnnTruncatedAccuracyAnalysis:
 
         Returns: 边界张量名列表（去重）；空 = 该层无可用子图（跳过）。
         """
+        ctx = self._context
         boundary: list[str] = []
         seen: set[str] = set()
-        stack = list(self._dlc_ops.get(target_tensor, {}).get('inputs', []))
+        stack = list(ctx['dlc_ops'].get(target_tensor, {}).get('inputs', []))
         while stack:
             t = stack.pop()
             if t in seen:
                 continue
             seen.add(t)
-            prod = self._onnx_producer.get(t)
-            rank = self._onnx_rank.get(t)
-            if t in self._model_inputs or (prod is not None
+            prod = ctx['onnx_producer'].get(t)
+            rank = ctx['onnx_rank'].get(t)
+            if t in ctx['model_input_names'] or (prod is not None
                                            and prod not in self.noncanonical_layout_producers
                                            and (rank is None or rank == 4)):
                 boundary.append(t)
-            elif t in self._dlc_ops:                     # DLC 自造/融合中间张量
-                stack.extend(self._dlc_ops[t]['inputs'])
+            elif t in ctx['dlc_ops']:                     # DLC 自造/融合中间张量
+                stack.extend(ctx['dlc_ops'][t]['inputs'])
             elif prod is not None:                       # 非规范 ONNX 中间张量
-                stack.extend(self._onnx_inputs.get(t, []))
+                stack.extend(ctx['onnx_inputs'].get(t, []))
             # else: 权重/常量等，不构成边界
         return boundary
 
-    def _trunc_prepare_layer(self, sdir: Path, layer: dict, v2_encodings_path: str,
-                             dims_nchw: dict) -> dict | None:
+    def _trunc_prepare_layer(self, sdir: Path, layer: dict) -> dict | None:
         """单层准备：按 DLC-op -> ONNX 子图映射切 cut ONNX + 生成单层 overrides。
 
+        各阶段沿用此字典，后续附加 tiny_meta 与 input_list。
         输出不在 ONNX 图或子图无输入边界（不可截断）时返回 None。
         """
         tensor = layer['tensor']
-        if tensor not in self._onnx_acts:
+        if tensor not in self._context['onnx_acts']:
             print(f"[QAIRTAccuracyDebugger] skip (not an onnx tensor): {tensor}")
             return None
         acts = self.subgraph_boundary(tensor)
@@ -1920,14 +2047,10 @@ class QnnTruncatedAccuracyAnalysis:
             print(f"[QAIRTAccuracyDebugger] skip (no onnx subgraph input): {tensor}")
             return None
         cut_onnx = sdir / 'cut.onnx'
-        try:
-            self.build_cut_onnx(str(self.onnx_path), cut_onnx, acts, tensor,
-                                model=self._onnx_model)
-        except Exception as exc:
-            print(f"[QAIRTAccuracyDebugger] cut failed for {tensor}: {type(exc).__name__}")
-            return None
+        self.build_cut_onnx(str(self.onnx_path), cut_onnx, acts, tensor,
+                            model=self._context['onnx_model'])
         ov_json = sdir / 'overrides.json'
-        self.make_layer_override_json(layer['io_tensors'], v2_encodings_path,
+        self.make_layer_override_json(layer['io_tensors'], self._context['encodings_path'],
                                       str(ov_json))
         return {
             'tensor': tensor, 'act_inputs': acts, 'sdir': sdir,
@@ -1942,9 +2065,9 @@ class QnnTruncatedAccuracyAnalysis:
         # prepare_input_data 决定，converter 按声明的 source 解释外部输入；
         # 内部统一 desired NHWC（与整图/激活 golden dump 一致）。
         # 其余激活 cut 输入保持 ONNX 自然 NCHW -> 内部 NHWC（喂数按 meta dims 重排）。
-        io = getattr(self, '_input_order', 'nhwc')
+        io = self._context['input_order']
         src_upper = 'NCHW' if str(io).lower() == 'nchw' else 'NHWC'
-        model_ins = getattr(self, '_model_input_names', None) or []
+        model_ins = self._context['model_input_names']
         args = ''
         for a in acts:
             src = src_upper if a in model_ins else 'NCHW'
@@ -1952,59 +2075,51 @@ class QnnTruncatedAccuracyAnalysis:
                      f' --desired_input_layout "{a}" NHWC')
         return args
 
-    def _trunc_write_feed(self, info: dict, qmeta: dict, golden: dict,
-                          dims_nchw: dict) -> str | None:
-        """按 tiny DLC 图输入顺序写 fp32 feed，返回该层 input_list 路径（失败 None）。
+    def _trunc_write_feed(self, info: dict) -> str:
+        """按 tiny DLC 输入顺序写 fp32 feed，异常由阶段边界统一隔离。"""
+        ctx = self._context
+        qmeta, golden, dims_nchw = info['tiny_meta'], ctx['golden'], ctx['dims_nchw']
+        feed_dir = info['sdir'] / 'feed'
+        feed_dir.mkdir(parents=True, exist_ok=True)
+        feed_raw_paths = []
+        for input_index, tiny_dlc_input in enumerate(qmeta['inputs']):
+            input_name, input_dims = tiny_dlc_input['name'], tiny_dlc_input['dims']
+            target_dims_nchw = dims_nchw.get(input_name)
+            # converter 已声明 desired NHWC；相等维度不能仅凭 shape 猜布局。
+            target_layout = self.trunc_order_of(input_dims, target_dims_nchw, preferred_order='nhwc')
+            if target_dims_nchw is not None and target_layout is None:
+                raise ValueError(f'cannot resolve input layout for {input_name!r}: '
+                                 f'{input_dims} vs {target_dims_nchw}')
+            if input_name in ctx['model_input_names']:
+                feed_array = np.fromfile(ctx['input_raw_by_name'][input_name], dtype=np.float32)
+                source_layout = ctx['input_order']
+            else:
+                # 中间激活直接使用全图 Golden 的 NHWC dump。
+                feed_array = golden[self._sanitize_name(input_name)].astype(np.float32)
+                source_layout = 'nhwc'
+            if target_layout is not None and target_layout != source_layout:
+                feed_array = self.trunc_arrange(feed_array, source_layout, target_layout, target_dims_nchw)
+            if feed_array.size != int(np.prod(input_dims)) or not np.isfinite(feed_array).all():
+                raise ValueError(f'invalid feed for {input_name!r}: {feed_array.size} vs {input_dims}')
+            feed_raw_path = feed_dir / f'in{input_index}_{self._sanitize_name(input_name)}.raw'
+            feed_array.astype(np.float32).tofile(str(feed_raw_path))
+            feed_raw_paths.append(str(feed_raw_path))
+        input_list_path = info['sdir'] / 'input_list.txt'
+        input_list_path.write_text(' '.join(feed_raw_paths) + '\n', encoding='utf-8')
+        return str(input_list_path)
 
-        两类输入的源布局不同但都要重排到 tiny DLC 声明的外部 dims，见函数体内注释。
-        """
-        try:
-            model_input_names = getattr(self, '_model_input_names', None) or []
-            raw_path_by_input_name = getattr(self, '_input_raw_by_name', {})
-            feed_dir = info['sdir'] / 'feed'
-            feed_dir.mkdir(parents=True, exist_ok=True)
-            feed_raw_paths = []
-            for input_index, tiny_dlc_input in enumerate(qmeta['inputs']):
-                input_name = tiny_dlc_input['name']
-                input_dims_in_tiny_dlc = tiny_dlc_input['dims']
-                target_dims_nchw = dims_nchw.get(input_name)
-                target_layout = self.trunc_order_of(input_dims_in_tiny_dlc, target_dims_nchw)
-                if input_name in model_input_names:
-                    # 模型原始输入：直接取 input_list 那一份 raw，源布局 = 生成它时用的 set_input_order
-                    feed_array = np.fromfile(raw_path_by_input_name[input_name], dtype=np.float32)
-                    source_layout = 'nchw' if getattr(self, '_input_order', 'nhwc') == 'nchw' else 'nhwc'
-                    if target_layout is not None and target_layout != source_layout:
-                        feed_array = self.trunc_arrange(feed_array, source_layout,
-                                                        target_layout, target_dims_nchw)
-                else:
-                    # 中间激活：golden 全图 dump 是 NHWC
-                    golden_key = self._sanitize_name(input_name)
-                    if golden_key not in golden:
-                        raise KeyError(f'golden dump missing for input tensor {input_name!r}')
-                    feed_array = golden[golden_key].astype(np.float32)
-                    if target_layout == 'nchw':
-                        feed_array = self.trunc_arrange(feed_array, 'nhwc', 'nchw',
-                                                        target_dims_nchw)
-                feed_raw_path = feed_dir / f'in{input_index}_{self._sanitize_name(input_name)}.raw'
-                feed_array.astype(np.float32).tofile(str(feed_raw_path))
-                feed_raw_paths.append(str(feed_raw_path))
-            input_list_path = info['sdir'] / 'input_list.txt'
-            input_list_path.write_text(' '.join(feed_raw_paths) + '\n', encoding='utf-8')
-            return str(input_list_path)
-        except Exception as exc:
-            print(f"[QAIRTAccuracyDebugger] feed failed for {info['tensor']}: "
-                  f"{type(exc).__name__}: {exc}")
-            return None
-
-    def _trunc_compare(self, info: dict, qmeta: dict, golden: dict,
-                       dims_nchw: dict) -> dict | None:
+    def _trunc_compare(self, info: dict) -> dict | None:
         """best-match：该层 dump 出的候选数组与 golden 按两种布局比，取 cos 最大者。
 
         Returns: {'name','cos','euc','mse'}；没有任何尺寸匹配的候选时 None（该层不产出）。
         """
+        qmeta = info['tiny_meta']
+        golden, dims_nchw = self._context['golden'], self._context['dims_nchw']
         target_tensor = info['tensor']
         golden_tensor_key = self._sanitize_name(target_tensor)
         golden_array = golden[golden_tensor_key]
+        if not golden_array.size or not np.isfinite(golden_array).all():
+            raise ValueError(f'Golden tensor is empty or non-finite: {target_tensor}')
         target_dims_nchw = dims_nchw.get(target_tensor)
         # 两种布局各算一次 cos：converter 可能给 cut 图输出补 transpose
         golden_references = {'direct': golden_array}
@@ -2019,41 +2134,81 @@ class QnnTruncatedAccuracyAnalysis:
             位数与 dtype 不符时（net-run 常把量化张量以 fp32 落盘）退回按 fp32 读。
             """
             dump_bytes = dump_path.stat().st_size
-            meta_tensor_name = next((name for name in qmeta['tensors']
-                                     if self._sanitize_name(name) == dump_path.stem), None)
+            meta_tensor_name = tensor_names.get(dump_path.stem)
+            if meta_tensor_name is None:
+                meta_tensor_name = tensor_names.get(dump_path.stem.removesuffix('_native'))
             tensor_entry = qmeta['tensors'].get(meta_tensor_name, {}) if meta_tensor_name else {}
+            tensor_dims = tensor_entry.get('dims')
+            if tensor_dims is not None and int(np.prod(tensor_dims)) != golden_array.size:
+                return None
             numpy_dtype = QnnSdkTools.numpy_dtype_of_qnn_dtype.get(tensor_entry.get('dtype'))
             if (numpy_dtype is not None
                     and dump_bytes == np.dtype(numpy_dtype).itemsize * golden_array.size):
                 dump_array = np.fromfile(str(dump_path), dtype=numpy_dtype)
                 if np.issubdtype(numpy_dtype, np.floating):
-                    return dump_array.astype(np.float32)
+                    return dump_array.astype(np.float32), np.dtype(numpy_dtype).name, meta_tensor_name
                 scale = tensor_entry.get('scale')
                 if scale is None:
                     return None
-                return ((dump_array.astype(np.float64)
-                         + tensor_entry.get('zp', 0)) * scale).astype(np.float32)
+                values = dump_array.astype(np.float64)
+                scale = np.asarray(scale, dtype=np.float64)
+                zero_point = np.asarray(tensor_entry.get('zp', 0), dtype=np.float64)
+                if 'axis' in tensor_entry:
+                    shape = tensor_entry.get('dims')
+                    axis = int(tensor_entry['axis'])
+                    if (not shape or not -len(shape) <= axis < len(shape)
+                            or int(np.prod(shape)) != values.size):
+                        raise ValueError(f'invalid per-axis shape for {meta_tensor_name!r}')
+                    axis %= len(shape)
+                    broadcast_shape = [1] * len(shape)
+                    broadcast_shape[axis] = shape[axis]
+                    if scale.size != shape[axis] or zero_point.size not in (1, shape[axis]):
+                        raise ValueError(f'invalid per-axis encoding for {meta_tensor_name!r}')
+                    values = values.reshape(shape)
+                    scale = scale.reshape(broadcast_shape)
+                    if zero_point.size != 1:
+                        zero_point = zero_point.reshape(broadcast_shape)
+                return (((values + zero_point) * scale).astype(np.float32).reshape(-1),
+                        np.dtype(numpy_dtype).name, meta_tensor_name)
             if dump_bytes == 4 * golden_array.size:
-                return np.fromfile(str(dump_path), dtype=np.float32)
+                return np.fromfile(str(dump_path), dtype=np.float32), 'float32', meta_tensor_name
             return None
 
-        best_cos, best_euc, best_file_name = -2.0, None, None
-        for dump_path in (info['sdir'] / 'quant_run').rglob('*.raw'):
-            dump_array = load_dump_array(dump_path)
-            if dump_array is None:
+        best_cos, best_euc, best_match = -2.0, None, None
+        run_dir = info['sdir'] / 'quant_run'
+        # 一层只喂一个样本；固定扫描 Result_0，不混入其它样本的输出。
+        dump_dir = run_dir / 'Result_0'
+        tensor_names = {self._sanitize_name(name): name for name in qmeta['tensors']}
+        for dump_path in sorted(dump_dir.rglob('*.raw')):
+            loaded = load_dump_array(dump_path)
+            if loaded is None:
                 continue
-            for _layout_mode, golden_reference in golden_references.items():
+            dump_array, dump_dtype, meta_tensor_name = loaded
+            if not np.isfinite(dump_array).all():
+                continue
+            for layout_mode, golden_reference in golden_references.items():
                 if dump_array.size != golden_reference.size:
                     continue
                 cosine = float(np.dot(golden_reference, dump_array)
                                / (np.linalg.norm(golden_reference) * np.linalg.norm(dump_array) + 1e-12))
-                if cosine > best_cos:
+                if np.isfinite(cosine) and cosine > best_cos:
                     best_cos = cosine
                     best_euc = float(np.linalg.norm(golden_reference - dump_array))
-                    best_file_name = dump_path.name
-        if best_cos < -1.5:                      # 没有任何候选数组与之同尺寸
+                    best_match = {'file': str(dump_path.relative_to(run_dir)),
+                                  'golden_layout': layout_mode,
+                                  'dump_dtype': dump_dtype,
+                                  'meta_dtype': qmeta['tensors'].get(meta_tensor_name, {}).get('dtype')}
+        if best_cos < -1.5 or not np.isfinite(best_euc):
             print(f"[QAIRTAccuracyDebugger] output missing for {target_tensor}")
             return None
+        # 保留现有 best-match 数值策略，逐层记录来源供 SDK/布局差异定位。
+        try:
+            (info['sdir'] / 'comparison.json').write_text(
+                json.dumps({'tensor': target_tensor, 'match': best_match,
+                            'cos': best_cos, 'euc': best_euc}, ensure_ascii=False, indent=2),
+                encoding='utf-8')
+        except OSError as exc:
+            print(f"[QAIRTAccuracyDebugger] cannot save comparison for {target_tensor}: {exc}")
         return {'name': golden_tensor_key, 'cos': best_cos, 'euc': best_euc,
                 'mse': float(best_euc * best_euc / golden_array.size)}
 
@@ -2061,28 +2216,13 @@ class QnnTruncatedAccuracyAnalysis:
     # tiny DLC meta（读取本体在 QnnSdkTools；这里只加进度条与落盘）
     # ------------------------------------------------------------------
 
-    def query_tiny_dlc_batch(self, dlc_paths: list) -> list:
-        """批量读 tiny DLC meta（带 tqdm）：单个失败不拖累其余，返回与 dlc_paths 对齐、失败项 None。"""
-        import tqdm
-        if not dlc_paths:
-            return []
-        out = []
-        with tqdm.tqdm(total=len(dlc_paths), desc='single[trunc meta]', unit='it',
-                       ncols=110, file=sys.stderr) as bar:
-            for p in dlc_paths:
-                try:
-                    out.append(self.query_tiny_dlc(p))
-                except Exception as exc:
-                    print(f"[QAIRTAccuracyDebugger] tinydlc failed {p}: "
-                          f"{type(exc).__name__}: {exc}")
-                    out.append(None)
-                bar.update(1)
-        return out
-
     def query_tiny_dlc(self, dlc_path) -> dict:
         """读取单个 tiny DLC 图输入顺序/输出/张量量化参数（并落盘 meta json）。"""
         meta = QnnSdkTools.read_tiny_meta(str(dlc_path))
-        QnnSdkTools.write_tiny_meta(str(dlc_path), meta)
+        try:
+            QnnSdkTools.write_tiny_meta(str(dlc_path), meta)
+        except OSError as exc:
+            print(f'[QAIRTAccuracyDebugger] cannot save tiny metadata: {exc}')
         return meta
 
     # ------------------------------------------------------------------
@@ -2112,21 +2252,29 @@ class QnnTruncatedAccuracyAnalysis:
 
         cmd = f'qnn-context-binary-generator --model {model_lib} --backend {backend_lib} --log_level error'
         cmd += f' --dlc_path {dlc_path} --binary_file {bin_stem} --output_dir {output_dir}'
+        native_config = getattr(self.dbg, 'native_htp_config', None)
+        if native_config:
+            cmd += f' --config_file "{native_config}"'
         if output_tensors:
             if graph_name:
                 cmd += f' --set_output_tensors "{graph_name}:{output_tensors}"'
             else:
                 cmd += f' --set_output_tensors "{output_tensors}"'
 
-        return run_command(cmd, signature="[QAIRTAccuracyDebugger]", print_output=print_output)
+        return run_command(cmd, signature="[QAIRTAccuracyDebugger]", print_output=print_output,
+                           log_path=Path(output_dir) / 'ctx.log')
 
     def run_qnn_net_run_bin(self, bin_path: str, backend_lib: str, input_list: str,
                             output_dir: str, print_output: bool = True) -> int:
         """执行 qnn-net-run --retrieve_context <bin>（context binary 加载执行）。"""
         cmd = f'qnn-net-run --retrieve_context {bin_path} --backend {backend_lib}'
         cmd += f' --input_list {input_list} --output_dir {output_dir} --log_level error'
+        native_config = getattr(self.dbg, 'native_htp_config', None)
+        if native_config:
+            cmd += f' --config_file "{native_config}"'
 
-        return run_command(cmd, signature="[QAIRTAccuracyDebugger]", print_output=print_output)
+        return run_command(cmd, signature="[QAIRTAccuracyDebugger]", print_output=print_output,
+                           log_path=Path(output_dir) / 'net-run.log')
 
     def extract_dlc_encoding(self, model_path: str) -> str:
         """量化 DLC -> v2.0.0 encodings json（主进程直读，需 SDK 环境已注入）。"""
@@ -2170,34 +2318,26 @@ class QnnTruncatedAccuracyAnalysis:
             json.dump(out, f, ensure_ascii=False, indent=4)
         return out_json_path
 
-    def _run_batch_progress(self, fn, items, desc) -> list:
-        """并行提交一批任务并显示 tqdm，返回与 items（[(args, kwargs), ...]）同序的返回码。
-
-        子进程输出由调用方以 print_output=False 静默，终端只留进度条。单层的意外
-        异常按失败处理（记 -1 并打印），不让它连带丢掉整批其它层的结果。
-        """
-        from concurrent.futures import as_completed
+    def _run_batch_progress(self, fn, items, stage, desc, *, max_workers: int = 8) -> list:
+        """并行执行层任务，按完成顺序推进进度，按输入顺序返回阶段结果。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         import tqdm
 
         if not items:
             return []  # 空批次(如前面阶段全部失败)：直接返回，不闪 0 层进度条
 
-        for args, kw in items:
-            MultThreadExetutor.run_exetutor(fn, *args, **kw)
         n = len(items)
-        idx_of = {id(f): i for i, f in enumerate(MultThreadExetutor.future_list)}
-        codes = [None] * n
-        with tqdm.tqdm(total=n, desc=desc, unit='it', ncols=110, file=sys.stderr) as bar:
-            for fut in as_completed(MultThreadExetutor.future_list):
-                i = idx_of[id(fut)]
-                try:
-                    codes[i] = fut.result()
-                except Exception as exc:
-                    codes[i] = -1
-                    print(f"{desc} layer {i} raised {type(exc).__name__}: {exc}")
-                bar.update(1)
-        MultThreadExetutor.wait_and_close()  # 收尾并重置线程池供下一阶段
-        return codes
+        results = [None] * n
+        # 每批独立持有线程池；不再经全局工具二次读取 Future.result()。
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            idx_of = {pool.submit(self._call_stage, fn, task, stage): i
+                      for i, task in enumerate(items)}
+            with tqdm.tqdm(total=n, desc=desc, unit='it', ncols=110, file=sys.stderr) as bar:
+                for fut in as_completed(idx_of):
+                    i = idx_of[fut]
+                    results[i] = fut.result()
+                    bar.update(1)
+        return results
 
     # ------------------------------------------------------------------
     # 静态纯函数工具（无实例状态；布局重排 / ONNX 切图 / tiny meta 导出）
@@ -2234,14 +2374,17 @@ class QnnTruncatedAccuracyAnalysis:
         return flat
 
     @classmethod
-    def trunc_order_of(cls, dims: list, nchw_dims: list | None) -> str | None:
+    def trunc_order_of(cls, dims: list, nchw_dims: list | None,
+                       preferred_order: str | None = None) -> str | None:
+        """按 shape 识别布局；两种 shape 相同只能依赖调用方的显式布局约定。"""
         if nchw_dims is None or len(nchw_dims) != 4 or len(dims) != 4:
             return None
-        if list(dims) == list(nchw_dims):
-            return 'nchw'
-        if list(dims) == cls.trunc_perm_nhwc(nchw_dims):
-            return 'nhwc'
-        return None
+        matches = [order for order, shape in (
+            ('nchw', list(nchw_dims)), ('nhwc', cls.trunc_perm_nhwc(nchw_dims)))
+            if list(dims) == shape]
+        if len(matches) == 1:
+            return matches[0]
+        return preferred_order if preferred_order in matches else None
 
     @staticmethod
     def build_cut_onnx(onnx_path: str, out_onnx: Path, act_inputs: list,
@@ -2307,471 +2450,25 @@ class QnnTruncatedAccuracyAnalysis:
         onnx.save(nm, str(out_onnx))
 
 
-class AccuracyGraph:
-    """
-    精度分析网络图（Netron 风格）。
+class NetronGraphLayout:
+    """按有序内部节点和邻接关系计算 Netron 风格几何，不读取模型或指标。"""
 
-    将 RKNN/QNN 快照层以"方框节点 + 箭头连线"呈现为从左到右分层的 DAG，
-    节点填充色按累积精度 entire_cos 着色（红=差, 绿=良），悬停显示
-    单层精度与欧氏距离等详细信息。
-
-    Attributes:
-        data (dict): AccuracyGraph 内部数据结构（rows/inputs/outputs/paths）。
-        children (dict[str, list[str]]): 层 -> 下游层列表。
-        parents (dict[str, list[str]]): 层 -> 上游层列表。
-    """
-
-    # 常见算子类型 -> 边框颜色（Netron 风格色板）
-    # Netron (lutzroeder/netron) 类别色板（grapher.css）
-    CATEGORY_COLORS: dict[str, str] = {
-        'Layer': '#335588',          # 卷积、全连接等
-        'Activation': '#702921',     # ReLU、Sigmoid、Softmax、Clip 等
-        'Pool': '#335533',           # 池化
-        'Normalization': '#335544',  # LayerNorm、BatchNorm 等
-        'Dropout': '#454770',
-        'Shape': '#6c4f47',          # Reshape、Flatten 等
-        'Tensor': '#59423b',         # Concat、Split 等
-        'Transform': '#335544',      # Transpose、Squeeze、Unsqueeze 等
-        'Data': '#555555',           # 输入/输出数据
-        'Quantization': '#502800',   # 量化层
-        'Attention': '#783c00',      # 注意力
-        'Constant': '#eeeeee',       # 常量
-        'Control': '#eeeeee',        # 控制流
-    }
-    DEFAULT_COLOR = '#333333'        # Netron 未分类默认色
-
-    # 算子类型 -> Netron 类别
-    OP_CATEGORY: dict[str, str] = {
-        'Conv': 'Layer', 'Gemm': 'Layer', 'MatMul': 'Layer',
-        'Add': 'Layer', 'Mul': 'Layer', 'Sub': 'Layer', 'Div': 'Layer',
-        'Concat': 'Tensor', 'Split': 'Tensor', 'Slice': 'Tensor',
-        'Reshape': 'Shape', 'Flatten': 'Shape',
-        'Transpose': 'Transform', 'Squeeze': 'Transform', 'Unsqueeze': 'Transform',
-        'Softmax': 'Activation', 'Sigmoid': 'Activation', 'Relu': 'Activation',
-        'LeakyRelu': 'Activation', 'Clip': 'Activation', 'exSwish': 'Activation',
-        'LayerNormalization': 'Normalization', 'LayerNorm': 'Normalization',
-        'exNorm': 'Normalization', 'BatchNormalization': 'Normalization',
-        'exDataConvert': 'Data', 'Input': 'Data', 'Output': 'Data',
-        'exSDPAttention': 'Attention',
-        # ---- QNN (DLC 反射 op_type，见 docs/.../SupportedOps.html) ----
-        # 常用算子：保持精简，按实际模型出现与常见 QNN 算子补齐
-        # ---- QNN (DLC 反射 op_type，见 docs/.../SupportedOps.html) ----
-        # 只列前段(RKNN)未出现的 QNN 算子；同名映射已在上面定义，避免重复键
-        'Conv2d': 'Layer', 'DepthWiseConv2d': 'Layer', 'FullyConnected': 'Layer',
-        'TransposeConv2d': 'Layer',
-        'Eltwise_Binary': 'Activation', 'Eltwise_Or': 'Activation',
-        'Eltwise_And': 'Activation', 'Eltwise_Not': 'Activation',
-        'Prelu': 'Activation', 'ReluMinMax': 'Activation',
-        'Tanh': 'Activation', 'Gelu': 'Activation', 'HardSwish': 'Activation',
-        'ElementWiseNeuron': 'Activation', 'ElementWiseUnary': 'Activation',
-        'Resize': 'Transform',   # QNN Resize (最近邻/双线性上采样)
-        'PoolMax': 'Pool', 'PoolAvg': 'Pool', 'Pooling': 'Pool',
-        'BatchNorm': 'Normalization', 'RmsNorm': 'Normalization',
-        'InstanceNorm': 'Normalization',
-        "StridedSlice": "Tensor",
-    }
-
-    def __init__(
-        self,
-        accuracy: dict,
-        onnx_path: str | Path,
-        output_path: str | Path,
-        title: str = 'Accuracy Analysis',
-        *,
-        sanitize: bool = False,
-        include_input: bool = False,
-        layer_display=None,
-        dlc_candidates: list[dict] | None = None,
-        dlc_io: dict | None = None,
-    ):
-        """基于统一"层精度" dict 构建精度网络图（Netron 风格 HTML）。
-
-        onnx 计算图在本构造器内构建一次（_parse_accuracy_dict），不再由
-        RknnAccuracyDebugger / QnnAccuracyDebugger 各自构建（消除重复 load）。
-
-        Args:
-            accuracy: 统一层精度 dict：{层名: {'entire_cos'|'entire_euc'|'entire_mse'|
-                        'single_cos'|'single_euc': float|None, 'op_type': str|None(可选)}}。
-            onnx_path: 用于图结构/拓扑/算子类型推断的 ONNX 模型。
-            output_path: 输出 HTML 路径。
-            title: 图标题（如 'RKNN Graph Accuracy Analysis' / 'QNN ...'）。
-            sanitize: 层名是否为 sanitized（QNN raw 文件名清洗名 -> True；
-                      RKNN 快照名基于原始 ONNX 张量名 -> False）。
-            include_input: 是否追加 Input 示意终端（QNN raw 不含输入层 -> True；
-                           RKNN 快照已含输入层 -> False）。
-            layer_display: (graph, key) -> 节点显示名 的 resolver；graph 为 _parse
-                           内部构建好的 onnx 图（build_onnx_tensor_graph 返回值），
-                           调用方无需自行再 load。None = 恒等（dict 键即显示名，RKNN
-                           用）；QNN 传 lambda g, k: g['tensors'].get(k,k) 把 sanitized
-                           键还原成原始 ONNX 张量名。
-            dlc_candidates: 可选，量化 DLC 反射出的层候选列表（DlcV2EncodingExporter.
-                           layer_candidates() 产物：每项 {tensor, op_type, io_tensors}）。
-                           提供时本图按 **DLC 视角** 构建：
-                           - 节点全集 = 全部候选 op（精度结果没有的层也画，精度 None）；
-                           - 节点 op_type = DLC 反射类型（如 Prelu/Conv2d/Eltwise_Binary）；
-                           - 连线 = 按候选 io_tensors（DLC 实际拓扑，含 converter 融合层）。
-                           None（默认）时维持 ONNX 视角（RKNN / 无 DLC 时用）。
-            dlc_io: 可选，DLC IR 图边界 {"inputs": [...], "outputs": [...]}
-                           （DlcV2EncodingExporter.graph_io_tensors() 产物）。
-                           提供时 Input/Output 终端直接取图边界；None 时按
-                           "未被任何候选产出/消费"的启发式反推（旧行为）。
-        """
-        self._accuracy = accuracy or {}
-        self.onnx_path = Path(onnx_path)
-        self._sanitize = sanitize
-        self._include_input = include_input
-        self._layer_display = layer_display
-        self._dlc_candidates = dlc_candidates or None
-        self._dlc_io = dlc_io or None
-
-        self.output_path = Path(output_path)
-        self.title = title
-        self.node_sep = 50.0 # 横向：真实节点之间的间距
-        self.edge_sep = 20.0 # 横向：长边虚拟节点占用的间距
-        self.rank_sep = 50.0 # 纵向：层与层之间的间距
-        self.pan_speed:float = 15
-
-        self.rows: list[dict] = []
-        self.inputs: list[str] = []
-        self.outputs: list[str] = []
-        self.node_order: dict[str, int] = {}
-        self.layer_row: dict[str, dict] = {}
-        self.euc_color_min = 0.0
-        self.euc_color_max = 1.0
-
-        self._parse_accuracy_dict()    # onnx 构建 + rows/终端/层图推导
-
-    # ------------------------------------------------------------------
-    # 内部：由统一 dict 构建 onnx 图 / 层图 / 终端节点
-    # ------------------------------------------------------------------
-
-    def _parse_accuracy_dict(self) -> None:
-        """从统一"层精度" dict 推导本图所需的全部数据（在 __init__ 调用）。
-
-        两种模式（构造器 dlc_candidates 决定）：
-          A) DLC 模式（QNN，dlc_candidates 非 None）：
-             节点全集 = 量化 DLC 的全部层候选（精度结果缺失的层也画，数值 None）；
-             op_type = DLC 反射类型（Prelu/Conv2d/Eltwise_Binary/...，与 encoding 一致）；
-             连线 = 按候选 io_tensors（DLC 实际拓扑，含 converter 融合/自造张量）。
-          B) ONNX 模式（RKNN / 无 DLC）：
-             onnx 计算图构建一次；层全集 = accuracy dict 键；op_type = dict 自带或
-             onnx node_info 回退；连线走 onnx 张量 succ。
-        两种模式最后都产出 rows/children/parents/inputs/outputs 及布局所需字段。
-        """
-        if self._dlc_candidates:
-            self._parse_accuracy_from_dlc()
-        else:
-            self._parse_accuracy_from_onnx()
-
-    def _finish_parse(self, real_rows: list[dict], children: dict, parents: dict,
-                      input_rows: list[dict], output_rows: list[dict],
-                      input_layers: list[str], output_layers: list[str]) -> None:
-        """收尾：组装 self.rows / children / parents / 颜色范围（两模式共用）。"""
-        self.rows = input_rows + real_rows + output_rows
-        self.inputs = input_layers
-        self.outputs = output_layers
-        self.children = children
-        self.parents = parents
-        self.data = {
-            'rows': self.rows,
-            'inputs': self.inputs,
-            'outputs': self.outputs,
-        }
-        self.node_order = {r['layer_name']: i for i, r in enumerate(self.rows)}
-        self.layer_row = {r['layer_name']: r for r in self.rows}
-        euc_values = [r.get('entire_euc') for r in self.rows
-                  if r.get('entire_euc') is not None]
-        self.euc_color_min = min(euc_values, default=0.0)
-        self.euc_color_max = max(euc_values, default=1.0)
-
-    # ------------------------------------------------------------------
-    # B) ONNX 模式（默认）：层全集 = accuracy 键；连线走 onnx 张量 succ
-    # ------------------------------------------------------------------
-
-    def _parse_accuracy_from_onnx(self) -> None:
-        graph = build_onnx_tensor_graph(self.onnx_path, sanitize=self._sanitize)
-        node_info = graph['node_info']
-        # layer_display(graph, key) -> 显示名；None 用恒等（graph 只此一次 load）
-        name_of = ((lambda k: self._layer_display(graph, k))
-                   if self._layer_display is not None else (lambda k: k))
-
-        results = []
-        for name, row in self._accuracy.items():
-            raw_stem = str(name)
-            if raw_stem.endswith('.raw'):
-                raw_stem = raw_stem[:-4]
-            tensor = match_tensor(raw_stem, graph)
-            # op_type：优先 dict 自带（Rknn error_analysis），缺则 onnx node_info 推断
-            op_type = row.get('op_type')
-            if not op_type and tensor is not None and tensor in node_info:
-                op_type = node_info[tensor][0]
-            results.append({
-                'golden': str(name), 'infer': None, 'tensor': tensor,
-                'layer_name': name_of(raw_stem),
-                'op_type': op_type or 'Unknown',
-                'entire_cos': row.get('entire_cos'),
-                'entire_euc': row.get('entire_euc'),
-                'single_cos': row.get('single_cos'),
-                'single_euc': row.get('single_euc'),
-                'mse': row.get('entire_mse'),
-            })
-
-        real_rows = [{
-            'layer_name': r['layer_name'], 'op_type': r['op_type'],
-            'entire_cos': r['entire_cos'], 'entire_euc': r['entire_euc'],
-            'single_cos': r['single_cos'], 'single_euc': r['single_euc'],
-        } for r in results]
-
-        children, parents, tensor_layers = build_layer_graph(results, graph)
-
-        (input_rows, output_rows, input_layers, output_layers,
-         aug_children, aug_parents) = build_terminal_nodes(
-            results, children, parents, graph, include_input=self._include_input,
-            name_of=name_of,
-        )
-
-        self._finish_parse(real_rows, aug_children, aug_parents,
-                           input_rows, output_rows, input_layers, output_layers)
-
-    # ------------------------------------------------------------------
-    # A) DLC 模式（QNN）：节点全集 = DLC 候选层；连线走候选 io_tensors
-    # ------------------------------------------------------------------
-
-    def _parse_accuracy_from_dlc(self) -> None:
-        import re as _re
-        san = lambda x: _re.sub(r'[^A-Za-z0-9_]', '_', x)
-        # onnx 图仍用于模型级输入/输出终端 + 显示名还原（与精度匹配分离）
-        graph = build_onnx_tensor_graph(self.onnx_path, sanitize=self._sanitize)
-        name_of = ((lambda k: self._layer_display(graph, k))
-                   if self._layer_display is not None else (lambda k: k))
-
-        cands = self._dlc_candidates
-
-        # ---- 1) 层全集 = 全部候选 op（精度缺失层也画，None）----
-        # 注意同一候选输出张量去重；DLC 输出张量 = io_tensors 的最后一项（多数 op）
-        # accuracy dict 的键即 sanitized 张量名，候选张量名清洗后直接查
-        produced: set[str] = set()                # 候选输出张量名 = 图中有出边的生产者
-        nodes: list[dict] = []                     # {name(原始tensor), op_type, 精度侧键}
-        for c in cands:
-            t = c['tensor']
-            if t in produced:
-                continue
-            produced.add(t)
-            acc = self._accuracy.get(san(t)) or {}
-            nodes.append({
-                'name': t,
-                'op_type': c['op_type'],
-                'entire_cos': acc.get('entire_cos'),
-                'entire_euc': acc.get('entire_euc'),
-                'single_cos': acc.get('single_cos'),
-                'single_euc': acc.get('single_euc'),
-            })
-
-        # ---- 2) children/parents：producer(输出张量名) -> 消费它的候选 ----
-        # io_tensors = [输入..., 输出]；输出 = 候选的 'tensor'。
-        # 输入张量名若等于某候选输出 -> 连 producer -> 当前候选。
-        # converter 自造/非候选张量（权重、coeff、Softmax 前的 reshape 等）作为叶子/边界。
-        children: dict[str, list[str]] = defaultdict(list)
-        parents: dict[str, list[str]] = defaultdict(list)
-
-        for c in cands:
-            cur = c['tensor']
-            if len(c['io_tensors']) > 1:
-                ins = c['io_tensors'][:-1]
-            else:
-                ins = []
-            for i in ins:
-                if i in produced and i != cur:
-                    children[i].append(cur)
-                    parents[cur].append(i)
-        # 去重 + 保持出现顺序
-        for k in children:
-            children[k] = list(dict.fromkeys(children[k]))
-        for k in parents:
-            parents[k] = list(dict.fromkeys(parents[k]))
-
-        # ---- 3) 构造真实行（显示层名 = 原始 DLC 张量名；可带 name_of 还原）----
-        real_rows = []
-        for n in nodes:
-            raw = n['name']
-            display = name_of(raw)
-            real_rows.append({
-                'layer_name': display,
-                'op_type': n['op_type'],
-                'entire_cos': n['entire_cos'],
-                'entire_euc': n['entire_euc'],
-                'single_cos': n['single_cos'],
-                'single_euc': n['single_euc'],
-            })
-
-        # ---- 4) children/parents 的键是原始 tensor 名；真实行 layer_name 可能被
-        #        还原(显示)成不同字符串 -> 需把边键统一到 display 名 ----
-        display_of = {c['tensor']: name_of(c['tensor']) for c in cands}
-        def map_edge(d):
-            out = defaultdict(list)
-            for a, bl in d.items():
-                da = display_of.get(a, a)
-                for b in bl:
-                    db = display_of.get(b, b)
-                    if da != db:
-                        out[da].append(db)
-            return {k: list(dict.fromkeys(v)) for k, v in out.items()}
-        children_disp = map_edge(children)
-        parents_disp = map_edge(parents)
-
-        # ---- 5) Input/Output 终端：模型级输入/输出张量 -> 连到 DLC 节点 ----
-        # 用 onnx graph inputs/outputs（原始名经 sanitize 在 display 域匹配困难，
-        # 直接按原始 tensor 名找出消费它的候选）。
-        def first_consumer(t: str) -> str | None:
-            # 在 parents(原始域)里找以 t 为输入的候选
-            hit = None
-            for c in cands:
-                if t in c['io_tensors'][:-1] if len(c['io_tensors']) > 1 else False:
-                    return display_of.get(c['tensor'], c['tensor'])
-            return hit
-
-        input_rows: list[dict] = []
-        input_layers: list[str] = []
-        output_rows: list[dict] = []
-        output_layers: list[str] = []
-        if self._include_input:
-            # 图输入：优先用 DLC IR 图声明的边界（graph_io_tensors）；无该信息
-            # 时退回启发式——"未被任何候选产出的候选输入"再减权重/常量名黑名单
-            # （黑名单对 TF 的 `.../kernel:0`、converter hoist 常量无效，会误画
-            # 成 Input 节点，故只在拿不到 IR 图边界时使用）。
-            if self._dlc_io and self._dlc_io.get('inputs'):
-                model_ins = [t for t in self._dlc_io['inputs'] if t not in produced]
-            else:
-                all_ins: set[str] = set()
-                for c in cands:
-                    if len(c['io_tensors']) > 1:
-                        all_ins.update(c['io_tensors'][:-1])
-                model_ins = sorted(
-                    t for t in (all_ins - produced)
-                    if not any(k in t for k in ('weight', 'bias', 'coeff', 'onnx::')))
-            for inp in model_ins:
-                display = inp  # 图输入没有 DLC 节点，直接显示原名
-                input_layers.append(display)
-                input_rows.append({
-                    'layer_name': display, 'op_type': 'Input',
-                    'entire_cos': 1.0, 'entire_euc': 0.0,
-                    'single_cos': 1.0, 'single_euc': 0.0,
-                })
-                # 连到下游第一个消费该输入张量的候选
-                con = first_consumer(inp)
-                if con:
-                    children_disp.setdefault(display, []).append(con)
-                    parents_disp.setdefault(con, []).append(display)
-
-        # 输出终端：优先用 DLC IR 图声明的图输出；无该信息时退回启发式
-        # （无人消费的候选输出，如 output0/1/2）。
-        # 注：output0 这类有输入(在 parents)但无下游消费者，故判 children 而非 parents
-        out_set = (set(self._dlc_io['outputs'])
-                   if (self._dlc_io and self._dlc_io.get('outputs')) else None)
-        for c in cands:
-            t = c['tensor']
-            if out_set is not None:
-                if t not in out_set:      # 非 IR 图输出 -> 不画 Output 终端
-                    continue
-            elif t in children:           # 启发式：有下游消费者 -> 非图输出
-                continue
-            display = display_of.get(t, t)
-            if display in {r['layer_name'] for r in real_rows}:
-                node_name = f'{display} (out)'
-            else:
-                node_name = display
-            output_layers.append(node_name)
-            src = [display]
-            output_rows.append({
-                'layer_name': node_name, 'op_type': 'Output',
-                'entire_cos': next((r['entire_cos'] for r in real_rows
-                                    if r['layer_name'] == display), None),
-                'entire_euc': next((r['entire_euc'] for r in real_rows
-                                    if r['layer_name'] == display), None),
-                'single_cos': next((r['single_cos'] for r in real_rows
-                                    if r['layer_name'] == display), None),
-                'single_euc': next((r['single_euc'] for r in real_rows
-                                    if r['layer_name'] == display), None),
-            })
-            for s in src:
-                children_disp.setdefault(s, []).append(node_name)
-                parents_disp.setdefault(node_name, []).append(s)
-
-        self._finish_parse(real_rows, children_disp, parents_disp,
-                           input_rows, output_rows, input_layers, output_layers)
-
-    # ------------------------------------------------------------------
-    # 颜色辅助
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _cos_to_color(cos: float | None, vmin: float = 0.8, vmax: float = 1.0) -> str:
-        """将累积/单层 cosine 相似度映射为红(差)-黄(中)-绿(良)。"""
-        if cos is None:
-            return '#b0b0b0'
-        t = (cos - vmin) / (vmax - vmin)
-        t = max(0.0, min(1.0, t))
-        # 红(255,69,0) -> 黄(255,215,0) -> 绿(60,179,113)
-        if t < 0.5:
-            k = t / 0.5
-            # 红/黄两端蓝色均为 0，必须保持 b=0；否则会被错误拉高成粉/橙红
-            r, g, b = 255, 69 + (215 - 69) * k, 0
-        else:
-            k = (t - 0.5) / 0.5
-            r, g, b = 255 + (60 - 255) * k, 215 + (179 - 215) * k, 0 + (113 - 0) * k
-        return f'#{int(r):02x}{int(g):02x}{int(b):02x}'
-
-    def _op_color(self, op_type: str | None) -> str:
-        """返回该算子类型在 Netron 中对应的类别颜色。"""
-        op = op_type or ''
-        category = self.OP_CATEGORY.get(op, '')
-        return self.CATEGORY_COLORS.get(category, self.DEFAULT_COLOR)
-
-    def _euc_to_color(self, euc: float | None) -> str:
-        """将累计欧氏距离映射为绿(小)-黄(中)-红(大)颜色。
-
-        映射：cos = 1.0 - t*0.4（t 为 euc 归一化值），使纯红区起点
-        （cos<=0.8）正好落在 t=0.5——即欧氏距离达到本次范围一半才变红。
-        """
-        if euc is None:
-            return '#b0b0b0'
-        span = self.euc_color_max - self.euc_color_min
-        t = 0.0 if span <= 0 else (euc - self.euc_color_min) / span
-        return self._cos_to_color(1.0 - max(0.0, min(1.0, t)) * 0.4)
-
-    @staticmethod
-    def _text_color_for(bg: str) -> str:
-        """根据背景色亮度选择文字颜色：浅背景用灰黑，深背景用白色。
-
-        避免浅色类别（如 Input/Constant/Control 的 #eeeeee）上白色文字看不清。
-        """
-        bg = bg.lstrip('#')
-        if len(bg) != 6:
-            return '#fff'
-        r, g, b = int(bg[0:2], 16), int(bg[2:4], 16), int(bg[4:6], 16)
-        # 相对亮度 (ITU-R BT.709)
-        lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
-        return '#333333' if lum > 140 else '#fff'
+    def __init__(self, node_ids, children: dict, parents: dict, *,
+                 node_width: float, node_height: float,
+                 node_sep: float, edge_sep: float, rank_sep: float):
+        self.nodes = dict.fromkeys(node_ids)
+        self.children, self.parents = children, parents
+        self.node_width, self.node_height = node_width, node_height
+        self.node_sep, self.edge_sep, self.rank_sep = node_sep, edge_sep, rank_sep
 
     def _layers(self) -> dict[str, int]:
-        """dagre.js `rank()` 的 network-simplex 排名：longestPath + networkSimplex。
-
-        1) longestPath：`rank(v)=max_dist - dist_to_sink(v)`，会把汇入同一个
-           消费者（如 Concat）的所有分支输出对齐到消费者的前一层；
-        2) networkSimplex（见 _network_simplex）：在最长路径初始排名上迭代
-           换边改进，权衡"merge 输入深度 / 最终输出深度"，使 FPN 级联的多个
-           SSH head 按深度对角错开，而非全部挤到同一层；
-        3) 规范化：assignRankMinMax（平移使最小 rank=0）+ removeEmptyRanks
-           （合并空层，使 rank 从 0 连续递增）。
-
-        实现采用迭代逆拓扑（非递归，避免层深过深），环上节点兜底为 0。
-        """
+        """dagre 排名：逆拓扑最长路径、network-simplex，再平移并合并空层。"""
         from collections import deque
 
-        layer_row = self.layer_row
+        layer_row = self.nodes
         children = self.children
 
-        # ---- Kahn 拓扑（源 -> 汇）----
+        # Kahn 拓扑（源 -> 汇），逆序计算到汇点的最长距离。
         in_degree: dict[str, int] = {n: 0 for n in layer_row}
         for n in layer_row:
             for p in self.parents.get(n, []):
@@ -2789,7 +2486,6 @@ class AccuracyGraph:
                     if in_degree[c] == 0:
                         queue.append(c)
 
-        # ---- dist_to_sink（逆拓扑：先算汇）→ longestPath rank ----
         dist: dict[str, int] = {}
         for n in reversed(topo):
             ch = [c for c in children.get(n, []) if c in layer_row]
@@ -2803,38 +2499,23 @@ class AccuracyGraph:
         max_dist = max(dist.values(), default=0)
         rank = {n: max_dist - dist[n] for n in layer_row}
 
-        # ---- networkSimplex：在最长路径初始排名上迭代改进 ----
         rank = self._network_simplex(rank)
-
-        # ---- assignRankMinMax：平移使最小 rank = 0（dagre）----
         min_rank = min(rank.values(), default=0)
         rank = {n: r - min_rank for n, r in rank.items()}
-
-        # ---- removeEmptyRanks：合并空 rank，使 rank 从 0 连续（dagre）----
         present_ranks = sorted(set(rank.values()))
         compact = {r: i for i, r in enumerate(present_ranks)}
         return {n: compact[r] for n, r in rank.items()}
 
     def _network_simplex(self, rank: dict[str, int]) -> dict[str, int]:
-        """dagre.js `rank()` 的 networkSimplex：在最长路径初始排名上迭代改进。
+        """dagre networkSimplex：从紧树迭代换出负割边，换入最小 slack 非树边。
 
-        在 `feasibleTree`（紧树）基础上增加：
-          - initLowLimValues：给树节点赋 low/lim/parent（DFS 区间，判断 ancestor）；
-          - initCutValues：计算每条树边的割值（cutvalue）；
-          - 循环 leaveEdge（cutvalue<0 的树边）→ enterEdge（跨割的最小平 slack
-            非树边）→ exchangeEdges（换边并更新 rank），直到没有可换的负割边。
-
-        相比 tight-tree，它会同时权衡"merge 输入深度 / 最终输出深度"，从而让 FPN
-        级联的三个 SSH head 按深度对角错开，而不再是全挤到同一层。
-
-        本图所有边 weight=1、minlen=1（简单图），故 simplify 为恒等。
-        返回更新后的 rank dict（可能为负，调用方再 assignRankMinMax / removeEmptyRanks）。
+        所有边 weight=minlen=1；low/lim 为树的 DFS 区间，用于判断祖先关系。
+        原地更新 rank（可为负），由调用方平移并合并空层。
         """
         from collections import defaultdict
 
-        layer_row = self.layer_row
+        layer_row = self.nodes
         children = self.children
-        node_set = set(layer_row)
         nodes = list(layer_row)
 
         # 有向边 (v=父, w=子)，minlen=1, weight=1
@@ -2853,7 +2534,7 @@ class AccuracyGraph:
             v, w = e
             return rank[w] - rank[v] - 1
 
-        # ---- feasibleTree：返回树边集合，并调整 rank ----
+        # feasibleTree：扩展紧树，必要时平移树内 rank。
         tree_edges: set[frozenset] = set()
         in_tree: dict[str, bool] = {}
         start = next(iter(nodes))
@@ -2864,12 +2545,15 @@ class AccuracyGraph:
                 changed = False
                 for (v, w) in edge_list:
                     if (v in in_tree) != (w in in_tree) and slack((v, w)) == 0:
-                        nm = w if v in in_tree else v
+                        if v in in_tree:
+                            nm = w
+                        else:
+                            nm = v
                         if nm not in in_tree:
                             in_tree[nm] = True
                             tree_edges.add(frozenset((v, w)))
                             changed = True
-            if len(in_tree) >= len(node_set):
+            if len(in_tree) >= len(nodes):
                 break
             min_key = float('inf')
             edge = None
@@ -2882,11 +2566,13 @@ class AccuracyGraph:
             if edge is None:
                 break
             v, w = edge
-            delta = slack((v, w)) if v in in_tree else -slack((v, w))
+            if v in in_tree:
+                delta = slack((v, w))
+            else:
+                delta = -slack((v, w))
             for n in list(in_tree):
                 rank[n] += delta
 
-        # ---- initLowLimValues：DFS 给树节点赋 low/lim/parent ----
         def build_tree_adj():
             adj: dict[str, set[str]] = defaultdict(set)
             for e in tree_edges:
@@ -2895,8 +2581,7 @@ class AccuracyGraph:
                 adj[b].add(a)
             return adj
 
-        # tree_edges 是 set，必须按固定序扫描；否则字符串哈希随机化
-        # （PYTHONHASHSEED）会让不同进程选到不同的负割边，布局结果不稳定。
+        # 固定树边扫描顺序，防止 PYTHONHASHSEED 改变负割边选择。
         def tree_edges_sorted():
             return sorted(tree_edges, key=lambda e: tuple(sorted(e)))
 
@@ -2939,7 +2624,6 @@ class AccuracyGraph:
 
         parent, low, lim, pre = init_low_lim()
 
-        # ---- initCutValues：计算每条树边的割值 ----
         def init_cut_values():
             cutvalue: dict[frozenset, float] = {}
             adj = build_tree_adj()
@@ -2949,8 +2633,14 @@ class AccuracyGraph:
             edge_order = []
             for e in tree_edges_sorted():
                 a, b = tuple(e)
-                child = b if parent.get(b) == a else a
-                par = a if child == b else b
+                if parent.get(b) == a:
+                    child = b
+                else:
+                    child = a
+                if child == b:
+                    par = a
+                else:
+                    par = b
                 edge_order.append((e, child, par))
             edge_order.sort(key=lambda x: -pre[x[1]])
             for e, child, par in edge_order:
@@ -2962,16 +2652,21 @@ class AccuracyGraph:
                     if other == par:
                         continue
                     pointsToHead = (isOut == childIsTail)
-                    cutvalue[e] += 1.0 if pointsToHead else -1.0
+                    if pointsToHead:
+                        cutvalue[e] += 1.0
+                    else:
+                        cutvalue[e] += -1.0
                     te = frozenset((child, other))
                     if te in tree_edges:
                         otherCut = cutvalue.get(te, 1.0)
-                        cutvalue[e] += -otherCut if pointsToHead else otherCut
+                        if pointsToHead:
+                            cutvalue[e] += -otherCut
+                        else:
+                            cutvalue[e] += otherCut
             return cutvalue
 
         cutvalue = init_cut_values()
 
-        # ---- leaveEdge：找 cutvalue<0 的树边 ----
         def leave_edge():
             for e in tree_edges_sorted():
                 if cutvalue.get(e, 0) < 0:
@@ -2983,7 +2678,6 @@ class AccuracyGraph:
             _, v_lim = v_lowlim
             return root_low <= v_lim <= root_lim
 
-        # ---- enterEdge：跨割且 slack 最小的非树边 ----
         def enter_edge(e):
             a, b = tuple(e)
             if (a, b) in edge_set:
@@ -3016,7 +2710,7 @@ class AccuracyGraph:
             tree_edges.discard(e)
             tree_edges.add(frozenset(f))
             parent, low, lim, pre = init_low_lim()
-            # 从根 BFS，按树边方向更新 rank（minlen=1）
+            # 从根遍历树，按边方向更新 rank（minlen=1）。
             adj = build_tree_adj()
             if adj:
                 root = next((n for n in nodes if parent.get(n) is None), nodes[0])
@@ -3037,7 +2731,6 @@ class AccuracyGraph:
                         stack.append(w)
             cutvalue = init_cut_values()
 
-        # ---- 主循环 ----
         guard = 0
         while guard < 1000:
             e = leave_edge()
@@ -3055,51 +2748,30 @@ class AccuracyGraph:
         self, depth: dict[str, int]
     ) -> tuple[dict[str, tuple[float, float]], dict[str, tuple[float, float]],
                dict[tuple[str, str], list[str]], dict[int, int]]:
-        """dagre 风格 Sugiyama 布局（Netron 使用的布局算法，保持 TB 纵向）。
+        """Netron/dagre 风格 TB 布局：长边虚拟化、交叉最小化、BK 坐标分配。
 
-        流水线：
-          1. normalize —— 把跨多层长边拆成虚拟节点（每个中间层插一个），
-             使所有边只跨一层；虚拟节点与真实节点共用同一套排序/定位，
-             不再"绕到图外侧"。
-          2. order —— 重心法(barycenter) + 交叉计数反馈 + transpose 交换，
-             最小化边交叉。
-          3. position —— Brandes-Köpf 坐标分配（中位数邻居对齐成"块" +
-             块图横向压缩，4 个方向各算一遍取最窄再平衡），让直线链保持
-             同一列、只有分叉才横向错开。
-
-        Returns:
-            tuple[real_pos, dummy_pos, edge_routes, level_sizes]:
-              real_pos: 真实节点 name -> (x, y)
-              dummy_pos: 虚拟节点 id -> (x, y)
-              edge_routes: (a, b) -> 该边经过的虚拟节点 id 列表
-              level_sizes: 层级 -> 节点数
+        返回真实/虚拟节点坐标、每条边的虚拟节点链，以及每层节点数。
         """
         from collections import defaultdict
 
-        node_w = 240.0
-        node_h = 86.0
+        node_w, node_h = self.node_width, self.node_height
         node_sep = self.node_sep
         edge_sep = self.edge_sep
         rank_sep = self.rank_sep
 
-        # 用确定性的层名序作种子，避免布局依赖框架提供的节点顺序
-        # （RKNN/QNN 因输入行序不同而互为镜像）。rank 仍由 _layers() 计算，
-        # 这里只规范化同 rank 内的相对顺序，供 init_order 与后继遍历作为
-        # 确定性的平局打破。
-        ordered_real = sorted(self.layer_row.keys(), reverse=True)
-        real = ordered_real
-        real_set = set(ordered_real)
-        seq_of = {n: i for i, n in enumerate(ordered_real)}
+        # 固定同 rank 内的初始顺序，避免框架输入行序改变平局结果。
+        real = sorted(self.nodes.keys(), reverse=True)
+        real_set = set(real)
 
-        # ---- 1. normalize：构建增强图（真实节点 + 虚拟节点） ----
+        # normalize：长边逐层插入虚拟节点，参与相同的排序与定位。
         nodes: dict[str, dict] = {}
-        for n in ordered_real:
+        for i, n in enumerate(real):
             nodes[n] = {
                 'rank': depth.get(n, 0),
                 'width': node_w,
                 'height': node_h,
                 'dummy': False,
-                'seq': seq_of[n],
+                'seq': i,
             }
 
         edge_routes: dict[tuple[str, str], list[str]] = {}
@@ -3140,28 +2812,19 @@ class AccuracyGraph:
                     add_edge(prev, b)
                     edge_routes[(a, b)] = chain
 
-        # 规范化后继/前驱遍历顺序（按 seq），使 init_order 的 DFS 遍历与层间
-        # 约束都与框架输入顺序无关，从而消除 RKNN/QNN 的镜像差异。
+        # 前驱/后继也按 seq 固定遍历顺序。
         for v in aug_out:
             aug_out[v].sort(key=lambda u: nodes[u].get('seq', 0))
         for v in aug_in:
             aug_in[v].sort(key=lambda u: nodes[u].get('seq', 0))
 
-        # ---- 2. order：交叉最小化 ----
         layering = self._dagre_order(nodes, aug_in, aug_out)
-
-        # ---- 3. position：Brandes-Köpf ----
         x_pos, y_pos = self._dagre_position(
             layering, nodes, aug_in, aug_out, node_sep, edge_sep, rank_sep,
         )
 
-        # 收尾：把每条长边的虚拟节点链夹在"源-目标 x 走廊"内，避免残差/跳连
-        # 被顶到远处的高速公路列（如 unisal /cnn/Slice_5 的残差被推到 x=1510，
-        # 而源/目标都在 x=765）。只收紧过大的水平摆幅，不改变真实节点位置，
-        # 也不影响 order/rank（故与镜像/确定性修复无关）。
-        #
-        # 允许的水平摆幅按边跨度（dummy 数）放宽：短边（如残差）仍收紧在
-        # 源-目标附近；横贯模型的长边则允许绕远，避免被硬性拉回同一列。
+        # 将虚拟节点限制在源/目标横向走廊内；跨度越长，允许的摆幅越大。
+        # 只收紧虚拟节点，不改真实节点坐标、order 或 rank。
         pad = node_sep * 1.5
         for (a, b), route in edge_routes.items():
             if not route:
@@ -3184,16 +2847,9 @@ class AccuracyGraph:
         aug_in: dict[str, list[str]],
         aug_out: dict[str, list[str]],
     ) -> list[list[str]]:
-        """dagre.js `order()` 的忠实移植（非 compound 图）。
+        """dagre.js order（非 compound）：按重心和约束交替扫描，再 transpose。
 
-        与旧的重心扫描不同，这里对齐 dagre 的做法：
-          - 每个层级边界用"层图"排序（down 用前驱、up 用后继的 barycenter）；
-          - `resolveConflicts`：用约束图把会违反已定顺序的节点合并；
-          - 交替 down/up 多轮扫描 + transpose 收尾，最小化边交叉。
-        这是 SSH 头部三条并行分支（3×3 / 5×5 / 7×7）能整齐排列、不互相交叉的关键。
-
-        Returns:
-            layering: list[list[str]]（按 rank/order 排列）。
+        down 用前驱、up 用后继；返回按 rank/order 排列的节点层。
         """
         from functools import cmp_to_key
 
@@ -3201,15 +2857,7 @@ class AccuracyGraph:
         if max_rank < 0:
             return []
 
-        def set_order(v: str, o: int) -> None:
-            nodes[v]['order'] = o
-
-        def neighbors_rel(v: str, relationship: bool) -> list[str]:
-            # relationship=True（down）用前驱；False（up）用后继
-            return aug_in.get(v, []) if relationship else aug_out.get(v, [])
-
-        # ---- initOrder（dagre：按 rank 升序遍历起点，对每个起点做后继优先 DFS，
-        #      节点首次被访问时按 rank 归入对应层）----
+        # initOrder：按 rank 升序选起点，后继优先 DFS 首次访问时入层。
         def init_order() -> list[list[str]]:
             visited: set[str] = set()
             layers: list[list[str]] = [[] for _ in range(max_rank + 1)]
@@ -3236,11 +2884,11 @@ class AccuracyGraph:
         def assign_order(layers: list[list[str]]) -> None:
             for layer in layers:
                 for i, v in enumerate(layer):
-                    set_order(v, i)
+                    nodes[v]['order'] = i
 
         assign_order(layering)
 
-        # ---- crossCount（本图所有边 weight=1 → 等价于逆序对数）----
+        # weight=1，crossCount 等于相邻层边终点的逆序对数。
         def cross_count(layers: list[list[str]]) -> int:
             total = 0
             for r in range(1, len(layers)):
@@ -3253,12 +2901,14 @@ class AccuracyGraph:
                 total += self._count_inversions(entries, len(layers[r]))
             return total
 
-        # ---- barycenter ----
         def barycenter(v: str, relationship: bool) -> dict:
-            nb = neighbors_rel(v, relationship)
             s = 0.0
             w = 0.0
-            for u in nb:
+            if relationship:
+                neighbors = aug_in.get(v, [])
+            else:
+                neighbors = aug_out.get(v, [])
+            for u in neighbors:
                 o = nodes.get(u, {}).get('order')
                 if o is None:
                     continue
@@ -3268,7 +2918,7 @@ class AccuracyGraph:
                 return {'v': v}
             return {'v': v, 'barycenter': s / w, 'weight': w}
 
-        # ---- resolveConflicts（约束图冲突合并，改写自 dagre.js）----
+        # resolveConflicts：按约束合并会违反已定顺序的节点。
         def resolve_conflicts(entries: list[dict], cg: dict[str, list[str]]) -> list[dict]:
             mapped: dict[str, dict] = {}
             for i, entry in enumerate(entries):
@@ -3289,46 +2939,42 @@ class AccuracyGraph:
             source_set = [e for e in mapped.values() if e['indegree'] == 0]
             results: list[dict] = []
 
-            def handle_in(v_entry: dict):
-                def fn(u_entry: dict) -> None:
-                    if u_entry.get('merged'):
-                        return
-                    if (u_entry.get('barycenter') is None
-                            or v_entry.get('barycenter') is None
-                            or u_entry.get('barycenter', 0) >= v_entry.get('barycenter', 0)):
-                        s = 0.0
-                        w = 0.0
-                        if v_entry.get('weight'):
-                            s += v_entry['barycenter'] * v_entry['weight']
-                            w += v_entry['weight']
-                        if u_entry.get('weight'):
-                            s += u_entry['barycenter'] * u_entry['weight']
-                            w += u_entry['weight']
-                        v_entry['vs'] = u_entry['vs'] + v_entry['vs']
-                        if w:
-                            v_entry['barycenter'] = s / w
-                        else:
-                            v_entry.pop('barycenter', None)
-                        v_entry['weight'] = w
-                        v_entry['i'] = min(u_entry['i'], v_entry['i'])
-                        u_entry['merged'] = True
-                return fn
+            def handle_in(v_entry: dict, u_entry: dict) -> None:
+                if u_entry.get('merged'):
+                    return
+                if (u_entry.get('barycenter') is None
+                        or v_entry.get('barycenter') is None
+                        or u_entry.get('barycenter', 0) >= v_entry.get('barycenter', 0)):
+                    s = 0.0
+                    w = 0.0
+                    if v_entry.get('weight'):
+                        s += v_entry['barycenter'] * v_entry['weight']
+                        w += v_entry['weight']
+                    if u_entry.get('weight'):
+                        s += u_entry['barycenter'] * u_entry['weight']
+                        w += u_entry['weight']
+                    v_entry['vs'] = u_entry['vs'] + v_entry['vs']
+                    if w:
+                        v_entry['barycenter'] = s / w
+                    else:
+                        v_entry.pop('barycenter', None)
+                    v_entry['weight'] = w
+                    v_entry['i'] = min(u_entry['i'], v_entry['i'])
+                    u_entry['merged'] = True
 
-            def handle_out(v_entry: dict):
-                def fn(w_entry: dict) -> None:
-                    w_entry['in'].append(v_entry)
-                    w_entry['indegree'] -= 1
-                    if w_entry['indegree'] == 0:
-                        source_set.append(w_entry)
-                return fn
+            def handle_out(v_entry: dict, w_entry: dict) -> None:
+                w_entry['in'].append(v_entry)
+                w_entry['indegree'] -= 1
+                if w_entry['indegree'] == 0:
+                    source_set.append(w_entry)
 
             while source_set:
                 entry = source_set.pop()
                 results.append(entry)
                 for u in reversed(entry['in']):
-                    handle_in(entry)(u)
+                    handle_in(entry, u)
                 for w in entry['out']:
-                    handle_out(entry)(w)
+                    handle_out(entry, w)
 
             out: list[dict] = []
             for e in results:
@@ -3341,7 +2987,7 @@ class AccuracyGraph:
                 out.append(value)
             return out
 
-        # ---- sort（带 bias 与 unsortable 吸收，改写自 dagre.js）----
+        # dagre sort：按重心及 bias 排序，穿插吸收无重心节点。
         def sort(entries: list[dict], bias_right: bool) -> dict:
             lhs = [e for e in entries if 'barycenter' in e]
             rhs = [e for e in entries if 'barycenter' not in e]
@@ -3352,14 +2998,16 @@ class AccuracyGraph:
                     return -1
                 if a['barycenter'] > b['barycenter']:
                     return 1
-                return (b['i'] - a['i']) if bias_right else (a['i'] - b['i'])
+                if bias_right:
+                    return b['i'] - a['i']
+                else:
+                    return a['i'] - b['i']
 
             sortable = sorted(lhs, key=cmp_to_key(compare))
 
             def consume_unsortable(vs: list, un: list, index: int) -> int:
                 while un and un[-1]['i'] <= index:
-                    last = un.pop()
-                    vs.append(last['vs'])
+                    vs.append(un.pop()['vs'])
                     index += 1
                 return index
 
@@ -3379,21 +3027,19 @@ class AccuracyGraph:
                 result['weight'] = w
             return result
 
-        # ---- sortSubgraph（非 compound：movable = rank 内全部真实+虚拟节点）----
         def sort_rank(rank_nodes: list[str], cg: dict[str, list[str]], bias_right: bool,
                       relationship: bool) -> list[str]:
-            entries = [barycenter(v, relationship) for v in rank_nodes]
-            entries = resolve_conflicts(entries, cg)
+            entries = resolve_conflicts([barycenter(v, relationship) for v in rank_nodes], cg)
             return sort(entries, bias_right)['vs']
 
-        # ---- sweepLayerGraphs：对一组 rank 边界做一次扫描，并记录层内约束 ----
+        # sweepLayerGraphs：逐层扫描，记录层内相邻节点约束。
         def sweep_ranks(ranks_to_sweep: list[int], bias_right: bool, relationship: bool) -> None:
             cg: dict[str, list[str]] = {}
             for r in ranks_to_sweep:
                 vs = sort_rank(list(layering[r]), cg, bias_right, relationship)
                 layering[r] = vs
                 for i, v in enumerate(vs):
-                    set_order(v, i)
+                    nodes[v]['order'] = i
                 for i in range(len(vs) - 1):
                     cg.setdefault(vs[i], []).append(vs[i + 1])
 
@@ -3500,10 +3146,7 @@ class AccuracyGraph:
         rank_sep: float,
     ) -> tuple[dict[str, float], dict[str, float]]:
         """Brandes-Köpf 坐标分配：返回 (x_pos, y_pos)。"""
-        from collections import defaultdict, deque
-        import math
-
-        for r, layer in enumerate(layering):
+        for layer in layering:
             for j, v in enumerate(layer):
                 nodes[v]['order'] = j
 
@@ -3527,10 +3170,17 @@ class AccuracyGraph:
 
         xss: dict[str, dict[str, float]] = {}
         for vertical in ('u', 'd'):
-            adj = layering if vertical == 'u' else list(reversed(layering))
+            if vertical == 'u':
+                adj = layering
+                neighbor = aug_in
+            else:
+                adj = list(reversed(layering))
+                neighbor = aug_out
             for horizontal in ('l', 'r'):
-                adj2 = [list(reversed(layer)) for layer in adj] if horizontal == 'r' else adj
-                neighbor = aug_in if vertical == 'u' else aug_out
+                if horizontal == 'r':
+                    adj2 = [list(reversed(layer)) for layer in adj]
+                else:
+                    adj2 = adj
                 root, align = self._vertical_alignment(adj2, nodes, neighbor, has_conflict)
                 xs = self._horizontal_compaction(adj2, root, align, nodes, node_sep, edge_sep)
                 if horizontal == 'r':
@@ -3550,7 +3200,10 @@ class AccuracyGraph:
                 xs = xss[key]
                 if xs is not min_xs:
                     rng = (min(xs.values()), max(xs.values()))
-                    delta = (align_range[0] - rng[0]) if horizontal == 'l' else (align_range[1] - rng[1])
+                    if horizontal == 'l':
+                        delta = align_range[0] - rng[0]
+                    else:
+                        delta = align_range[1] - rng[1]
                     if delta:
                         xss[key] = {v: x + delta for v, x in xs.items()}
 
@@ -3620,9 +3273,17 @@ class AccuracyGraph:
                     uroot = root[prev]
                     un = nodes[prev]
                     vn = nodes[v]
+                    if vn['dummy']:
+                        v_sep = edge_sep
+                    else:
+                        v_sep = node_sep
+                    if un['dummy']:
+                        u_sep = edge_sep
+                    else:
+                        u_sep = node_sep
                     sep = (vn['width'] / 2.0
-                           + (edge_sep if vn['dummy'] else node_sep) / 2.0
-                           + (edge_sep if un['dummy'] else node_sep) / 2.0
+                           + v_sep / 2.0
+                           + u_sep / 2.0
                            + un['width'] / 2.0)
                     key = (uroot, vroot)
                     if key not in sep_map or sep > sep_map[key]:
@@ -3654,17 +3315,12 @@ class AccuracyGraph:
             for (c, s) in block_out[b]:
                 xs[c] = max(xs[c], xs[b] + s)
         for b in reversed(topo):
-            # 第二遍（对齐 dagre pass2）：对所有块根（含 dummy 块）取
-            # max(自身, 最小出边坐标-间距)，把块向右推以消除右侧空白。
+            # dagre pass2：包括 dummy 块，向右推至最小出边坐标减间距。
             best = min((xs[c] - s for c, s in block_out[b]), default=None)
             if best is not None:
                 xs[b] = max(xs[b], best)
 
-        result: dict[str, float] = {}
-        for layer in layering:
-            for v in layer:
-                result[v] = xs[root[v]]
-        return result
+        return {v: xs[root[v]] for layer in layering for v in layer}
 
     @staticmethod
     def _find_type1_conflicts(
@@ -3688,7 +3344,10 @@ class AccuracyGraph:
             k0 = 0
             scan_pos = 0
             prev_len = len(prev)
-            last_node = layer[-1] if layer else None
+            if layer:
+                last_node = layer[-1]
+            else:
+                last_node = None
             for i, v in enumerate(layer):
                 w = None
                 if nodes[v]['dummy']:
@@ -3697,7 +3356,10 @@ class AccuracyGraph:
                             w = u
                             break
                 if w is not None or v == last_node:
-                    k1 = nodes[w]['order'] if w is not None else prev_len
+                    if w is not None:
+                        k1 = nodes[w]['order']
+                    else:
+                        k1 = prev_len
                     for scan_node in layer[scan_pos:i + 1]:
                         for u in aug_in.get(scan_node, []):
                             u_order = nodes[u]['order']
@@ -3716,12 +3378,9 @@ class AccuracyGraph:
         nodes: dict[str, dict],
         aug_in: dict[str, list[str]],
     ) -> dict[str, set[str]]:
-        """找出 type-2 冲突（两条虚边在相邻层的内段互相交叉），用于 BK 对齐。
+        """dagre.js findType2Conflicts（非 compound），阻止交叉内段垂直对齐。
 
-        改写自 dagre.js `findType2Conflicts`（非 compound 分支）：扫描相邻两层
-        north->south，当 south 层的虚节点（长边中间节点）v 的虚前驱 u 落在
-        "上一个内段边界 ~ 当前内段边界"之外时，标记 (u, v) 冲突，避免两条
-        相互交叉的长边被垂直对齐到同一列而重叠。
+        扫描相邻层，虚节点的虚前驱超出前后内段边界时标记冲突。
         """
         conflicts: dict[str, set[str]] = {}
 
@@ -3768,12 +3427,10 @@ class AccuracyGraph:
         """计算从节点中心指向 point 的射线与节点矩形的交点（dagre intersectRect）。"""
         x, y = node_center
         px, py = point
-        dx = px - x
-        dy = py - y
+        dx, dy = px - x, py - y
         if dx == 0.0 and dy == 0.0:
             return (x, y + node_h / 2.0)
-        w = node_w / 2.0
-        h = node_h / 2.0
+        w, h = node_w / 2.0, node_h / 2.0
         if abs(dy) * w > abs(dx) * h:
             if dy < 0:
                 h = -h
@@ -3782,180 +3439,16 @@ class AccuracyGraph:
             w = -w
         return (x + w, y + w * dy / dx)
 
-    # ------------------------------------------------------------------
-    # 构建与渲染
-    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _fmt5(x: float | None) -> str:
-        """5 位有效数字显示：整数部分位数决定小数位数（左右共享共 5 位）。
-
-        例：100.00（3+2）、1.0000（1+4）、0.9998（0+4，前导 0 占一位）、16.237（2+3）。
-        """
-        if x is None:
-            return '-'
-        n = len(str(int(abs(x))))
-        p = max(0, 5 - n)
-        return f'{x:.{p}f}'
-
-    def _svg_node(self, name: str, op: str, row: dict) -> tuple[str, str]:
-        """
-        生成 Netron 风格节点的内联 SVG 矢量图 data URI。
-
-        上半栏：算子类型（背景色 = 该算子代表色，白字）
-        下半栏：精度数据（背景色 = 累积余弦误差 entire_cos 颜色）
-
-        Returns:
-            tuple[str, str]: (svg data_uri, tooltip 纯文本)
-        """
-        import base64
-
-        entire_cos = row.get('entire_cos')
-        entire_euc = row.get('entire_euc')
-        single_cos = row.get('single_cos')
-        single_euc = row.get('single_euc')
-
-        # 上半栏：算子类型色
-        top_fill = self._op_color(op)
-        # 上半栏文字色：随背景亮度自适应（浅背景用灰黑，深背景用白）
-        top_text = self._text_color_for(top_fill)
-        # 下半栏左右两块：左侧累计余弦精度，右侧累计欧氏距离精度
-        cos_fill = self._cos_to_color(entire_cos)
-        euc_fill = self._euc_to_color(entire_euc)
-
-        # 精度文本（4 个值全部显示，5 位有效数字）
-        e_cos = self._fmt5(entire_cos)
-        e_euc = self._fmt5(entire_euc)
-        s_cos = self._fmt5(single_cos)
-        s_euc = self._fmt5(single_euc)
-
-        # 尺寸：宽 240，类型栏高 34，精度栏高 52
-        w, top_h, bot_h = 240, 34, 52
-        h = top_h + bot_h
-        r = 12  # 圆角半径
-
-        def esc(t: str) -> str:
-            return t.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-
-        # 用 clipPath 实现整体圆角，上下两半各占一个半圆角矩形
-        svg = (
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}">'
-            f'<defs><clipPath id="cp">'
-            f'<rect x="0" y="0" width="{w}" height="{h}" rx="{r}" ry="{r}"/>'
-            f'</clipPath>'
-            f'<linearGradient id="accuracy-gradient" x1="0%" y1="0%" x2="100%" y2="0%">'
-            f'<stop offset="0%" stop-color="{cos_fill}"/>'
-            f'<stop offset="37.5%" stop-color="{cos_fill}"/>'
-            f'<stop offset="62.5%" stop-color="{euc_fill}"/>'
-            f'<stop offset="100%" stop-color="{euc_fill}"/>'
-            f'</linearGradient></defs>'
-            # 上半栏：算子类型色（仅顶部两角圆角）
-            f'<rect x="0" y="0" width="{w}" height="{top_h}" fill="{top_fill}" clip-path="url(#cp)"/>'
-            f'<text x="{w/2}" y="{top_h-10}" font-family="Arial" font-size="16" fill="{top_text}" '
-            f'text-anchor="middle" font-weight="bold">{esc(op)}</text>'
-            # 下半栏：左端为累计余弦颜色，向右平滑过渡到累计欧氏距离颜色
-            f'<rect x="0" y="{top_h}" width="{w}" height="{bot_h}" '
-            f'fill="url(#accuracy-gradient)" clip-path="url(#cp)"/>'
-            f'<text x="8" y="{top_h+18}" font-family="monospace" font-size="12" fill="#000">'
-            f'<tspan font-weight="bold">single:</tspan> cos={esc(s_cos)} euc={esc(s_euc)}</text>'
-            f'<text x="8" y="{top_h+38}" font-family="monospace" font-size="12" fill="#000">'
-            f'<tspan font-weight="bold">entire:</tspan> cos={esc(e_cos)} euc={esc(e_euc)}</text>'
-            # 外框描边（圆角）
-            f'<rect x="0.5" y="0.5" width="{w-1}" height="{h-1}" rx="{r}" ry="{r}" '
-            f'fill="none" stroke="#000" stroke-width="1"/>'
-            f'</svg>'
-        )
-        b64 = base64.b64encode(svg.encode()).decode('ascii')
-        data_uri = 'data:image/svg+xml;base64,' + b64
-
-        # tooltip 纯文本：真实节点名 + 详细精度
-        title_lines = [name, f'op_type: {op}']
-        if entire_cos is not None:
-            title_lines.append(f'entire_cos={entire_cos:.6f}  euc={entire_euc}')
-        else:
-            title_lines.append('entire_cos=n/a')
-        if single_cos is not None:
-            title_lines.append(f'single_cos={single_cos:.6f}  euc={single_euc}')
-        else:
-            title_lines.append('single_cos=n/a')
-        return data_uri, '\n'.join(title_lines)
-
-    @staticmethod
-    def _netron_curve_path(points: list[tuple[float, float]]) -> str:
-        """复刻 Netron `grapher.Edge.Curve`（source/grapher.js）的漂浮式三次贝塞尔路径。
-
-        与"精确过每个点"的 Catmull-Rom 不同，它用当前的 (x0,y0)/(x1,y1) 与下一个
-        点做加权得到控制点，使曲线在点列附近"漂浮"：转角更圆润，不会在折点处
-        外凸过冲。适合长边沿垂直走廊"拐出-直线-拐回"的绕行。
-
-        本实现是 Netron 源码的逐行移植：
-          - point() 状态机：0→moveTo, 1→(仅推进状态), 2→lineTo(前导点)+curve,
-            3→curve；其中 curve() 只写贝塞尔段、不推进 (x0,y0)/(x1,y1)，
-            推进统一在 point 末尾完成（旧实现把推进写进 curve 导致 x0==x1 退化）。
-          - 每个点处理完后，若为末点则按末态补尾：state==3 时 curve(x1,y1)+lineTo(x1,y1)，
-            state==2 时仅 lineTo(x1,y1)，使终点精确落在最后一个点上。
-        """
-        pts = [(float(x), float(y)) for x, y in points]
-        n = len(pts)
-        if n < 2:
-            return ''
-
-        data = ''
-        x0 = y0 = x1 = y1 = float('nan')
-        state = 0
-
-        def curve(x: float, y: float) -> None:
-            nonlocal data
-            # 与 Netron 一致：curve 不推进 x0/x1/y0/y1，避免后续段退化
-            data += (
-                f'C{(2 * x0 + x1) / 3:.1f},{(2 * y0 + y1) / 3:.1f},'
-                f'{(x0 + 2 * x1) / 3:.1f},{(y0 + 2 * y1) / 3:.1f},'
-                f'{(x0 + 4 * x1 + x) / 6:.1f},{(y0 + 4 * y1 + y) / 6:.1f}'
-            )
-
-        for i, (x, y) in enumerate(pts):
-            if state == 0:
-                state = 1
-                data += f'M{x:.1f},{y:.1f}'
-            elif state == 1:
-                state = 2
-            elif state == 2:
-                state = 3
-                # Netron 的前导 line_to：从起点迈向 (5*x0+x1)/6，
-                # 为第一条贝塞尔提供明确的起始切线
-                data += f'L{(5 * x0 + x1) / 6:.1f},{(5 * y0 + y1) / 6:.1f}'
-                curve(x, y)
-            else:
-                curve(x, y)
-
-            x0, x1 = x1, x
-            y0, y1 = y1, y
-
-            if i == n - 1:
-                if state == 3:
-                    curve(x1, y1)
-                    data += f'L{x1:.1f},{y1:.1f}'
-                elif state == 2:
-                    data += f'L{x1:.1f},{y1:.1f}'
-        return data
-
-    def _build_edge_paths(
+    def edge_points(
         self,
         real_pos: dict[str, tuple[float, float]],
         dummy_pos: dict[str, tuple[float, float]],
         edge_routes: dict[tuple[str, str], list[str]],
-    ) -> list[tuple[list[tuple[float, float]], str, str]]:
-        """为每条真实边构建完整路径点列（Netron 风格）。
-
-        Returns:
-            list[(points, color, title)]:
-              points: [源边界交点] + 虚拟节点点列 + [目标边界交点]
-              color: 边颜色（源节点累积精度色）
-              title: tooltip 文本
-        """
-        node_w = 240.0
-        node_h = 86.0
-        paths: list[tuple[list[tuple[float, float]], str, str]] = []
+    ) -> list[tuple[str, str, list[tuple[float, float]]]]:
+        """按原邻接顺序返回 (源内部键, 目标内部键, 边界交点及途经点列)。"""
+        node_w, node_h = self.node_width, self.node_height
+        paths: list[tuple[str, str, list[tuple[float, float]]]] = []
 
         for a, blist in self.children.items():
             if a not in real_pos:
@@ -3964,411 +3457,762 @@ class AccuracyGraph:
                 if tb not in real_pos:
                     continue
 
-                src_ec = self.layer_row[a].get('entire_cos')
-                ec_color = self._cos_to_color(src_ec)
-                dst_ec = self.layer_row[tb].get('entire_cos')
-                title = (
-                    f'{a} -> {tb}\nentire_cos={dst_ec:.6f}'
-                    if dst_ec is not None else f'{a} -> {tb}'
-                )
-
                 route = edge_routes.get((a, tb), [])
                 if route:
-                    # 长边：源边界 → 各虚拟节点 → 目标边界（曲线沿层间间隙行进）
-                    first = dummy_pos[route[0]]
-                    last = dummy_pos[route[-1]]
-                    src_pt = self._intersect_rect(real_pos[a], first, node_w, node_h)
-                    dst_pt = self._intersect_rect(real_pos[tb], last, node_w, node_h)
-                    pts = [src_pt] + [dummy_pos[d] for d in route] + [dst_pt]
+                    first, last = dummy_pos[route[0]], dummy_pos[route[-1]]
                 else:
-                    # 短边（相邻层）：边界交点 → 边界交点
-                    src_pt = self._intersect_rect(real_pos[a], real_pos[tb], node_w, node_h)
-                    dst_pt = self._intersect_rect(real_pos[tb], real_pos[a], node_w, node_h)
-                    col_dx = real_pos[tb][0] - real_pos[a][0]
+                    first, last = real_pos[tb], real_pos[a]
+                src_pt = self._intersect_rect(real_pos[a], first, node_w, node_h)
+                dst_pt = self._intersect_rect(real_pos[tb], last, node_w, node_h)
+                if route:
+                    pts = [src_pt] + [dummy_pos[d] for d in route] + [dst_pt]
+                elif abs(real_pos[tb][0] - real_pos[a][0]) < 1.0:
+                    pts = [src_pt, dst_pt]
+                else:
+                    # 短边控制点向扇出更多的一侧外凸，保持原浮点运算顺序。
                     span = dst_pt[0] - src_pt[0]
-                    if abs(col_dx) < 1.0:
-                        # 同列：两点直线
-                        pts = [src_pt, dst_pt]
-                    else:
-                        # 并排/分叉：外凸贝塞尔曲线，方向朝扇出更多的一侧
-                        out_n = len(self.children.get(a, []))
-                        in_n = len(self.parents.get(tb, []))
-                        sgn = 1.0 if span > 0 else -1.0
-                        if in_n > out_n:
-                            sgn = -sgn
-                        mx = (src_pt[0] + dst_pt[0]) / 2.0 + sgn * 0.3 * abs(span)
-                        my = (src_pt[1] + dst_pt[1]) / 2.0
-                        pts = [src_pt, (mx, my), dst_pt]
-                paths.append((pts, ec_color, title))
+                    sgn = -1.0
+                    if span > 0:
+                        sgn = 1.0
+                    if len(self.parents.get(tb, [])) > len(self.children.get(a, [])):
+                        sgn = -sgn
+                    mx = (src_pt[0] + dst_pt[0]) / 2.0 + sgn * 0.3 * abs(span)
+                    my = (src_pt[1] + dst_pt[1]) / 2.0
+                    pts = [src_pt, (mx, my), dst_pt]
+                paths.append((a, tb, pts))
         return paths
 
-    def render(self, show: bool = True) -> str:
-        """渲染网络图为自包含 SVG HTML（无外部依赖）。
+    @staticmethod
+    def _netron_curve_path(points: list[tuple[float, float]]) -> str:
+        """生成 Netron grapher.Edge.Curve 的漂浮式三次贝塞尔路径。
 
-        边用 Netron 风格漂浮贝塞尔曲线（_netron_curve_path）穿过所有虚拟节点点列，
-        实现真正平滑的绕行长弧线；节点用 _svg_node 生成的矢量图。
-        交互（缩放/平移/WASD/还原/悬停）由内联 JS 实现。返回 HTML 路径。
+        第三点先写前导线段，再写曲线；曲线不推进点状态，统一在循环末推进。
+        三点及以上补末段曲线，最后直达终点；控制点运算顺序与一位小数格式保持。
         """
-        import json
+        pts = [(float(x), float(y)) for x, y in points]
+        n = len(pts)
+        if n < 2:
+            return ''
 
-        depth = self._layers()
-        real_pos, dummy_pos, edge_routes, level_sizes = self._compute_layout(depth)
-        paths = self._build_edge_paths(real_pos, dummy_pos, edge_routes)
+        data = ''
+        x0 = y0 = x1 = y1 = float('nan')
 
-        node_w, node_h = 240.0, 86.0
+        def curve(x: float, y: float) -> None:
+            nonlocal data
+            data += (
+                f'C{(2 * x0 + x1) / 3:.1f},{(2 * y0 + y1) / 3:.1f},'
+                f'{(x0 + 2 * x1) / 3:.1f},{(y0 + 2 * y1) / 3:.1f},'
+                f'{(x0 + 4 * x1 + x) / 6:.1f},{(y0 + 4 * y1 + y) / 6:.1f}'
+            )
 
-        # 全图坐标范围（含节点半宽/半高留白）
+        for i, (x, y) in enumerate(pts):
+            if i == 0:
+                data += f'M{x:.1f},{y:.1f}'
+            elif i == 2:
+                data += f'L{(5 * x0 + x1) / 6:.1f},{(5 * y0 + y1) / 6:.1f}'
+                curve(x, y)
+            elif i > 2:
+                curve(x, y)
+
+            x0, x1 = x1, x
+            y0, y1 = y1, y
+
+        if n > 2:
+            curve(x1, y1)
+        data += f'L{x1:.1f},{y1:.1f}'
+        return data
+
+
+class AccuracyGraph:
+    """将 RKNN/QNN 层精度渲染为纵向 DAG 的自包含 HTML。
+
+    rows 保存节点指标，children/parents 保存依赖；累计大字色块与单层小字
+    共享可搜索的层列表和详情；几何计算委托 NetronGraphLayout。
+    """
+
+    NODE_WIDTH, NODE_HEIGHT = 180.0, 86.0
+    METRIC_KEYS = ('entire_cos', 'entire_euc', 'single_cos', 'single_euc', 'entire_mse')
+
+    # 常见算子类型 -> 边框颜色（Netron 风格色板）
+    # Netron (lutzroeder/netron) 类别色板（grapher.css）
+    CATEGORY_COLORS: dict[str, str] = {
+        'Layer': '#335588',          # 卷积、全连接等
+        'Activation': '#702921',     # ReLU、Sigmoid、Softmax、Clip 等
+        'Pool': '#335533',           # 池化
+        'Normalization': '#335544',  # LayerNorm、BatchNorm 等
+        'Dropout': '#454770',
+        'Shape': '#6c4f47',          # Reshape、Flatten 等
+        'Tensor': '#59423b',         # Concat、Split 等
+        'Transform': '#335544',      # Transpose、Squeeze、Unsqueeze 等
+        'Data': '#555555',           # 输入/输出数据
+        'Quantization': '#502800',   # 量化层
+        'Attention': '#783c00',      # 注意力
+        'Constant': '#eeeeee',       # 常量
+        'Control': '#eeeeee',        # 控制流
+    }
+    DEFAULT_COLOR = '#333333'        # Netron 未分类默认色
+
+    # 算子类型 -> Netron 类别
+    OP_CATEGORY: dict[str, str] = {
+        'Conv': 'Layer', 'Gemm': 'Layer', 'MatMul': 'Layer',
+        'Add': 'Layer', 'Mul': 'Layer', 'Sub': 'Layer', 'Div': 'Layer',
+        'Concat': 'Tensor', 'Split': 'Tensor', 'Slice': 'Tensor',
+        'Reshape': 'Shape', 'Flatten': 'Shape',
+        'Transpose': 'Transform', 'Squeeze': 'Transform', 'Unsqueeze': 'Transform',
+        'Softmax': 'Activation', 'Sigmoid': 'Activation', 'Relu': 'Activation',
+        'LeakyRelu': 'Activation', 'Clip': 'Activation', 'exSwish': 'Activation',
+        'LayerNormalization': 'Normalization', 'LayerNorm': 'Normalization',
+        'exNorm': 'Normalization', 'BatchNormalization': 'Normalization',
+        'exDataConvert': 'Data', 'Input': 'Data', 'Output': 'Data',
+        'exSDPAttention': 'Attention',
+        # DLC 反射的 QNN 算子；只补充上面未出现的类型。
+        'Conv2d': 'Layer', 'DepthWiseConv2d': 'Layer', 'FullyConnected': 'Layer',
+        'TransposeConv2d': 'Layer',
+        'Eltwise_Binary': 'Activation', 'Eltwise_Or': 'Activation',
+        'Eltwise_And': 'Activation', 'Eltwise_Not': 'Activation',
+        'Prelu': 'Activation', 'ReluMinMax': 'Activation',
+        'Tanh': 'Activation', 'Gelu': 'Activation', 'HardSwish': 'Activation',
+        'ElementWiseNeuron': 'Activation', 'ElementWiseUnary': 'Activation',
+        'Resize': 'Transform',   # QNN Resize (最近邻/双线性上采样)
+        'PoolMax': 'Pool', 'PoolAvg': 'Pool', 'Pooling': 'Pool',
+        'BatchNorm': 'Normalization', 'RmsNorm': 'Normalization',
+        'InstanceNorm': 'Normalization',
+        "StridedSlice": "Tensor",
+    }
+
+    def __init__(
+        self,
+        accuracy: dict,
+        onnx_path: str | Path,
+        output_path: str | Path,
+        title: str | None = None,
+        *,
+        sanitize: bool = False,
+        include_input: bool = False,
+        layer_display=None,
+        dlc_candidates: list[dict] | None = None,
+        dlc_io: dict | None = None,
+    ):
+        """由输出张量的精度字典构建报告，ONNX 结构只读取一次。
+
+        accuracy 的值包含 METRIC_KEYS 与可选 op_type；缺失指标保留 None。
+        title 默认取结构参考 ONNX 的 stem；output_path 是单 HTML 输出路径。
+        sanitize 用于 QNN raw 名称匹配；include_input 追加理想 Input 示意终端。
+        layer_display(graph, key) 只还原张量关联键，真实算子名另作界面显示。
+        dlc_candidates 非空时按 DLC 的全部候选及实际输入/输出构图，包含融合层；
+        否则按 ONNX 张量依赖构图。dlc_io 提供实际图边界，缺失时使用原启发式。
+        """
+        self._accuracy = accuracy or {}
+        self.onnx_path = Path(onnx_path)
+        self._sanitize = sanitize
+        self._include_input = include_input
+        self._layer_display = layer_display
+        self._dlc_candidates = dlc_candidates or None
+        self._dlc_io = dlc_io or None
+
+        self.output_path = Path(output_path)
+        self.title = title
+        if title is None:
+            self.title = self.onnx_path.stem
+        self.node_sep = 37.5 # 横向：真实节点之间的间距
+        self.edge_sep = 15.0 # 横向：长边虚拟节点占用的间距
+        self.rank_sep = 37.5 # 纵向：层与层之间的间距
+        self.pan_speed:float = 15
+
+        self._parse_accuracy_dict()
+
+    # ------------------------------------------------------------------
+    # 内部：由统一 dict 构建 onnx 图 / 层图 / 终端节点
+    # ------------------------------------------------------------------
+
+    def _parse_accuracy_dict(self) -> None:
+        """按当前图视角组装精度行、邻接关系和示意终端。"""
+        if self._dlc_candidates:
+            self._parse_accuracy_from_dlc()
+        else:
+            self._parse_accuracy_from_onnx()
+
+    def _finish_parse(self, real_rows: list[dict], children: dict, parents: dict,
+                      input_rows: list[dict], output_rows: list[dict],
+                      input_layers: list[str], output_layers: list[str]) -> None:
+        """收尾：组装 self.rows / children / parents / 颜色范围（两模式共用）。"""
+        for row in input_rows + output_rows:
+            row['terminal'] = True
+        self.rows = input_rows + real_rows + output_rows
+        self.inputs = input_layers
+        self.outputs = output_layers
+        self.children = children
+        self.parents = parents
+        self.data = {'rows': self.rows, 'inputs': self.inputs, 'outputs': self.outputs}
+        self.node_order = {r['layer_name']: i for i, r in enumerate(self.rows)}
+        self.layer_row = {r['layer_name']: r for r in self.rows}
+        euc_values = [r.get('entire_euc') for r in self.rows
+                  if r.get('entire_euc') is not None]
+        self.euc_color_min = min(euc_values, default=0.0)
+        self.euc_color_max = max(euc_values, default=1.0)
+
+    # ------------------------------------------------------------------
+    # B) ONNX 模式（默认）：层全集 = accuracy 键；连线走 onnx 张量 succ
+    # ------------------------------------------------------------------
+
+    def _parse_accuracy_from_onnx(self) -> None:
+        graph = build_onnx_tensor_graph(self.onnx_path, sanitize=self._sanitize)
+        node_info = graph['node_info']
+        # layer_display 还原张量关联键；算子展示名另存，避免重名/多输出合并。
+        name_of = lambda key: key
+        if self._layer_display is not None:
+            name_of = lambda key: self._layer_display(graph, key)
+
+        results, real_rows = [], []
+        for name, row in self._accuracy.items():
+            raw_stem = str(name).removesuffix('.raw')
+            tensor = match_tensor(raw_stem, graph)
+            exact = tensor is not None and raw_stem in {tensor, '_' + tensor, tensor.lstrip('_')}
+            # op_type：优先 dict 自带（Rknn error_analysis），缺则 onnx node_info 推断
+            op_type = row.get('op_type')
+            if not op_type and tensor is not None and tensor in node_info:
+                op_type = node_info[tensor][0]
+            display = name_of(raw_stem)
+            label, tensor_name = display, raw_stem
+            if exact:
+                label = graph['node_labels'].get(tensor) or display
+                tensor_name = graph['tensors'].get(tensor, raw_stem)
+            parsed = {
+                'layer_name': display,
+                'op_type': op_type or 'Unknown',
+                'display_name': label, 'tensor_name': tensor_name,
+                **{key: row.get(key) for key in self.METRIC_KEYS},
+            }
+            real_rows.append(parsed)
+            results.append(dict(parsed, tensor=tensor))
+
+        children, parents, _ = build_layer_graph(results, graph)
+
+        (input_rows, output_rows, input_layers, output_layers,
+         aug_children, aug_parents) = build_terminal_nodes(
+            results, children, parents, graph, include_input=self._include_input,
+            name_of=name_of,
+        )
+
+        self._finish_parse(real_rows, aug_children, aug_parents,
+                           input_rows, output_rows, input_layers, output_layers)
+
+    # ------------------------------------------------------------------
+    # A) DLC 模式（QNN）：节点全集 = DLC 候选层；连线走候选 io_tensors
+    # ------------------------------------------------------------------
+
+    def _parse_accuracy_from_dlc(self) -> None:
+        """按实际 DLC 候选构图，张量关联键与算子展示名保持独立。"""
+        graph = build_onnx_tensor_graph(self.onnx_path, sanitize=self._sanitize)
+        name_of = lambda key: key
+        if self._layer_display is not None:
+            name_of = lambda key: self._layer_display(graph, key)
+
+        cands = self._dlc_candidates
+
+        # 每个输出保留一个分析项，精度缺失也保留；重复张量取首条。
+        produced, real_rows = set(), []
+        for c in cands:
+            t = c['tensor']
+            if t in produced:
+                continue
+            produced.add(t)
+            acc = self._accuracy.get(re.sub(r'[^A-Za-z0-9_]', '_', t)) or {}
+            label, outputs = c.get('op_name') or '', c.get('outputs', [t])
+            if label and len(outputs) > 1 and t in outputs:
+                label += f' [输出 {outputs.index(t)}]'
+            display = name_of(t)
+            real_rows.append({
+                'layer_name': display, 'display_name': label or display, 'tensor_name': t,
+                'op_type': c['op_type'],
+                **{key: acc.get(key) for key in self.METRIC_KEYS},
+            })
+
+        # 生产张量连到消费它的候选；兼容旧候选的 io_tensors 格式。
+        children: dict[str, list[str]] = defaultdict(list)
+        parents: dict[str, list[str]] = defaultdict(list)
+
+        for c in cands:
+            cur = c['tensor']
+            ins = c.get('inputs', c['io_tensors'][:-1])
+            for i in ins:
+                if i in produced and i != cur:
+                    children[i].append(cur)
+                    parents[cur].append(i)
+        for adjacency in (children, parents):
+            for key, values in adjacency.items():
+                adjacency[key] = list(dict.fromkeys(values))
+
+        # 边键统一到关联键；不得改用可能重名的算子展示名。
+        display_of = {c['tensor']: name_of(c['tensor']) for c in cands}
+        def map_edge(d):
+            out = defaultdict(list)
+            for a, bl in d.items():
+                da = display_of.get(a, a)
+                for b in bl:
+                    db = display_of.get(b, b)
+                    if da != db:
+                        out[da].append(db)
+            return {k: list(dict.fromkeys(v)) for k, v in out.items()}
+        children_disp = map_edge(children)
+        parents_disp = map_edge(parents)
+
+        def consumers(t: str) -> list[str]:
+            # 一个图输入可被多个 op 或同一 op 的多个输出候选消费。
+            return list(dict.fromkeys(
+                display_of.get(c['tensor'], c['tensor']) for c in cands
+                if t in c.get('inputs', c['io_tensors'][:-1])))
+
+        input_rows: list[dict] = []
+        input_layers: list[str] = []
+        output_rows: list[dict] = []
+        output_layers: list[str] = []
+        if self._include_input:
+            # 优先 IR 边界；缺失时启发式可能把 TF kernel/hoist 常量误判为输入。
+            if self._dlc_io and self._dlc_io.get('inputs'):
+                model_ins = [t for t in self._dlc_io['inputs'] if t not in produced]
+            else:
+                all_ins: set[str] = set()
+                for c in cands:
+                    all_ins.update(c.get('inputs', c['io_tensors'][:-1]))
+                model_ins = sorted(
+                    t for t in (all_ins - produced)
+                    if not any(k in t for k in ('weight', 'bias', 'coeff', 'onnx::')))
+            for inp in model_ins:
+                display = inp  # 图输入没有 DLC 节点，直接显示原名
+                input_layers.append(display)
+                input_rows.append({
+                    'layer_name': display, 'op_type': 'Input',
+                    'entire_cos': 1.0, 'entire_euc': 0.0,
+                    'single_cos': 1.0, 'single_euc': 0.0,
+                })
+                for con in consumers(inp):
+                    children_disp.setdefault(display, []).append(con)
+                    parents_disp.setdefault(con, []).append(display)
+
+        # 无 IR 输出边界时，以没有下游消费者的候选作为输出。
+        out_set = None
+        if self._dlc_io and self._dlc_io.get('outputs'):
+            out_set = set(self._dlc_io['outputs'])
+        row_by_name = {}
+        for row in real_rows:
+            row_by_name.setdefault(row['layer_name'], row)
+        for c in cands:
+            t = c['tensor']
+            if out_set is not None:
+                if t not in out_set:      # 非 IR 图输出 -> 不画 Output 终端
+                    continue
+            elif t in children:           # 启发式：有下游消费者 -> 非图输出
+                continue
+            display = display_of.get(t, t)
+            node_name = display
+            if display in row_by_name:
+                node_name += ' (out)'
+            output_layers.append(node_name)
+            row = row_by_name.get(display, {})
+            output_rows.append({
+                'layer_name': node_name, 'op_type': 'Output',
+                **{key: row.get(key) for key in
+                   self.METRIC_KEYS[:4]},
+            })
+            children_disp.setdefault(display, []).append(node_name)
+            parents_disp.setdefault(node_name, []).append(display)
+
+        self._finish_parse(real_rows, children_disp, parents_disp,
+                           input_rows, output_rows, input_layers, output_layers)
+
+    # ------------------------------------------------------------------
+    # 颜色辅助
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cos_to_color(cos: float | None, vmin: float = 0.8, vmax: float = 1.0) -> str:
+        """将累积/单层 cosine 相似度映射为红(差)-黄(中)-绿(良)。"""
+        if cos is None:
+            return '#b0b0b0'
+        t = (cos - vmin) / (vmax - vmin)
+        t = max(0.0, min(1.0, t))
+        # 红(255,69,0) -> 黄(255,215,0) -> 绿(60,179,113)
+        if t < 0.5:
+            k = t / 0.5
+            # 红/黄两端蓝色均为 0，必须保持 b=0；否则会被错误拉高成粉/橙红
+            r, g, b = 255, 69 + (215 - 69) * k, 0
+        else:
+            k = (t - 0.5) / 0.5
+            r, g, b = 255 + (60 - 255) * k, 215 + (179 - 215) * k, 0 + (113 - 0) * k
+        return f'#{int(r):02x}{int(g):02x}{int(b):02x}'
+
+    def _op_color(self, op_type: str | None) -> str:
+        """返回该算子类型在 Netron 中对应的类别颜色。"""
+        category = self.OP_CATEGORY.get(op_type or '', '')
+        return self.CATEGORY_COLORS.get(category, self.DEFAULT_COLOR)
+
+    def _euc_to_color(self, euc: float | None) -> str:
+        """欧氏距离映射为绿→黄→红，范围中点起为纯红（cos≤0.8）。"""
+        if euc is None:
+            return '#b0b0b0'
+        span = self.euc_color_max - self.euc_color_min
+        if span <= 0:
+            t = 0.0
+        else:
+            t = (euc - self.euc_color_min) / span
+        return self._cos_to_color(1.0 - max(0.0, min(1.0, t)) * 0.4)
+
+    @staticmethod
+    def _text_color_for(bg: str) -> str:
+        """浅背景用灰黑文字，深背景用白色（BT.709 相对亮度）。"""
+        bg = bg.lstrip('#')
+        if len(bg) != 6:
+            return '#fff'
+        r, g, b = int(bg[0:2], 16), int(bg[2:4], 16), int(bg[4:6], 16)
+        # 相对亮度 (ITU-R BT.709)
+        lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        if lum > 140:
+            return '#333333'
+        return '#fff'
+
+    def _layout_engine(self) -> NetronGraphLayout:
+        return NetronGraphLayout(self.layer_row, self.children, self.parents,
+                                 node_width=self.NODE_WIDTH, node_height=self.NODE_HEIGHT,
+                                 node_sep=self.node_sep, edge_sep=self.edge_sep, rank_sep=self.rank_sep)
+
+    def _layers(self) -> dict[str, int]:
+        return self._layout_engine()._layers()
+
+    def _compute_layout(self, depth: dict[str, int]):
+        return self._layout_engine()._compute_layout(depth)
+
+    _intersect_rect = staticmethod(NetronGraphLayout._intersect_rect)
+    _netron_curve_path = staticmethod(NetronGraphLayout._netron_curve_path)
+
+    # ------------------------------------------------------------------
+    # 构建与渲染
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fmt5(value: float | None) -> str:
+        """五位有效数字，整数和科学计数法尾数至少保留一位小数。"""
+        if value is None:
+            return '—'
+        mantissa, separator, exponent = f'{value:.5g}'.partition('e')
+        if '.' not in mantissa:
+            mantissa += '.0'
+        return mantissa + separator + exponent
+
+    def _svg_node(self, name: str, op: str, row: dict) -> tuple[str, str]:
+        """生成类型色栏、累计大字色块和单层小字组成的节点。"""
+        import base64
+
+        width, height = int(self.NODE_WIDTH), int(self.NODE_HEIGHT)
+        top_fill = self._op_color(op)
+        top_text = self._text_color_for(top_fill)
+        svg = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
+            f'<defs><clipPath id="cp"><rect x="0" y="0" width="{width}" height="{height}" '
+            'rx="12" ry="12"/></clipPath></defs>',
+            f'<rect x="0" y="0" width="{width}" height="34" fill="{top_fill}" clip-path="url(#cp)"/>',
+            f'<text x="{width/2}" y="24" font-family="Arial" font-size="16" fill="{top_text}" '
+            f'text-anchor="middle" font-weight="bold">{html.escape(op)}</text>',
+            f'<rect x="0" y="34" width="{width}" height="52" fill="#fff" clip-path="url(#cp)"/>',
+            f'<line x1="{width//2}" y1="39" x2="{width//2}" y2="81" stroke="#edf1f5"/>',
+        ]
+        for metric, left, right, color in [('cos', 8, 82, self._cos_to_color(row.get('entire_cos'))),
+                                           ('euc', 98, 172, self._euc_to_color(row.get('entire_euc')))]:
+            svg.extend([
+                f'<text x="{left}" y="44" font-family="Arial" font-size="8.5" '
+                f'fill="#7c8b9d">entire {metric}</text>',
+                f'<rect class="accuracy-color" data-key="entire_{metric}" '
+                f'x="{left-3}" y="48" width="80" height="21" rx="3" fill="{color}"/>',
+                f'<text x="{left}" y="79" font-family="Arial" font-size="8.5" '
+                'fill="#7c8b9d">single</text>',
+            ])
+            for stage, y, size, limit, small, weight, fill, missing in [
+                    ('entire', 64, 17, 8, 12, '600', '#17251f', '#34465c'),
+                    ('single', 79, 9.5, 9, 8, '400', '#34465c', '#9aa5b4')]:
+                key = f'{stage}_{metric}'
+                value = row.get(key)
+                label = self._fmt5(value)
+                if value is None:
+                    fill = missing
+                if len(label) > limit:
+                    size = small
+                svg.append(f'<text class="accuracy-value" data-key="{key}" x="{right}" y="{y}" '
+                           f'text-anchor="end" font-family="Consolas,monospace" font-size="{size}" '
+                           f'font-weight="{weight}" fill="{fill}">{html.escape(label)}</text>')
+        svg.append(f'<rect x="0.5" y="0.5" width="{width-1}" height="{height-1}" rx="12" ry="12" '
+                   'fill="none" stroke="#94a3b8" stroke-width="1"/></svg>')
+        image = 'data:image/svg+xml;base64,' + base64.b64encode(''.join(svg).encode('utf-8')).decode('ascii')
+        title = '\n'.join([name, f'op_type: {op}'] + [f'{key}={row.get(key)}' for key in
+                         ('entire_cos', 'entire_euc', 'single_cos', 'single_euc')])
+        return image, title
+
+
+    def _build_edge_paths(self, real_pos: dict, dummy_pos: dict, edge_routes: dict, *,
+                          layout: NetronGraphLayout | None = None) -> list:
+        """给有序几何点列附加精度颜色和原 tooltip，保留旧私有返回契约。"""
+        if layout is None:
+            layout = self._layout_engine()
+        paths = []
+        for source, target, points in layout.edge_points(real_pos, dummy_pos, edge_routes):
+            color = self._cos_to_color(self.layer_row[source].get('entire_cos'))
+            value = self.layer_row[target].get('entire_cos')
+            title = f'{source} -> {target}'
+            if value is not None:
+                title += f'\nentire_cos={value:.6f}'
+            paths.append((points, color, title))
+        return paths
+
+    _REPORT_HTML = r'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root{font-family:Inter,"Segoe UI","Microsoft YaHei",sans-serif;color:#233047;background:#f5f7fa;font-synthesis:none;--line:#e3e8ee;--muted:#7c8797;--accent:#087b75}
+*{box-sizing:border-box}body{margin:0;height:100vh;overflow:hidden}button,input,select{font:inherit}button{cursor:pointer}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #0c9489;outline-offset:3px}button{color:inherit}a{color:inherit;text-decoration:none}
+.app{--layers-width:252px;--details-width:300px;position:relative;height:100%;display:grid;grid-template-rows:minmax(0,1fr)}.plain{border:1px solid var(--line);border-radius:6px;background:#fff;font-size:12px;padding:7px 11px;display:inline-flex;align-items:center;justify-content:center;gap:6px}.plain:hover{background:#f4f7f9}.plain svg{width:15px;height:15px}
+.workspace{display:grid;grid-template-columns:var(--layers-width) minmax(0,1fr) var(--details-width);grid-template-rows:minmax(0,1fr);min-height:0}.sidebar,.inspector{background:#fff;min-height:0;display:flex;flex-direction:column;z-index:3}.sidebar{grid-column:1;border-right:1px solid var(--line)}.inspector{grid-column:3;border-left:1px solid var(--line);overflow:auto}.side-top{padding:19px 16px 14px}.section-title{display:flex;align-items:center;justify-content:space-between;height:18px;padding-left:80px;gap:6px;white-space:nowrap;font-size:13px;font-weight:650}.count{flex-shrink:0;font-size:10px;background:#f0f3f7;color:#64748b;border-radius:4px;padding:2px 4px;font-weight:500}.search{position:relative;margin-top:15px}.search svg{width:15px;height:15px;position:absolute;left:10px;top:11px;color:#95a1b0}.search input{width:100%;height:36px;padding:0 10px 0 32px;border:1px solid #dde4eb;border-radius:6px;background:#fafbfd;font-size:12px;color:#28394c}.search input::placeholder{color:#99a3b0}.sort-row{display:flex;align-items:center;justify-content:space-between;padding:0 16px 12px;font-size:10px;color:#99a3b0}.sort-row select{border:0;background:transparent;color:#778499;max-width:140px;font-size:10px;cursor:pointer}.layer-list{overflow:auto;flex:1;padding:0 9px 12px}.layer{border:1px solid transparent;background:#fff;width:100%;text-align:left;border-radius:7px;padding:10px 9px;margin-bottom:3px;display:grid;grid-template-columns:21px 1fr;gap:6px}.layer:hover{background:#f7f9fb}.layer.selected{border-color:#bfdbd6;background:#edf5f3}.layer-index{font:10px ui-monospace,Consolas,monospace;color:#a2acb8;padding-top:2px}.layer-title{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:168px}.layer-op{font-size:10px;color:#95a0af;margin-top:4px}.layer-bottom{display:flex;gap:9px;margin-top:9px;font:10px ui-monospace,Consolas,monospace;color:#7d8a9d}.layer-bottom .label{font-size:9px;color:#a0a9b5;margin-right:3px}.dot{width:5px;height:5px;display:inline-block;border-radius:50%;background:#66a78c;vertical-align:middle;margin-right:4px}.dot.missing{background:#b8c0ca}.empty{padding:25px 8px;color:#8b96a5;font-size:12px;text-align:center}.side-foot{border-top:1px solid var(--line);font-size:10px;line-height:1.7;color:#98a3b2;padding:12px 17px}.coverage{height:3px;background:#edf1f5;border-radius:2px;margin-top:7px;overflow:hidden}.coverage i{display:block;height:100%;background:#8ab6a9}
+.canvas{grid-column:2;min-width:0;position:relative;overflow:hidden;background:#f5f7fa}.canvas>svg{width:100%;height:100%;display:block;touch-action:none;user-select:none;cursor:grab}.canvas>svg image.node{cursor:pointer}.canvas-empty{position:absolute;left:0;right:0;top:45%;text-align:center;font-size:13px;color:#8d99aa;pointer-events:none}.canvas-caption{min-width:0;font-size:10px;color:#94a0b1}.canvas-caption h1{margin:0 0 6px;color:#34465c;font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.view-controls{position:absolute;left:18px;bottom:18px;display:flex;gap:0;border:1px solid #dce3ea;border-radius:7px;box-shadow:0 3px 14px #21334c08;background:#fff;padding:3px;align-items:center}.view-controls button{width:31px;height:29px;background:#fff;border:0;font-size:17px;border-radius:4px;display:grid;place-items:center}.view-controls button:hover{background:#eef3f5}.view-controls output{min-width:47px;text-align:center;color:#68778a;font:10px ui-monospace,Consolas,monospace}.view-controls .separator{height:15px;width:1px;background:#e4e9ef;margin:0 4px}.view-controls svg{width:15px;height:15px}.map{position:absolute;bottom:18px;right:18px;width:110px;height:220px;border:1px solid #dce3ea;border-radius:7px;background:#fffffff2;box-shadow:0 3px 14px #21334c05;padding:7px;cursor:crosshair;touch-action:none;user-select:none}.map.dragging{cursor:grabbing}.map svg{display:block;width:100%;height:100%;overflow:hidden}.map rect.viewport{fill:#197e7510;stroke:#459388;stroke-width:1.3;vector-effect:non-scaling-stroke}.canvas-key{position:absolute;bottom:64px;left:18px;color:#8d99aa;font-size:10px;pointer-events:none}
+.inspect-header{padding:20px 19px 17px;border-bottom:1px solid var(--line)}.inspect-kicker{font-size:12px;line-height:24px;color:#7e8a9c;margin-bottom:12px}.inspect-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.op-badge{border-radius:4px;background:#edf1f8;color:#577193;padding:4px 7px;font-size:10px;font-weight:650}.copy{border:0;background:transparent;color:#97a3b3;padding:4px;display:grid;place-items:center}.copy svg{width:15px;height:15px}.full-name{font:12px/1.65 ui-monospace,Consolas,"Microsoft YaHei",monospace;word-break:break-all;margin-top:13px;color:#34465c}.inspect-section{padding:19px;border-bottom:1px solid var(--line)}.small-title{margin:0 0 12px;color:#7e8a9c;font-size:10px;font-weight:600;letter-spacing:.5px}.metrics{width:100%;border-collapse:collapse;font-size:11px}.metrics th{color:#96a1b1;font-size:10px;font-weight:400;padding:0 0 11px;text-align:right}.metrics th:first-child,.metrics td:first-child{text-align:left}.metrics td{padding:10px 0;border-top:1px solid #f0f3f6;text-align:right;font:11px ui-monospace,Consolas,monospace;color:#506176}.metrics td:first-child{font-family:inherit;font-size:11px;color:#758297}.metrics td.missing{font-size:10px;color:#a6afbb}.relation{display:block;text-align:left;border:1px solid #e8edf2;width:100%;background:#fbfcfd;border-radius:5px;color:#69788b;padding:8px;margin:6px 0;font:10px/1.6 ui-monospace,Consolas,monospace;overflow-wrap:anywhere}.relation:hover{background:#eff5f3;border-color:#c9ddd8}.relation-head{display:flex;justify-content:space-between;font-size:10px;color:#9aa4b3;margin-top:11px}.legend-scale+.legend-scale{margin-top:18px}.legend-heading{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:#68788d}.legend-heading small{font-size:9px;color:#98a3b1}.legend-bar{height:7px;border-radius:5px;background:linear-gradient(to right,#ff4500 0%,#ffd700 50%,#3cb371 100%);margin-top:9px}.legend-euc .legend-bar{background:linear-gradient(to right,#3cb371 0%,#ffd700 25%,#ff4500 50%,#ff4500 100%)}
+.legend-numbers{position:relative;height:14px;color:#8d99aa;font:9px ui-monospace,Consolas,monospace;margin-top:6px}.legend-numbers span{position:absolute;top:0;white-space:nowrap;transform:translateX(-50%)}.legend-numbers span:first-child{transform:none}.legend-numbers span:last-child{transform:translateX(-100%)}.legend-scale.single-value .legend-numbers span{left:0!important;transform:none}.legend-text{font-size:10px;line-height:1.85;color:#8d99aa;margin:8px 0 0}
+.legend-key{display:flex;gap:8px;align-items:center;color:#8795a8;font-size:10px;margin-top:12px}.legend-node{display:inline-flex;overflow:hidden;border-radius:3px;border-top:3px solid #577193}.legend-node i{font:8px/15px ui-monospace,Consolas,monospace;padding:0 5px;background:#3cb371;color:#17251f}.legend-node i+i{background:#ffd700}.legend-missing{width:12px;height:12px;background:#b0b0b0;border-radius:3px}
+.tensor-name{margin-top:8px;font:10px/1.6 ui-monospace,Consolas,monospace;color:#8d99aa;overflow-wrap:anywhere}
+.tensor-name:not([hidden]){display:grid;grid-template-columns:max-content minmax(0,1fr);gap:6px}.tensor-name>span:first-child{white-space:nowrap}
+.toast{position:fixed;left:50%;bottom:53px;transform:translateX(-50%);background:#213a43;color:white;font-size:11px;padding:8px 14px;border-radius:6px;display:none;z-index:20}.panel-btn{position:absolute;top:16px;z-index:5}.layers-btn{left:16px}.app.hide-layers .canvas-head{left:104px}.details-btn{right:16px}.app.hide-layers{--layers-width:0px}.app.hide-details{--details-width:0px}.app.hide-layers .sidebar,.app.hide-details .inspector{display:none}
+@media(max-width:1150px){.app{--layers-width:222px;--details-width:272px}.layer-title{max-width:144px}}
+@media(max-width:900px){.app{--layers-width:210px;--details-width:0px}.inspector{position:absolute;top:0;right:0;bottom:0;width:272px;box-shadow:-10px 0 40px #1c31400d}.layer-title{max-width:132px}}
+@media(max-width:600px){.app{--layers-width:0px}.sidebar{position:absolute;top:0;left:0;bottom:0;width:252px;box-shadow:10px 0 40px #1c31400d}.layer-title{max-width:168px}.canvas-caption h1{font-size:12px}.map{width:90px;height:180px}}
+
+.canvas-head{position:absolute;top:18px;left:19px;right:18px;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,42%);gap:18px;pointer-events:none;z-index:2}
+.canvas-status{min-width:0;display:flex;flex-direction:column;gap:6px;text-align:right;color:#8d99aa;font-size:10px;line-height:1.5}.canvas-status>span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.app.hide-details .canvas-head{right:104px}.canvas-key{display:flex;flex-direction:column;gap:5px;line-height:1.5}.canvas-key kbd{border:1px solid #dce3ea;border-radius:3px;padding:1px 4px;font:9px ui-monospace,Consolas,monospace;background:#f9fafb}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <button class="plain panel-btn layers-btn" id="toggle-layers" aria-label="显示或隐藏层列表" aria-expanded="true" aria-controls="layer-sidebar"><span id="layers-label">收起列表</span></button>
+  <button class="plain panel-btn details-btn" id="toggle-details" aria-label="显示或隐藏层详情" aria-expanded="true" aria-controls="layer-inspector"><span id="details-label">收起详情</span></button>
+  <div class="workspace">
+    <aside class="sidebar" id="layer-sidebar" aria-label="层列表">
+      <div class="side-top"><div class="section-title"><span id="layers-heading">层目录</span><span class="count" id="layer-count"></span></div>
+        <div class="search"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 4 4"/></svg><input id="search" type="search" autocomplete="off" aria-label="搜索层名、张量或算子" placeholder="搜索层名、张量或算子…"></div>
+      </div>
+      <div class="sort-row"><span>S 单层 · E 累计</span><select id="sort" aria-label="层列表排序"><option value="order">计算图顺序</option><option value="entire_cos">累计 cos 升序</option><option value="single_cos">单层 cos 升序</option></select></div>
+      <div class="layer-list" id="layer-list"></div>
+      <div class="side-foot"><span id="coverage"></span><div class="coverage"><i id="coverage-bar"></i></div></div>
+    </aside>
+    <main class="canvas" aria-label="计算图画布">
+      <div class="canvas-head"><div class="canvas-caption"><h1 id="model-title"></h1><span id="source-note">点击节点查看完整指标</span></div><div class="canvas-status"><span id="graph-count"></span><span id="selection-status"></span></div></div><div class="canvas-key"><span><kbd>W A S D</kbd> 平移画布</span><span>滚轮缩放 · 拖拽平移</span></div>
+      __SVG__<div class="canvas-empty" id="canvas-empty" hidden>暂无计算图节点</div>
+      <div class="view-controls"><button id="zoom-out" aria-label="缩小">−</button><output id="zoom-value">100%</output><button id="zoom-in" aria-label="放大">+</button><span class="separator"></span><button id="fit" aria-label="还原视图"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m10-4v4h-4"/></svg></button></div>
+      <div class="map" id="map" title="点击定位，拖动平移画布"><svg id="map-svg" aria-label="全图缩略图"></svg></div>
+    </main>
+    <aside class="inspector" id="layer-inspector" aria-label="选中层详情">
+      <div class="inspect-header"><div class="inspect-kicker">层详情</div><div class="inspect-heading"><span class="op-badge" id="detail-op"></span><button class="copy" id="copy-name" aria-label="复制完整层名" title="复制完整层名"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="7" y="7" width="10" height="11" rx="1.5"/><path d="M13 7V3H3v11h4"/></svg></button></div><div class="full-name" id="detail-name"></div><div class="tensor-name" id="detail-tensor" hidden><span>输出张量：</span><span id="detail-tensor-value"></span></div></div>
+      <div class="inspect-section"><h2 class="small-title">精度指标</h2><table class="metrics"><thead><tr><th>指标</th><th>单层 single</th><th>累计 entire</th></tr></thead><tbody id="metric-rows"></tbody></table></div>
+      <div class="inspect-section"><h2 class="small-title">相邻层</h2><div id="relations"></div></div>
+      <div class="inspect-section"><h2 class="small-title">图例</h2>
+        <div class="legend-scale" id="cos-legend"><div class="legend-heading"><span>累计 cos</span><small>越大越接近参考值</small></div><div class="legend-bar"></div><div class="legend-numbers"><span style="left:0">≤0.80</span><span style="left:50%">0.90</span><span style="left:100%">1.00</span></div></div>
+        <div class="legend-scale legend-euc" id="euc-legend"><div class="legend-heading"><span>累计 euc</span><small>本图范围 · 越小越接近参考值</small></div><div class="legend-bar"></div><div class="legend-numbers" id="euc-ticks"></div></div>
+        <div class="legend-key"><span class="legend-node"><i>cos</i><i>euc</i></span><span>累计：大字色块 · 单层：下方小字</span></div>
+        <div class="legend-key"><span class="legend-missing"></span><span>未提供</span></div>
+      </div>
+    </aside>
+  </div>
+</div>
+<div class="toast" id="toast" role="status"></div>
+<script>
+const payload = __PAYLOAD__;
+const rows=payload.rows, layers=rows.filter(row=>!row.terminal), svg=document.getElementById('svg');
+const $=id=>document.getElementById(id), ns=svg.namespaceURI;
+let selected=layers[0]||rows[0], baseView;
+const number=value=>value==null?'未提供':Number(value).toPrecision(6);
+const short=value=>value.split('/').filter(Boolean).slice(-2).join(' / ');
+const layerName=row=>row?.display_name||row?.layer_name||'';
+const byName=new Map(rows.map(row=>[row.layer_name,row]));
+function text(tag,value,cls){const element=document.createElement(tag);element.textContent=value;if(cls)element.className=cls;return element;}
+function compact(value){const [mantissa,exponent]=Number(value.toPrecision(4)).toString().split('e');return mantissa+(mantissa.includes('.')?'':'.0')+(exponent===undefined?'':`e${exponent}`);}
+const view=()=>svg.getAttribute('viewBox').split(/[ ,]+/).map(Number);
+function setView(next){svg.setAttribute('viewBox',next.join(' '));syncView();}
+function syncView(){
+  const current=view(),box=$('map-svg').querySelector('.viewport');
+  $('zoom-value').textContent=`${Math.round(baseView[2]/current[2]*100)}%`;
+  if(box)['x','y','width','height'].forEach((key,index)=>box.setAttribute(key,current[index]));
+}
+function point(element,event){return new DOMPoint(event.clientX,event.clientY).matrixTransform(element.getScreenCTM().inverse());}
+function zoomAt(x,y,factor){const current=view();setView([x+(current[0]-x)*factor,y+(current[1]-y)*factor,current[2]*factor,current[3]*factor]);}
+function renderList(){
+  const query=$('search').value.toLowerCase().trim(),sort=$('sort').value;
+  let list=layers.filter(row=>!query||`${layerName(row)} ${row.tensor_name||''} ${row.layer_name} ${row.op_type}`.toLowerCase().includes(query));
+  if(sort!=='order')list=list.slice().sort((a,b)=>(a[sort]??Infinity)-(b[sort]??Infinity));
+  $('layer-list').replaceChildren();$('layer-count').textContent=`${list.length} / ${layers.length}`;
+  for(const row of list){
+    const button=text('button','','layer'+(row===selected?' selected':''));button.title=layerName(row)+(row.tensor_name?`\n输出张量：${row.tensor_name}`:'');
+    button.append(text('span',String(layers.indexOf(row)+1).padStart(2,'0'),'layer-index'));
+    const content=text('div','');content.append(text('div',short(layerName(row)),'layer-title'),text('div',row.op_type,'layer-op'));
+    const metrics=text('div','','layer-bottom');
+    for(const [label,value] of [['S',row.single_cos],['E',row.entire_cos]]){
+      const item=text('span','');item.append(text('i','','dot'+(value==null?' missing':'')),text('span',label,'label'),text('span',value==null?'—':value.toFixed(4)));metrics.append(item);
+    }
+    content.append(metrics);button.append(content);button.onclick=()=>choose(row,true);$('layer-list').append(button);
+  }
+  if(!list.length)$('layer-list').append(text('div',layers.length?'没有匹配的层':'暂无分析层','empty'));
+}
+function choose(row,focus=false){
+  if(!row)return;selected=row;renderList();$('detail-name').textContent=layerName(row);$('detail-op').textContent=row.op_type;
+  $('detail-tensor').hidden=!row.tensor_name||row.tensor_name===layerName(row);$('detail-tensor-value').textContent=row.tensor_name||'';
+  $('selection-status').textContent=`已选中 ${short(layerName(row))}`;$('metric-rows').replaceChildren();
+  for(const [label,single,entire] of [['Cosine','single_cos','entire_cos'],['Euclidean','single_euc','entire_euc']]){
+    const tr=document.createElement('tr');tr.append(text('td',label));
+    for(const key of [single,entire])tr.append(text('td',number(row[key]),row[key]==null?'missing':''));$('metric-rows').append(tr);
+  }
+  if(row.entire_mse!=null){const tr=document.createElement('tr');tr.append(text('td','MSE'),text('td','—','missing'),text('td',number(row.entire_mse)));$('metric-rows').append(tr);}
+  $('relations').replaceChildren();
+  for(const [label,names] of [['上游',row.parents],['下游',row.children]]){
+    const head=text('div','','relation-head');head.append(text('span',label),text('span',String(names.length)));$('relations').append(head);
+    for(const name of names){const target=byName.get(name),display=layerName(target)||name,button=text('button',short(display),'relation');button.title=display+'\n'+(target?.tensor_name||name);button.onclick=()=>choose(target,true);$('relations').append(button);}
+    if(!names.length)$('relations').append(text('div','—','legend-text'));
+  }
+  svg.querySelector('#selected-outline')?.remove();
+  const node=svg.querySelector(`image.node[data-i="${rows.indexOf(row)}"]`);
+  if(node){
+    const box=node.getBBox(),outline=document.createElementNS(ns,'rect');
+    Object.entries({id:'selected-outline',x:box.x-4,y:box.y-4,width:box.width+8,height:box.height+8,rx:15,fill:'none',stroke:'#0c6f70','stroke-width':2,'pointer-events':'none'}).forEach(([key,value])=>outline.setAttribute(key,value));svg.append(outline);
+    if(focus){const current=view();setView([box.x+box.width/2-current[2]/2,box.y+box.height/2-current[3]/2,current[2],current[3]]);}
+  }
+}
+function setPanel(name,open){
+  $('app').classList.toggle(`hide-${name}`,!open);$(`toggle-${name}`).setAttribute('aria-expanded',String(open));
+  $(`${name}-label`).textContent=(open?'收起':'展开')+(name==='layers'?'列表':'详情');
+}
+['layers','details'].forEach(name=>$(`toggle-${name}`).onclick=()=>setPanel(name,$('app').classList.contains(`hide-${name}`)));
+setPanel('layers',window.innerWidth>600);setPanel('details',window.innerWidth>900);
+$('model-title').textContent=payload.title;$('model-title').title=payload.title;
+$('graph-count').textContent=`${rows.length} 个节点 · ${payload.edges} 条连接`;
+const covered=layers.filter(row=>row.single_cos!=null).length;
+$('coverage').textContent=`单层指标覆盖 ${covered} / ${layers.length} 层`;$('coverage-bar').style.width=`${covered/Math.max(layers.length,1)*100}%`;
+const [eucMin,eucMax]=payload.euc_range,eucSpan=eucMax-eucMin;
+const hasEuc=rows.some(row=>Number.isFinite(row.entire_euc));
+if(!hasEuc||eucSpan===0){
+  $('euc-legend').classList.add('single-value');$('euc-legend').querySelector('.legend-bar').style.background=hasEuc?'#3cb371':'#b0b0b0';
+  $('euc-ticks').append(text('span',hasEuc?compact(eucMin):'未提供'));
+}else for(const fraction of [0,.25,.5,1]){
+  const tick=text('span',compact(eucMin+fraction*eucSpan));tick.style.left=`${fraction*100}%`;tick.title=number(eucMin+fraction*eucSpan);$('euc-ticks').append(tick);
+}
+const [minX,maxX,minY,maxY]=payload.bounds,figureH=maxY-minY||1,ratio=svg.clientWidth/Math.max(svg.clientHeight,1);
+// 小图适配全图；长图保留局部初始视图。
+const initialH=rows.length<=12?Math.max(figureH+70,(maxX-minX+70)/ratio):figureH/10;
+baseView=[(minX+maxX-initialH*ratio)/2,rows.length<=12?(minY+maxY-initialH)/2:minY-initialH*.1,initialH*ratio,initialH];
+svg.setAttribute('viewBox',baseView.join(' '));
+const mini=$('map-svg'),nodes=[...svg.querySelectorAll('image.node')];
+let bounds=[minX-30,minY-30,maxX-minX+60,maxY-minY+60];
+if(rows.length<=12){const left=Math.min(bounds[0],baseView[0])-20,top=Math.min(bounds[1],baseView[1])-20;bounds=[left,top,Math.max(bounds[0]+bounds[2],baseView[0]+baseView[2])+20-left,Math.max(bounds[1]+bounds[3],baseView[1]+baseView[3])+20-top];}
+mini.setAttribute('viewBox',bounds.join(' '));
+for(const node of nodes){const box=document.createElementNS(ns,'rect');for(const key of ['x','y','width','height'])box.setAttribute(key,node.getAttribute(key));box.setAttribute('rx',10);box.setAttribute('fill','#bdccd5');mini.append(box);}
+const viewport=document.createElementNS(ns,'rect');viewport.classList.add('viewport');mini.append(viewport);syncView();
+let mapDrag;
+const map=$('map');
+function moveMap(event){const p=point(mini,event);setView([p.x-mapDrag.x,p.y-mapDrag.y,mapDrag.w,mapDrag.h]);}
+map.onpointerdown=event=>{
+  if(event.button!==0||!event.isPrimary||mapDrag)return;
+  const p=point(mini,event),current=view(),inside=p.x>=current[0]&&p.x<=current[0]+current[2]&&p.y>=current[1]&&p.y<=current[1]+current[3];
+  mapDrag={id:event.pointerId,x:inside?p.x-current[0]:current[2]/2,y:inside?p.y-current[1]:current[3]/2,w:current[2],h:current[3]};
+  map.setPointerCapture(event.pointerId);map.classList.add('dragging');if(!inside)moveMap(event);event.preventDefault();
+};
+map.onpointermove=event=>{if(mapDrag?.id===event.pointerId){moveMap(event);event.preventDefault();}};
+function endMap(event){if(mapDrag?.id!==event.pointerId)return;mapDrag=null;map.classList.remove('dragging');if(map.hasPointerCapture(event.pointerId))map.releasePointerCapture(event.pointerId);}
+['pointerup','pointercancel','lostpointercapture'].forEach(type=>map.addEventListener(type,endMap));
+svg.addEventListener('wheel',event=>{event.preventDefault();const p=point(svg,event);zoomAt(p.x,p.y,event.deltaY>0?1.15:1/1.15);},{passive:false});
+const pointers=new Map();let pan,pinch,moved=false,pressedNode;
+const distance=()=>{const [a,b]=[...pointers.values()];return Math.hypot(a.x-b.x,a.y-b.y);};
+function startPan(){const p=[...pointers.values()][0];pan={x:p.x,y:p.y,view:view(),inverse:svg.getScreenCTM().inverse()};}
+svg.onpointerdown=event=>{
+  if(event.pointerType==='mouse'&&event.button!==0)return;
+  svg.focus({preventScroll:true});
+  if(!pointers.size)pressedNode=event.target.getAttribute('data-i');
+  pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});svg.setPointerCapture(event.pointerId);
+  if(pointers.size===1){moved=false;startPan();svg.style.cursor='grabbing';}
+  else if(pointers.size===2){pinch=distance();pan=null;moved=true;}event.preventDefault();
+};
+svg.onpointermove=event=>{
+  if(!pointers.has(event.pointerId))return;pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
+  if(pointers.size===2){const d=distance(),[a,b]=[...pointers.values()],p=point(svg,{clientX:(a.x+b.x)/2,clientY:(a.y+b.y)/2});if(d>0&&pinch>0)zoomAt(p.x,p.y,pinch/d);pinch=d;return;}
+  if(pan){const delta=new DOMPoint(event.clientX-pan.x,event.clientY-pan.y).matrixTransform(new DOMMatrix([pan.inverse.a,pan.inverse.b,pan.inverse.c,pan.inverse.d,0,0]));if(Math.hypot(event.clientX-pan.x,event.clientY-pan.y)>4)moved=true;setView([pan.view[0]-delta.x,pan.view[1]-delta.y,pan.view[2],pan.view[3]]);}
+};
+function endPointer(event){
+  const clicked=event.type==='pointerup'&&!moved&&pointers.size===1?pressedNode:null;
+  if(!pointers.delete(event.pointerId))return;pinch=null;if(pointers.size===1)startPan();else{pan=null;svg.style.cursor='grab';}
+  if(svg.hasPointerCapture(event.pointerId))svg.releasePointerCapture(event.pointerId);
+  if(clicked!=null)choose(rows[Number(clicked)]);
+}
+['pointerup','pointercancel','lostpointercapture'].forEach(type=>svg.addEventListener(type,endPointer));
+const pressed=new Set(),editing=target=>target instanceof Element&&!!target.closest('input,select,textarea,[contenteditable="true"]');
+window.addEventListener('keydown',event=>{if(editing(event.target)||event.ctrlKey||event.metaKey||event.altKey)return;const key=event.key.toLowerCase();if('wasd'.includes(key)&&key.length===1){pressed.add(key);event.preventDefault();}});
+window.addEventListener('keyup',event=>pressed.delete(event.key.toLowerCase()));
+window.addEventListener('blur',()=>pressed.clear());document.addEventListener('focusin',event=>{if(editing(event.target))pressed.clear();});
+function animate(){if(pressed.size){const current=view(),dx=(pressed.has('d')-pressed.has('a'))*payload.pan_speed,dy=(pressed.has('s')-pressed.has('w'))*payload.pan_speed;setView([current[0]+dx,current[1]+dy,current[2],current[3]]);}requestAnimationFrame(animate);}animate();
+$('search').oninput=renderList;$('sort').onchange=renderList;$('fit').onclick=()=>setView(baseView.slice());
+for(const [id,factor] of [['zoom-in',1/1.15],['zoom-out',1.15]])$(id).onclick=()=>{const current=view();zoomAt(current[0]+current[2]/2,current[1]+current[3]/2,factor);};
+$('copy-name').disabled=!selected;
+$('copy-name').onclick=async()=>{
+  if(!selected)return;
+  try{await navigator.clipboard.writeText(layerName(selected));$('toast').textContent='完整层名已复制';}
+  catch{const range=document.createRange();range.selectNodeContents($('detail-name'));window.getSelection().removeAllRanges();window.getSelection().addRange(range);$('toast').textContent='已选中层名，可按 Ctrl+C 复制';}
+  $('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',1800);
+};
+renderList();choose(selected);
+if(!rows.length){$('canvas-empty').hidden=false;$('detail-name').textContent='未选择层';}
+
+</script>
+</body>
+</html>'''
+
+    def render(self, show: bool = True) -> str:
+        """生成单文件交互报告，节点布局及连接路径保持原有算法。"""
+        layout = self._layout_engine()
+        real_pos, dummy_pos, edge_routes = {}, {}, {}
+        if self.layer_row:
+            depth = layout._layers()
+            if depth:
+                real_pos, dummy_pos, edge_routes, _ = layout._compute_layout(depth)
+        paths = self._build_edge_paths(real_pos, dummy_pos, edge_routes, layout=layout)
+        node_w, node_h = self.NODE_WIDTH, self.NODE_HEIGHT
         all_xs = [p[0] for p in real_pos.values()] + [p[0] for p in dummy_pos.values()]
         all_ys = [p[1] for p in real_pos.values()] + [p[1] for p in dummy_pos.values()]
-        min_x, max_x = min(all_xs) - node_w / 2, max(all_xs) + node_w / 2
-        min_y, max_y = min(all_ys) - node_h / 2, max(all_ys) + node_h / 2
-
-        # 边（先画，被节点覆盖形成"从节点边缘出发"的观感）
-        edges_svg = []
-        for pts, color, _title in paths:
-            d = self._netron_curve_path(pts)
-            edges_svg.append(
-                f'<path d="{d}" fill="none" stroke="{color}" stroke-width="1.6" '
-                f'marker-end="url(#arrow)"/>'
-            )
-        edges_svg = ''.join(edges_svg)
-
-        # 节点 + tooltip 数据
-        node_titles: list[str] = []
-        nodes_svg = []
-        for name in sorted(self.layer_row.keys(), key=lambda x: self.node_order[x]):
+        bounds = [min(all_xs, default=0)-node_w/2, max(all_xs, default=0)+node_w/2,
+                  min(all_ys, default=0)-node_h/2, max(all_ys, default=0)+node_h/2]
+        edges_svg = ''.join(
+            f'<path d="{self._netron_curve_path(points)}" fill="none" stroke="{color}" '
+            'stroke-width="1.6" marker-end="url(#arrow)"/>' for points, color, _ in paths)
+        rows, nodes_svg = [], []
+        for name in sorted(self.layer_row, key=self.node_order.__getitem__):
             row = self.layer_row[name]
-            op = row.get('op_type', '?')
-            image, title = self._svg_node(name, op, row)
+            image, _ = self._svg_node(name, row.get('op_type', '?'), row)
             x, y = real_pos[name]
-            idx = len(node_titles)
-            node_titles.append(title)
             nodes_svg.append(
-                f'<image href="{image}" x="{x - node_w / 2:.1f}" y="{y - node_h / 2:.1f}" '
-                f'width="{node_w:.0f}" height="{node_h:.0f}" data-i="{idx}" class="node"/>'
-            )
-        nodes_svg = ''.join(nodes_svg)
-        titles_json = json.dumps(node_titles)
-
-        # 颜色条图例
-        c_low, c_mid, c_high = '#ff4500', '#ffd700', '#3cb371'
-        legend_html = (
-            '<div id="legend">'
-            '<div id="legendTitle"><span class="dot" style="background:#335588"></span>'
-            '<b>entire_cos</b> 累积余弦精度</div>'
-            '<div id="legendBar"></div>'
-            '<div id="legendTicks">'
-            '<span style="color:' + c_low + '">0.80</span>'
-            '<span style="color:' + c_high + '">0.90</span>'
-            '<span style="color:#2e8b57">1.00</span>'
-            '</div>'
-            '<div id="legendNote">悬停节点查看 <b>单层精度 / 欧氏距离</b></div>'
-            '</div>'
-        )
-
-        reset_btn = (
-            '<button id="btnReset" title="还原视图到初始布局" '
-            'style="position:fixed;top:16px;left:16px;z-index:2000;'
-            'padding:8px 14px;border:1px solid #bbb;border-radius:6px;'
-            'background:#fff;color:#333;font-family:Arial;font-size:13px;'
-            'cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.2);">'
-            '&#x27f3; 还原布局</button>'
-        )
-
-        # 左下角缩放按钮（+ 放大 / - 缩小）
-        zoom_btns = (
-            '<div style="position:fixed;bottom:20px;left:16px;z-index:2000;'
-            'display:flex;flex-direction:column;gap:6px;">'
-            '<button id="btnZoomIn" title="放大" '
-            'style="width:34px;height:34px;border:1px solid #bbb;border-radius:6px;'
-            'background:#fff;color:#333;font-family:Arial;font-size:20px;font-weight:bold;'
-            'line-height:1;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.2);">+</button>'
-            '<button id="btnZoomOut" title="缩小" '
-            'style="width:34px;height:34px;border:1px solid #bbb;border-radius:6px;'
-            'background:#fff;color:#333;font-family:Arial;font-size:20px;font-weight:bold;'
-            'line-height:1;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.2);">-</button>'
-            '</div>'
-        )
-
-        # 全部用占位符，避免 f-string 与 JS 的 {} 冲突
-        script = (
-            '<script>\n'
-            '(function() {\n'
-            '  var svg = document.getElementById("svg");\n'
-            '  var tip = document.getElementById("tip");\n'
-            '  var B = {minX:__MINX__, maxX:__MAXX__, minY:__MINY__, maxY:__MAXY__};\n'
-            '  var titles = __TITLES__;\n'
-            '  var panSpeed = __PAN_SPEED__;\n'
-            '  var initView = null;\n'
-            '  function getView() {\n'
-            '    var v = svg.getAttribute("viewBox").split(/[ ,]+/).map(Number);\n'
-            '    return {x: v[0], y: v[1], w: v[2], h: v[3]};\n'
-            '  }\n'
-            '  function setView(x, y, w, h) { svg.setAttribute("viewBox", x + " " + y + " " + w + " " + h); renderMinimap(); }\n'
-            '  // ---- 小地图（minimap）----\n'
-            '  var mmSvg = document.getElementById("minimapSvg");\n'
-            '  var mmW = 220, mmH = 400;\n'
-            '  var mmData = null;  // {nodes:[{x,y}], scale, ox, oy}\n'
-            '  function mmScale() {\n'
-            '    // 等比缩放让全图 fit 进小地图（居中）\n'
-            '    return Math.min(mmW / (B.maxX - B.minX), mmH / (B.maxY - B.minY));\n'
-            '  }\n'
-            '  function mmToWorld(px, py) {\n'
-            '    // 小地图像素 -> 世界坐标\n'
-            '    var s = mmScale();\n'
-            '    var ox = (mmW - (B.maxX - B.minX) * s) / 2;\n'
-            '    var oy = (mmH - (B.maxY - B.minY) * s) / 2;\n'
-            '    return {x: B.minX + (px - ox) / s, y: B.minY + (py - oy) / s};\n'
-            '  }\n'
-            '  function renderMinimap() {\n'
-            '    if (!mmData) { return; }\n'
-            '    var vb = getView();\n'
-            '    var s = mmScale();\n'
-            '    var ox = (mmW - (B.maxX - B.minX) * s) / 2;\n'
-            '    var oy = (mmH - (B.maxY - B.minY) * s) / 2;\n'
-            '    var wx = function(x) { return ox + (x - B.minX) * s; };\n'
-            '    var wy = function(y) { return oy + (y - B.minY) * s; };\n'
-            '    mmSvg.innerHTML = "";\n'
-            '    var ns = "http://www.w3.org/2000/svg";\n'
-            '    // 所有节点小方块\n'
-            '    mmData.nodes.forEach(function(n) {\n'
-            '      var r = document.createElementNS(ns, "rect");\n'
-            '      r.setAttribute("x", wx(n.x) - 2);\n'
-            '      r.setAttribute("y", wy(n.y) - 2);\n'
-            '      r.setAttribute("width", 4);\n'
-            '      r.setAttribute("height", 4);\n'
-            '      r.setAttribute("fill", "#6688aa");\n'
-            '      r.setAttribute("rx", 1);\n'
-            '      mmSvg.appendChild(r);\n'
-            '    });\n'
-            '    // 当前视窗框\n'
-            '    var vr = document.createElementNS(ns, "rect");\n'
-            '    vr.setAttribute("class", "mm-rect");\n'
-            '    vr.setAttribute("x", wx(vb.x));\n'
-            '    vr.setAttribute("y", wy(vb.y));\n'
-            '    vr.setAttribute("width", Math.max(wx(vb.x + vb.w) - wx(vb.x), 2));\n'
-            '    vr.setAttribute("height", Math.max(wy(vb.y + vb.h) - wy(vb.y), 2));\n'
-            '    mmSvg.appendChild(vr);\n'
-            '    mmData.rect = vr;\n'
-            '  }\n'
-            '  // 点击/拖拽小地图跳转（pointer 事件：鼠标/触摸/触控笔通用）\n'
-            '  var mmDrag = false;\n'
-            '  function mmJump(px, py) {\n'
-            '    var pos = mmToWorld(px, py);\n'
-            '    var vb = getView();\n'
-            '    setView(pos.x - vb.w / 2, pos.y - vb.h / 2, vb.w, vb.h);\n'
-            '  }\n'
-            '  mmSvg.addEventListener("pointerdown", function(e) {\n'
-            '    if (e.pointerType === "mouse" && e.button !== 0) { return; }\n'
-            '    mmDrag = true;\n'
-            '    var r = mmSvg.getBoundingClientRect();\n'
-            '    mmJump(e.clientX - r.left, e.clientY - r.top);\n'
-            '    e.stopPropagation();\n'
-            '  });\n'
-            '  window.addEventListener("pointermove", function(e) {\n'
-            '    if (!mmDrag) { return; }\n'
-            '    var r = mmSvg.getBoundingClientRect();\n'
-            '    mmJump(e.clientX - r.left, e.clientY - r.top);\n'
-            '  });\n'
-            '  window.addEventListener("pointerup", function() { mmDrag = false; });\n'
-            '  window.addEventListener("pointercancel", function() { mmDrag = false; });\n'
-            '  function initialView() {\n'
-            '    var figH = (B.maxY - B.minY) || 1;\n'
-            '    var targetH = figH / 10;\n'
-            '    var vw = targetH * (window.innerWidth / window.innerHeight);\n'
-            '    var vh = targetH;\n'
-            '    var cx = (B.minX + B.maxX) / 2;\n'
-            '    var cy = B.minY + targetH * 0.4;\n'
-            '    return {x: cx - vw / 2, y: cy - vh / 2, w: vw, h: vh};\n'
-            '  }\n'
-            '  function zoomAt(px, py, factor) {\n'
-            '    var vb = getView();\n'
-            '    var cx = vb.x + (px / window.innerWidth) * vb.w;\n'
-            '    var cy = vb.y + (py / window.innerHeight) * vb.h;\n'
-            '    var nw = vb.w * factor, nh = vb.h * factor;\n'
-            '    setView(cx - (px / window.innerWidth) * nw, cy - (py / window.innerHeight) * nh, nw, nh);\n'
-            '  }\n'
-            '  svg.addEventListener("wheel", function(e) {\n'
-            '    e.preventDefault();\n'
-            '    zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? 1.15 : 1 / 1.15);\n'
-            '  }, {passive: false});\n'
-            '  // 平移/捏合统一走 pointer 事件（鼠标/触摸/触控笔）；touch-action:none 见 CSS。\n'
-            '  // 注意：原来的 mousedown/mousemove/mouseup 已删除，两套并存会让鼠标平移速度翻倍。\n'
-            '  var dragging = false, sx = 0, sy = 0, svx = 0, svy = 0;\n'
-            '  var ptrs = {}, ptrN = 0, pinch = null;   // ptrs: pointerId -> {x,y}\n'
-            '  function ptrVals() {\n'
-            '    var o = [];\n'
-            '    for (var k in ptrs) { if (ptrs.hasOwnProperty(k)) { o.push(ptrs[k]); } }\n'
-            '    return o;\n'
-            '  }\n'
-            '  function ptrDist(p) {\n'
-            '    return Math.sqrt(Math.pow(p[0].x - p[1].x, 2) + Math.pow(p[0].y - p[1].y, 2));\n'
-            '  }\n'
-            '  svg.addEventListener("pointerdown", function(e) {\n'
-            '    if (e.pointerType === "mouse" && e.button !== 0) { return; }\n'
-            '    ptrs[e.pointerId] = {x: e.clientX, y: e.clientY}; ptrN++;\n'
-            '    if (ptrN === 1) {\n'
-            '      dragging = true; sx = e.clientX; sy = e.clientY;\n'
-            '      var vb = getView(); svx = vb.x; svy = vb.y;\n'
-            '      svg.style.cursor = "grabbing";\n'
-            '    } else if (ptrN === 2) {\n'
-            '      dragging = false;                      // 双指 -> 捏合\n'
-            '      var p = ptrVals();\n'
-            '      pinch = {d: ptrDist(p), cx: (p[0].x + p[1].x) / 2, cy: (p[0].y + p[1].y) / 2};\n'
-            '    }\n'
-            '  });\n'
-            '  window.addEventListener("pointermove", function(e) {\n'
-            '    if (!ptrs.hasOwnProperty(e.pointerId)) { return; }\n'
-            '    ptrs[e.pointerId] = {x: e.clientX, y: e.clientY};\n'
-            '    if (pinch && ptrN >= 2) {\n'
-            '      var p = ptrVals(); var d = ptrDist(p);\n'
-            '      if (d > 0 && pinch.d > 0) { zoomAt(pinch.cx, pinch.cy, pinch.d / d); }  // 两指分开=放大\n'
-            '      pinch.d = d;\n'
-            '      return;\n'
-            '    }\n'
-            '    if (!dragging) { return; }\n'
-            '    var vb = getView();\n'
-            '    var dx = (e.clientX - sx) / window.innerWidth * vb.w;\n'
-            '    var dy = (e.clientY - sy) / window.innerHeight * vb.h;\n'
-            '    setView(svx - dx, svy - dy, vb.w, vb.h);\n'
-            '  });\n'
-            '  function endPointer(e) {\n'
-            '    if (!ptrs.hasOwnProperty(e.pointerId)) { return; }\n'
-            '    delete ptrs[e.pointerId]; ptrN--;\n'
-            '    if (ptrN < 2) { pinch = null; }\n'
-            '    if (ptrN === 1) {                          // 双指松一指：重设基准，避免画面跳变\n'
-            '      var p = ptrVals()[0];\n'
-            '      dragging = true; sx = p.x; sy = p.y;\n'
-            '      var vb = getView(); svx = vb.x; svy = vb.y;\n'
-            '    } else if (ptrN === 0) {\n'
-            '      dragging = false; svg.style.cursor = "grab";\n'
-            '    }\n'
-            '  }\n'
-            '  window.addEventListener("pointerup", endPointer);\n'
-            '  window.addEventListener("pointercancel", endPointer);\n'
-            '  var pressed = {};\n'
-            '  window.addEventListener("keydown", function(e) { pressed[e.key.toLowerCase()] = true; });\n'
-            '  window.addEventListener("keyup", function(e) { pressed[e.key.toLowerCase()] = false; });\n'
-            '  function pan(dx, dy) {\n'
-            '    var vb = getView();\n'
-            '    setView(vb.x + dx, vb.y + dy, vb.w, vb.h);\n'
-            '  }\n'
-            '  (function loop() {\n'
-            '    if (pressed["w"]) { pan(0, -panSpeed); }\n'
-            '    if (pressed["s"]) { pan(0, panSpeed); }\n'
-            '    if (pressed["a"]) { pan(-panSpeed, 0); }\n'
-            '    if (pressed["d"]) { pan(panSpeed, 0); }\n'
-            '    requestAnimationFrame(loop);\n'
-            '  })();\n'
-            '  svg.addEventListener("mousemove", function(e) {\n'
-            '    if (pinnedIdx >= 0) { return; }\n'
-            '    var t = e.target; if (!t || !t.classList || !t.classList.contains("node")) { tip.style.display = "none"; return; }\n'
-            '    var i = Number(t.getAttribute("data-i"));\n'
-            '    if (titles[i]) { tip.textContent = titles[i]; tip.style.display = "block"; }\n'
-            '    tip.style.left = (e.clientX + 14) + "px";\n'
-            '    tip.style.top = (e.clientY + 14) + "px";\n'
-            '  });\n'
-            '  svg.addEventListener("mouseleave", function() { if (pinnedIdx < 0) { tip.style.display = "none"; } });\n'
-            '  var pinnedIdx = -1;\n'
-            '  // 点击节点固定信息卡片；点击别处关闭。卡片内点击（选择/复制）不关闭。\n'
-            '  document.addEventListener("click", function(e) {\n'
-            '    var t = e.target;\n'
-            '    if (t && t.id === "tip") { return; }\n'
-            '    if (t && t.classList && t.classList.contains("node")) {\n'
-            '      pinnedIdx = Number(t.getAttribute("data-i"));\n'
-            '      tip.textContent = titles[pinnedIdx];\n'
-            '      tip.classList.add("pinned");\n'
-            '      tip.style.display = "block";\n'
-            '      tip.style.left = (e.clientX + 14) + "px";\n'
-            '      tip.style.top = (e.clientY + 14) + "px";\n'
-            '      return;\n'
-            '    }\n'
-            '    pinnedIdx = -1;\n'
-            '    tip.classList.remove("pinned");\n'
-            '    tip.style.display = "none";\n'
-            '  });\n'
-            '  window.__resetLayout = function() { if (initView) setView(initView.x, initView.y, initView.w, initView.h); };\n'
-            '  var btn = document.getElementById("btnReset");\n'
-            '  if (btn) { btn.addEventListener("click", function() { window.__resetLayout(); }); }\n'
-            '  var zi = document.getElementById("btnZoomIn");\n'
-            '  if (zi) { zi.addEventListener("click", function() { zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1 / 1.15); }); }\n'
-            '  var zo = document.getElementById("btnZoomOut");\n'
-            '  if (zo) { zo.addEventListener("click", function() { zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1.15); }); }\n'
-            '  // 收集节点真实坐标，供小地图使用\n'
-            '  mmData = {nodes: []};\n'
-            '  qs = svg.querySelectorAll("image.node");\n'
-            '  for (var qi = 0; qi < qs.length; qi++) {\n'
-            '    var q = qs[qi];\n'
-            '    mmData.nodes.push({x: parseFloat(q.getAttribute("x")) + parseFloat(q.getAttribute("width")) / 2,\n'
-            '                        y: parseFloat(q.getAttribute("y")) + parseFloat(q.getAttribute("height")) / 2});\n'
-            '  }\n'
-            '  initView = initialView();\n'
-            '  setView(initView.x, initView.y, initView.w, initView.h);\n'
-            '})();\n'
-            '</script>'
-        )
-        script = (script.replace('__MINX__', f'{min_x:.1f}')
-                       .replace('__MAXX__', f'{max_x:.1f}')
-                       .replace('__MINY__', f'{min_y:.1f}')
-                       .replace('__MAXY__', f'{max_y:.1f}')
-                       .replace('__TITLES__', titles_json)
-                       .replace('__PAN_SPEED__', str(self.pan_speed)))
-
-        html = (
-            '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="utf-8">\n'
-            f'<title>{self.title}</title>\n'
-            '<style>\n'
-            'html,body{margin:0;height:100%;overflow:hidden;overscroll-behavior:none;'
-            'font-family:Arial;}\n'
-            'svg#svg{display:block;width:100vw;height:100vh;background:#fff;cursor:grab;}\n'
-            # 触摸屏：必须显式声明 touch-action，否则手指拖拽会被浏览器判为页面平移/缩放并中断事件流
-            'svg#svg,#minimap svg{touch-action:none;-webkit-user-select:none;user-select:none;'
-            '-webkit-touch-callout:none;}\n'
-            'button{touch-action:manipulation;}\n'
-            'image.node{cursor:pointer;}\n'
-            '#tip{position:fixed;display:none;z-index:3000;background:rgba(255,255,255,.97);'
-            'border:1px solid #aaa;border-radius:4px;padding:6px 10px;font-size:12px;'
-            'color:#222;white-space:pre;box-shadow:0 1px 4px rgba(0,0,0,.2);pointer-events:none;max-width:520px;}\n'
-            '#tip.pinned{pointer-events:auto;cursor:text;user-select:text;}\n'
-            '#legend{position:fixed;bottom:20px;right:20px;z-index:2000;background:#fff;'
-            'border:1px solid #d8dde4;border-radius:8px;padding:12px 14px;font-family:Arial;'
-            'font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.12);'
-            'box-sizing:border-box;width:234px;}\n'
-            '#legendTitle{display:flex;align-items:center;gap:6px;font-size:13px;'
-            'color:#333;margin-bottom:8px;}\n'
-            '#legendTitle .dot{width:12px;height:12px;border-radius:3px;display:inline-block;}\n'
-            '#legendBar{width:100%;height:14px;border-radius:7px;'
-            'background:linear-gradient(to right, ' + c_low + ', ' + c_mid + ', ' + c_high + ');}\n'
-            '#legendTicks{display:flex;justify-content:space-between;margin-top:3px;'
-            'font-size:11px;font-weight:bold;}\n'
-            '#legendNote{margin-top:9px;padding-top:8px;border-top:1px solid #eee;'
-            'color:#888;font-size:11px;line-height:1.5;}\n'
-            '#minimap{position:fixed;top:16px;right:20px;z-index:2000;background:#fff;'
-            'border:1px solid #bbb;border-radius:6px;padding:6px;box-shadow:0 1px 4px rgba(0,0,0,.2);'
-            'user-select:none;cursor:crosshair;}\n'
-            '#minimap svg{display:block;background:#f8f8f8;border-radius:4px;width:220px;height:400px;}\n'
-            '#minimap .mm-rect{fill:rgba(60,179,113,.12);stroke:#3cb371;stroke-width:1.5;}\n'
-            '</style>\n</head>\n<body>\n'
-            '<svg id="svg" preserveAspectRatio="xMidYMid meet">\n'
+                f'<image href="{image}" x="{x-node_w/2:.1f}" y="{y-node_h/2:.1f}" '
+                f'width="{node_w:g}" height="{node_h:g}" data-i="{len(rows)}" class="node"/>')
+            rows.append(dict(row, parents=self.parents.get(name, []), children=self.children.get(name, [])))
+        svg = (
+            '<svg id="svg" tabindex="0" aria-label="精度计算图" preserveAspectRatio="xMidYMid meet">\n'
             '<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" '
             'markerWidth="7" markerHeight="7" orient="auto">'
             '<path d="M0,0 L10,5 L0,10 z" fill="#666"/></marker></defs>\n'
-            + edges_svg + nodes_svg +
-            '</svg>\n'
-            + reset_btn + zoom_btns + legend_html +
-            '<div id="minimap"><svg id="minimapSvg" width="220" height="400"></svg></div>\n'
-            '<div id="tip"></div>\n'
-            + script +
-            '\n</body>\n</html>\n'
-        )
-
-        self.output_path.write_text(html, encoding='utf-8')
-
+            + edges_svg + ''.join(nodes_svg) + '</svg>')
+        payload = dict(rows=rows, title=self.title, edges=len(paths), bounds=bounds,
+                       euc_range=[self.euc_color_min, self.euc_color_max], pan_speed=self.pan_speed)
+        encoded = json.dumps(payload, ensure_ascii=False, default=float, allow_nan=False).replace('<', '\\u003c')
+        parts = {'__TITLE__': html.escape(self.title), '__PAYLOAD__': encoded, '__SVG__': svg}
+        document = re.sub(r'__TITLE__|__PAYLOAD__|__SVG__', lambda match: parts[match[0]], self._REPORT_HTML)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.output_path.write_text(document, encoding='utf-8')
         print(f"Network analysis HTML saved to: {self.output_path}")
         if show:
             import webbrowser
-            webbrowser.open(self.output_path.as_uri())
+            webbrowser.open(self.output_path.resolve().as_uri())
         return str(self.output_path)
+
 
 
 # ----------------------------------------------------------------------

@@ -1235,31 +1235,39 @@ class OnnxToQNN:
         else:
             # ---------------- Linux/Unix ----------------
             envsetup_script = self.qnn_sdk_dir / 'bin/envsetup.sh'
-            command = f"source '{envsetup_script}' && env"
             print("[OnnxToQNN] Setting up QAIRT Linux environment...")
-
-            # 执行脚本
-            proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, executable='/bin/bash')
-            stdout, stderr = proc.communicate() # 获取输出
+            command = ('qairt_env_script=$1; set --; source "$qairt_env_script" '
+                       '&& printf "\\n===QAIRT_ENV_START===\\n" && env')
+            proc = subprocess.Popen(
+                ['/bin/bash', '-c', command, 'qairt-env', str(envsetup_script)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = proc.communicate()
 
             if proc.returncode != 0:
                 print(f"[OnnxToQNN] Error executing script: {stderr.decode('utf-8')}")
                 return False
 
-            env_to_parse = stdout.decode('utf-8')
+            env_block = stdout.decode('utf-8').split('===QAIRT_ENV_START===', 1)
+            if len(env_block) != 2:
+                print("[OnnxToQNN] Error parsing envsetup.sh output: environment marker missing")
+                return False
+            env_to_parse = env_block[1]
 
 
-        # 解析环境变量
-        for line in env_to_parse.splitlines():
-            if '=' in line:
-                key, value = line.split('=', 1)
-                os.environ[key] = value
-
-        # QAIRT 工具需要可写临时目录（受限环境系统 TEMP 不可写），指向模型工作子目录
-        # qairt_tmp_dir = self.tmp_work_dir / 'qairt_tmp'
-        # qairt_tmp_dir.mkdir(parents=True, exist_ok=True)
-        # os.environ['QAIRT_TMP_DIR'] = str(qairt_tmp_dir)
-        # self.file_or_dir_to_clean.append(qairt_tmp_dir)
+        updates = dict(line.split('=', 1) for line in env_to_parse.splitlines() if '=' in line)
+        if not sys.platform.startswith('win'):
+            # 部分 SDK 的 envsetup.sh 固定选择 x86；工具和库必须匹配当前进程架构。
+            arch = QAIRTScript.current_platform_arch()
+            bin_dir, lib_dir = (self.qnn_sdk_dir / kind / arch for kind in ('bin', 'lib'))
+            if not (bin_dir.is_dir() and lib_dir.is_dir()):
+                print(f"[OnnxToQNN] SDK tools/libraries missing for {arch}")
+                return False
+            updates['PATH'] = os.pathsep.join([
+                str(Path(sys.executable).parent), str(bin_dir),
+                updates.get('PATH', os.environ.get('PATH', ''))])
+            updates['LD_LIBRARY_PATH'] = os.pathsep.join([
+                str(lib_dir), updates.get('LD_LIBRARY_PATH', os.environ.get('LD_LIBRARY_PATH', ''))])
+        os.environ.update(updates)
 
         return True
 

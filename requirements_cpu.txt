@@ -1,10 +1,12 @@
 pyyaml
 yacs
+setuptools<80.1.0
 
 psutil>=5.9.0
 ruamel.yaml>=0.17.21
 tqdm>=4.64.1
 fast-histogram>=0.11
+Pillow>=10.0.1
 
 numpy<2.0
 scipy
@@ -12,17 +14,20 @@ matplotlib
 
 
 onnxruntime==1.20
-onnx==1.17.0
+onnx==1.18.0
 onnxslim
 
-opencv-python>=4.5.5
+opencv-python>=4.5.5,<=5.0
 
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.4.1+cpu
-torchvision==0.19.1+cpu
+torch==2.4.1+cpu ; platform_machine == "x86_64" or platform_machine == "AMD64" or platform_machine == "amd64"
+torch==2.4.1 ; platform_machine != "x86_64" and platform_machine != "AMD64" and platform_machine != "amd64"
+torchvision==0.19.1+cpu ; platform_machine == "x86_64" or platform_machine == "AMD64" or platform_machine == "amd64"
+torchvision==0.19.1 ; platform_machine != "x86_64" and platform_machine != "AMD64" and platform_machine != "amd64"
 timm
 
-tensorflow-cpu==2.16.0rc0
+tensorflow-cpu==2.16.0rc0 ; platform_machine == "x86_64" or platform_machine == "AMD64" or platform_machine == "amd64"
+tensorflow==2.16.0rc0 ; platform_machine != "x86_64" and platform_machine != "AMD64" and platform_machine != "amd64"
 tf-keras==2.16.0rc0
 tensorboardx
 tf2onnx
@@ -32,5 +37,3 @@ tf2onnx
 protobuf<=4.25.4
 easydict
 # ml_dtypes>0.5
-
-# aimet-onnx

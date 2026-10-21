@@ -6,6 +6,7 @@ import copy
 import random
 import heapq
 import shutil
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Callable
 from collections import defaultdict, deque
@@ -993,7 +994,13 @@ class NumpySaver:
 
 
 
-def run_command(command: str, signature: str = "", print_output: bool = True) -> int:
+def run_command(
+    command: str,
+    signature: str = "",
+    print_output: bool = True,
+    *,
+    log_path: str | Path | None = None,
+) -> int:
     """在 shell 中执行命令，返回进程返回码。
 
     Args:
@@ -1002,6 +1009,9 @@ def run_command(command: str, signature: str = "", print_output: bool = True) ->
         print_output: True（默认）逐行实时打印子进程输出；
             False 静默执行（不打印 Running 行与输出），仅当返回码非 0 时打印输出尾部，
             便于失败诊断且不刷屏（配合并行阶段 tqdm 进度条使用）。
+        log_path: 可选的完整 UTF-8 日志路径，包含命令及合并后的 stdout/stderr。
+            提供此路径且 print_output=False 时，失败尾部也只保存在文件中，
+            由调用方统一展示失败摘要。
 
     Returns:
         int: 进程返回码（0 表示成功）。
@@ -1021,29 +1031,37 @@ def run_command(command: str, signature: str = "", print_output: bool = True) ->
         errors='replace',
         env=os.environ,
     )
-    if sys.platform.startswith('win'):
-        process = subprocess.Popen(command, shell=True, **popen_kwargs)
-    else:
-        process = subprocess.Popen(command, shell=True, executable='/bin/bash', **popen_kwargs)
+    tail_lines: deque[str] = deque(maxlen=30)
+    with ExitStack() as stack:
+        log_file = None
+        if log_path is not None:
+            path = Path(log_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = stack.enter_context(path.open('w', encoding='utf-8', buffering=1))
+            log_file.write(f"{signature} Running command: {command}\n")
 
-    tail_lines: list[str] = []
-    # 实时打印输出（或静默收集尾部，失败时展示）
-    while True:
-        output = process.stdout.readline()
-        if output == '' and process.poll() is not None:
-            break
-        if output:
+        if sys.platform.startswith('win'):
+            process = stack.enter_context(subprocess.Popen(command, shell=True, **popen_kwargs))
+        else:
+            process = stack.enter_context(subprocess.Popen(
+                command, shell=True, executable='/bin/bash', **popen_kwargs,
+            ))
+
+        # 逐行读取以便实时输出；静默执行只保留固定长度的诊断尾部。
+        for output in process.stdout:
+            if log_file is not None:
+                log_file.write(output)
             if print_output:
                 print(output.strip())
-            else:
+            elif log_file is None:
                 tail_lines.append(output.rstrip('\n'))
 
-    return_code = process.poll()
-    if not print_output and return_code != 0 and tail_lines:
+        return_code = process.wait()
+
+    if not print_output and log_path is None and return_code != 0 and tail_lines:
         print(f"{signature} command failed (code {return_code}), last output:")
-        for ln in tail_lines[-30:]:
+        for ln in tail_lines:
             print(ln)
-        tail_lines.clear()
     return return_code
 
 
